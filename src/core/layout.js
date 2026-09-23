@@ -21,8 +21,8 @@ import { deriveSeed } from './params.js';
  */
 
 /** @returns {Layout} */
-export function computeLayout(key, params, width, height) {
-  const { rngKey, nonce, check } = deriveSeed(key, params, width, height);
+export function computeLayout(key, params, width, height, index = 0) {
+  const { rngKey, nonce, check } = deriveSeed(key, params, width, height, index);
   const rng = new ChaChaRng(rngKey, nonce);
   const total = width * height;
   if (total > 0xffffffff) throw new RangeError('Image too large');

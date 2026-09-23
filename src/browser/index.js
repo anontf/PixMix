@@ -9,11 +9,7 @@
 
 import { decode, decodeAsync as decodeAnyAsync, inspect, detectFormat, configureJxl, PixmixError, WrongKeyError } from '../decoder.js';
 import { unscramblePngDetailedAsync } from '../formats/png/index.js';
-import { unscrambleJpegDetailed } from '../formats/jpeg/index.js';
-import { unscrambleJxlDetailed, reconstructJpeg } from '../formats/jxl/index.js';
-import { writeChunks } from '../formats/png/chunks.js';
-import { encodeRasterAsync } from '../formats/png/raster.js';
-import { toRGBA8 } from '../formats/png/rgba.js';
+import { computeAnywhere } from './worker-client.js';
 import { readOrientation } from '../meta/exif.js';
 import { orientationTransform, swapsAxes, browserHonoursPngOrientation } from './orient.js';
 
@@ -39,9 +35,9 @@ export async function decodeAsync(input, { key } = {}) {
  * Fetches and decodes to a blob: URL an <img> can show: the original PNG/JPEG, or for
  * JPEG XL (which most browsers cannot display) a lossless PNG of its pixels.
  */
-export async function decodeToURL(url, { key, fetchOptions } = {}) {
+export async function decodeToURL(url, { key, fetchOptions, worker } = {}) {
   const bytes = await fetchBytes(url, fetchOptions);
-  const job = await prepare(bytes, key, 'ignore', false);
+  const job = await prepare(bytes, key, 'ignore', false, worker);
   return URL.createObjectURL(new Blob([await job.restored()], { type: job.type }));
 }
 
@@ -58,6 +54,8 @@ export async function decodeToURL(url, { key, fetchOptions } = {}) {
  * @param {RequestInit} [opts.fetchOptions]
  * @param {'auto'|'apply'|'ignore'} [opts.orientation='auto'] EXIF orientation during the
  *        animation; 'auto' matches whatever this browser does for the final <img>
+ * @param {boolean|string} [opts.worker=true] decode in a Web Worker (falls back to the main
+ *        thread when one cannot start); a string is the worker script's URL
  */
 export async function reveal(img, opts = {}) {
   const {
@@ -67,6 +65,7 @@ export async function reveal(img, opts = {}) {
     onProgress,
     fetchOptions,
     orientation = 'auto',
+    worker = true,
   } = opts;
   const key = img.dataset.pixmixKey ?? optKey;
   let effect = img.dataset.pixmixEffect ?? opts.effect ?? 'dissolve';
@@ -77,7 +76,7 @@ export async function reveal(img, opts = {}) {
   img.dataset.pixmixState = 'decoding';
   try {
     const bytes = await fetchBytes(url, fetchOptions);
-    const job = await prepare(bytes, key, orientation, effect !== 'none');
+    const job = await prepare(bytes, key, orientation, effect !== 'none', worker);
 
     if (effect !== 'none') {
       const { width, height, o } = job;
@@ -130,68 +129,27 @@ export async function reveal(img, opts = {}) {
 }
 
 /**
- * Decodes and sets up the format-specific animation.
+ * Decodes (in a worker when possible) and sets up the format-specific animation.
  * @returns {Promise<{width: number, height: number, o: number, type: string,
- *   restored: () => Promise<Uint8Array>|Uint8Array, animate: Function}>}
+ *   restored: () => Uint8Array, animate?: Function}>}
  */
-async function prepare(bytes, key, orientation, animated) {
-  const format = detectFormat(bytes);
-  if (format === 'png') {
-    const d = await unscramblePngDetailedAsync(bytes, { key });
-    const exif = d.img.chunks.find((c) => c.type === 'eXIf');
-    const o = await effectiveOrientation(exif?.data, orientation, browserHonoursPngOrientation);
-    return {
-      width: d.layout.width,
-      height: d.layout.height,
-      o,
-      type: TYPES.png,
-      restored: d.toPng,
-      animate: (work, opts) => animate(work, d, toRGBA8(d.img, d.img.pixels), opts),
-    };
+async function prepare(bytes, key, orientation, animated, worker = true) {
+  const r = await computeAnywhere(bytes, key, { animated, worker });
+  const { width, height } = r.layout;
+  const restored = () => r.restored;
+  if (r.kind === 'pixels') {
+    const o = await effectiveOrientation(r.exif, orientation, browserHonoursPngOrientation);
+    return { width, height, o, type: r.type, restored, animate: (work, opts) => animate(work, r, r.scrambled, opts) };
   }
-  if (format === 'jpeg') {
-    const d = unscrambleJpegDetailed(bytes, { key });
-    const restored = d.toJpeg();
-    const { width, height } = d.layout;
-    const app1 = d.segments.find((s) => s.marker === 0xe1 && s.data[0] === 0x45 && s.data[4] === 0 && s.data[5] === 0);
-    let o = await effectiveOrientation(app1?.data.subarray(6), orientation, async () => true);
-    if (!animated) return { width, height, o, type: TYPES.jpeg, restored: () => restored };
-    // Browsers decode JPEGs already oriented; undo that to get the stored pixel grid.
-    const [orig, scr] = await Promise.all([loadImage(restored, TYPES.jpeg), loadImage(bytes, TYPES.jpeg)]);
-    if (swapsAxes(o) && orig.naturalWidth === width) o = 1; // this browser did not apply it
-    return {
-      width, height, o, type: TYPES.jpeg,
-      restored: () => restored,
-      animate: (work, opts) => animateJpeg(work, d.layout, toRaw(scr, width, height, o), toRaw(orig, width, height, o), opts),
-    };
-  }
-  if (format === 'jxl') {
-    // JPEG route: rebuild the scrambled JPEG (WASM) and reveal that; visitors get the JPEG.
-    if (inspect(bytes).mode === 'mcu') {
-      return prepare(await reconstructJpeg(bytes), key, orientation, animated);
-    }
-    // Pixel route: decoded in WASM, exact, so this animates like PNG. The <img> gets a PNG
-    // of the restored pixels, since most browsers cannot display JPEG XL.
-    const d = await unscrambleJxlDetailed(bytes, { key });
-    const { width, height } = d.layout;
-    return {
-      width, height, o: 1, type: TYPES.png,
-      restored: () => rgbaPng(width, height, d.pixels),
-      animate: (work, opts) => animate(work, d, new Uint8ClampedArray(d.scrambled.buffer, d.scrambled.byteOffset, d.scrambled.length), opts),
-    };
-  }
-  throw new PixmixError(`${format ? format.toUpperCase() : 'This format'} cannot be revealed`, 'UNSUPPORTED');
-}
-
-async function rgbaPng(width, height, rgba) {
-  const ihdr = new Uint8Array(13);
-  const dv = new DataView(ihdr.buffer);
-  dv.setUint32(0, width);
-  dv.setUint32(4, height);
-  ihdr[8] = 8;
-  ihdr[9] = 6;
-  const idat = await encodeRasterAsync({ width, height, depth: 8, colorType: 6, interlace: 0 }, rgba);
-  return writeChunks([{ type: 'IHDR', data: ihdr }, { type: 'IDAT', data: idat }, { type: 'IEND', data: new Uint8Array(0) }]);
+  let o = await effectiveOrientation(r.exif, orientation, async () => true);
+  if (!animated) return { width, height, o, type: r.type, restored };
+  // Browsers decode JPEGs already oriented; undo that to get the stored pixel grid.
+  const [orig, scr] = await Promise.all([loadImage(r.restored, r.type), loadImage(r.scrambled, r.type)]);
+  if (swapsAxes(o) && orig.naturalWidth === width) o = 1; // this browser did not apply it
+  return {
+    width, height, o, type: r.type, restored,
+    animate: (work, opts) => animateJpeg(work, r.layout, toRaw(scr, width, height, o), toRaw(orig, width, height, o), opts),
+  };
 }
 
 /**
@@ -275,6 +233,7 @@ function invertAffine([a, b, c, d, e, f]) {
 
 const easeInOut = (t) => (t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2);
 
+/** @param {{layout: object}} d  PNG / JPEG XL pixel-route result */
 function animate(canvas, d, scrambledRGBA, { effect, duration, onProgress, present }) {
   const { width, height, map, tiles } = d.layout;
   const ctx = canvas.getContext('2d');

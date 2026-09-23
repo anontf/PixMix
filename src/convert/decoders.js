@@ -26,6 +26,7 @@ export const pngDecoder = {
     const img = readPng(bytes);
     const metadata = readPngMetadata(img.chunks);
     if (img.ihdr.depth === 16) metadata.dropped.push('16-bit precision (reduced to 8-bit)');
+    if (img.animated) metadata.dropped.push('animation (first frame kept)');
     return { width: img.ihdr.width, height: img.ihdr.height, data: new Uint8Array(toRGBA8(img, img.pixels).buffer), metadata };
   },
 };
@@ -59,10 +60,33 @@ export const gifDecoder = {
     } catch (err) {
       throw new PixmixError(`GIF decode failed: ${err.message}`, 'BAD_GIF');
     }
-    const data = new Uint8Array(reader.width * reader.height * 4);
-    reader.decodeAndBlitFrameRGBA(0, data);
-    const dropped = reader.numFrames() > 1 ? ['animation (first frame kept)'] : [];
-    return { width: reader.width, height: reader.height, data, metadata: { dropped } };
+    const { width, height } = reader;
+    const n = reader.numFrames();
+    if (n <= 1) {
+      const data = new Uint8Array(width * height * 4);
+      reader.decodeAndBlitFrameRGBA(0, data);
+      return { width, height, data, metadata: { dropped: [] } };
+    }
+    // Composite every frame onto the full canvas, following GIF disposal, so each becomes a
+    // complete image (APNG output keeps them all; other formats keep the first).
+    const canvas = new Uint8Array(width * height * 4);
+    const frames = [];
+    for (let i = 0; i < n; i++) {
+      const info = reader.frameInfo(i);
+      const saved = info.disposal === 3 ? canvas.slice() : null;
+      reader.decodeAndBlitFrameRGBA(i, canvas);
+      // Browsers play delays of 0 or 1 (1/100 s) at 10; do the same so timing matches.
+      frames.push({ data: canvas.slice(), delay: info.delay <= 1 ? 10 : info.delay });
+      if (info.disposal === 2) {
+        for (let y = info.y; y < info.y + info.height; y++) canvas.fill(0, (y * width + info.x) * 4, (y * width + info.x + info.width) * 4);
+      } else if (saved) canvas.set(saved);
+    }
+    const loops = reader.loopCount(); // 0 = forever; null = no loop extension, play once
+    return {
+      width, height, data: frames[0].data,
+      animation: { frames: frames.map((f) => ({ data: f.data, delay: [f.delay, 100] })), plays: loops ?? 1 },
+      metadata: { dropped: ['animation (first frame kept)'] },
+    };
   },
 };
 

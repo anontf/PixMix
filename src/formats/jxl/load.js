@@ -1,10 +1,12 @@
 // Lazy loader for the JPEG XL codec module. In the dist bundles the codec is a separate
 // file (pixmix-jxl.mjs) next to the bundle; from source it is ./codec.js.
 
+import { SCRIPT_BASE } from '../../core/script-base.js';
+
 /* global __PIXMIX_JXL_CHUNK__ */
-const CHUNK = typeof __PIXMIX_JXL_CHUNK__ !== 'undefined' ? __PIXMIX_JXL_CHUNK__ : './codec.js';
-// import.meta.url is empty in the IIFE/CJS builds; the script's own URL stands in.
-const BASE = import.meta.url || (typeof document !== 'undefined' && document.currentScript?.src) || undefined;
+// From source, codec.js sits next to this file; in bundles the chunk sits next to the bundle.
+const CHUNK = typeof __PIXMIX_JXL_CHUNK__ !== 'undefined' ? __PIXMIX_JXL_CHUNK__ : new URL('./codec.js', import.meta.url).href;
+const BASE = SCRIPT_BASE;
 
 let moduleUrl = null;
 let pending = null;

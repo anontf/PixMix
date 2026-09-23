@@ -10,6 +10,8 @@ import { sharpDecoder } from '../src/plugins/sharp.js';
 import { buildPng } from '../src/convert/png-build.js';
 import { readChunks } from '../src/formats/png/chunks.js';
 import { readOrientation } from '../src/meta/exif.js';
+import { readPng } from '../src/formats/png/index.js';
+import { toRGBA8 } from '../src/formats/png/rgba.js';
 
 const W = 48, H = 32;
 const ascii = (s) => Buffer.from(s, 'latin1');
@@ -163,17 +165,32 @@ test('ICC profile space constrains the colour type', () => {
   assert.deepEqual(rgbaOf(bad.png), colour);
 });
 
-test('animated GIF keeps the first frame as a palette PNG', () => {
-  const buf = Buffer.alloc(4096);
-  const gw = new GifWriter(buf, 4, 4, { loop: 0, palette: [0xff0000, 0x00ff00, 0x0000ff, 0xffffff] });
-  gw.addFrame(0, 0, 4, 4, [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3]);
-  gw.addFrame(0, 0, 4, 4, new Array(16).fill(3));
-  const r = convert(new Uint8Array(buf.subarray(0, gw.end())));
+test('animated GIF becomes an APNG with every frame, its delays and loop count', () => {
+  const buf = Buffer.alloc(8192);
+  const gw = new GifWriter(buf, 4, 4, { loop: 2, palette: [0xff0000, 0x00ff00, 0x0000ff, 0xffffff] });
+  gw.addFrame(0, 0, 4, 4, [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3], { delay: 20 });
+  gw.addFrame(1, 1, 2, 2, [3, 3, 3, 3], { delay: 0, disposal: 2 }); // partial, then cleared
+  gw.addFrame(0, 0, 1, 1, [1], { delay: 5 });
+  const gif = new Uint8Array(buf.subarray(0, gw.end()));
+  const r = convert(gif);
   assert.equal(r.from, 'gif');
-  assert.deepEqual(r.dropped, ['animation (first frame kept)']);
-  assert.equal(chunk(r.bytes, 'IHDR')[9], 3);
-  const px = rgbaOf(r.bytes);
-  assert.deepEqual([...px.subarray(0, 8)], [255, 0, 0, 255, 0, 255, 0, 255]);
+  assert.deepEqual(r.dropped, []);
+  assert.ok(r.transferred.includes('animation'));
+  const info = inspect(r.bytes);
+  assert.deepEqual([info.animated, info.frames, info.plays, info.colorType], [true, 3, 2, 3]);
+  const fctl = readChunks(r.bytes).filter((c) => c.type === 'fcTL').map((c) => [Buffer.from(c.data).readUInt16BE(20), Buffer.from(c.data).readUInt16BE(22)]);
+  assert.deepEqual(fctl, [[20, 100], [10, 100], [5, 100]], 'delays, with 0 played as 10 like browsers do');
+  const frames = readPng(r.bytes).frames;
+  // frame 1: frame 0 with the 2x2 white square composited in; frame 2: the square disposed.
+  const px = (f, x, y) => [...toRGBA8({ ...readPng(r.bytes), pixels: frames[f] }, frames[f]).subarray((y * 4 + x) * 4, (y * 4 + x) * 4 + 4)];
+  assert.deepEqual(px(1, 1, 1), [255, 255, 255, 255]);
+  assert.deepEqual(px(2, 1, 1), [0, 0, 0, 0], 'disposal 2 cleared it');
+  assert.deepEqual(px(2, 0, 0), [0, 255, 0, 255]);
+  // Scrambles and restores like any APNG.
+  const restored = decode(encode(gif, { key: 'k' }), { key: 'k' });
+  assert.deepEqual(readPng(restored).frames.map((f) => Buffer.from(f)), frames.map((f) => Buffer.from(f)));
+  // Other formats keep the first frame.
+  assert.deepEqual(convert(gif, { format: 'jpeg' }).dropped, ['animation (first frame kept)']);
 });
 
 test('formats without a built-in decoder ask for a plugin', async () => {

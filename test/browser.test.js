@@ -230,3 +230,60 @@ test('JPEG-route JXL reveals as the original JPEG', async () => {
   await reveal(img, { key: 'k', effect: 'none' });
   assert.equal(detectFormat(new Uint8Array(await resolveObjectURL(img.src).arrayBuffer())), 'jpeg');
 });
+
+test('APNG reveal animates frame 0 and hands the <img> the whole animation', async () => {
+  const { buildPng } = await import('../src/convert/png-build.js');
+  const { readPng } = await import('../src/formats/png/index.js');
+  const w = 12, h = 8;
+  const frames = [1, 2, 3].map((k) => ({ data: new Uint8Array(w * h * 4).map((_, i) => (i % 4 === 3 ? 255 : (i * k * 7) & 255)), delay: [10, 100] }));
+  const { png } = buildPng({ width: w, height: h, data: frames[0].data, animation: { frames, plays: 0 } });
+  globalThis.fetch = async () => new Response(encode(png, { key: 'k' }));
+  const img = new FakeImg();
+  await reveal(img, { key: 'k', duration: 20 });
+  const shown = new Uint8Array(await resolveObjectURL(img.src).arrayBuffer());
+  assert.equal(inspect(shown).frames, 3);
+  assert.deepEqual(readPng(shown).frames.map((f) => Buffer.from(f)), readPng(png).frames.map((f) => Buffer.from(f)));
+});
+
+// --- Web Worker path -------------------------------------------------------------------
+
+test('decoding through the worker gives the same result; errors keep their type', async () => {
+  // Stand-in Worker: runs the real worker module in this thread, cloning every message.
+  const sent = [];
+  class FakeWorker {
+    constructor(url, opts) {
+      assert.equal(opts.type, 'module');
+      FakeWorker.instance = this;
+      globalThis.self = { postMessage: (msg) => queueMicrotask(() => this.onmessage({ data: structuredClone(msg) })) };
+      this.ready = import(String(url));
+    }
+    postMessage(msg) {
+      sent.push(msg.id);
+      this.ready.then(() => globalThis.self.onmessage({ data: structuredClone(msg) }));
+    }
+  }
+  globalThis.Worker = FakeWorker;
+  try {
+    const orig = readFileSync(new URL('./fixtures/pngsuite/basn6a08.png', import.meta.url));
+    globalThis.fetch = async () => new Response(encode(orig, { key: 'k', mode: 'block', block: 4 }));
+    const out = await reveal(new FakeImg(), { key: 'k', effect: 'blocks', duration: 20, final: 'canvas' });
+    assert.deepEqual(out.pixels, expected);
+
+    globalThis.fetch = async () => new Response(encode(await jpegFixture(), { key: 'k' }));
+    const j = await reveal(new FakeImg(), { key: 'k', effect: 'scan', duration: 20, final: 'canvas' });
+    assert.equal(j.width, 37);
+
+    globalThis.fetch = async () => new Response(encode(orig, { key: 'k' }));
+    await assert.rejects(reveal(new FakeImg(), { key: 'wrong' }), (e) => e.name === 'WrongKeyError' && e.code === 'WRONG_KEY');
+    assert.equal(sent.length, 3, 'all three went through the worker');
+
+    // A worker that dies mid-request: the request is redone on the main thread, and later
+    // ones skip the worker.
+    FakeWorker.prototype.postMessage = function postMessage() { queueMicrotask(() => this.onerror({ preventDefault() {} })); };
+    globalThis.fetch = async () => new Response(encode(orig, { key: 'k' }));
+    const again = await reveal(new FakeImg(), { key: 'k', effect: 'dissolve', duration: 20, final: 'canvas' });
+    assert.deepEqual(again.pixels, expected);
+  } finally {
+    delete globalThis.Worker;
+  }
+});

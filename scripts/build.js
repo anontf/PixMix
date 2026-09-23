@@ -2,6 +2,8 @@
 //
 //   dist/pixmix-decoder.js        ESM, browser decoder + reveal animations
 //   dist/pixmix-decoder.min.js    IIFE, exposes window.PixMix; drop in with a <script> tag
+//   dist/pixmix-worker.mjs        Web Worker the decoders use (optional: without it they
+//                                 decode on the main thread)
 //   dist/pixmix-encoder.mjs       ESM, encoder for any server/runtime (Node, Deno, Bun, workers)
 //   dist/pixmix-encoder.cjs       CommonJS build of the encoder, for require()-based servers
 //   dist/pixmix-jxl.mjs           JPEG XL codec, loaded on demand by all of the above,
@@ -21,7 +23,7 @@ const common = { bundle: true, target: 'es2020', logLevel: 'warning', legalComme
 await rm(out(''), { recursive: true, force: true });
 await mkdir(out(''), { recursive: true });
 
-const chunk = { define: { __PIXMIX_JXL_CHUNK__: '"./pixmix-jxl.mjs"' } };
+const chunk = { define: { __PIXMIX_JXL_CHUNK__: '"./pixmix-jxl.mjs"', __PIXMIX_WORKER__: '"./pixmix-worker.mjs"' } };
 const targets = [
   { entryPoints: [`${root}src/browser/index.js`], outfile: out('pixmix-decoder.js'), format: 'esm', platform: 'browser', ...chunk },
   {
@@ -36,6 +38,7 @@ const targets = [
     define: { ...chunk.define, 'import.meta.url': '__pixmix_url' },
     banner: { js: "const __pixmix_url = require('url').pathToFileURL(__filename).href;" },
   },
+  { entryPoints: [`${root}src/browser/worker.js`], outfile: out('pixmix-worker.mjs'), format: 'esm', platform: 'browser', minify: true, ...chunk },
   {
     entryPoints: [`${root}src/formats/jxl/codec.js`], outfile: out('pixmix-jxl.mjs'), format: 'esm', platform: 'neutral',
     mainFields: ['module', 'main'], minify: true,

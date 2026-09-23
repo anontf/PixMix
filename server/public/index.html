@@ -62,6 +62,7 @@
       <select id="effect"><option>dissolve</option><option>scan</option><option>blocks</option><option>none</option></select>
     </label>
     <label>Duration ms <input type="number" id="duration" value="1600" min="0" step="100"></label>
+    <label>Web Worker <input type="checkbox" id="worker" checked title="decode off the main thread"></label>
     <button class="primary" id="replay" disabled>Decode again</button>
     <label>New key <input id="newKey" placeholder="rotate to…" size="18"></label>
     <button id="rekey" disabled>Rekey</button>
@@ -129,7 +130,9 @@ async function loadOriginal(bytes, name, note = '') {
     parts.push(`depth ${info.bitDepth} · colour type ${info.colorType}${info.interlaced ? ' · interlaced' : ''}`);
   } else if (info.format === 'jpeg') {
     parts.push(`${info.components} comp · MCU ${info.mcu}${info.progressive ? ' · progressive' : ''}`);
-  } else if (info.format === 'jxl') {
+  }
+  if (info.animated) parts.push(`${info.frames ?? '?'} frames`);
+  if (info.format === 'jxl') {
     parts.push(`${info.lossy ? 'lossy' : 'lossless'} · ${info.bitDepth}-bit${info.alpha ? ' · alpha' : ''}${info.animated ? ' · animated' : ''}${info.srgb === false ? ' · non-sRGB' : ''}`);
   }
   if (info.scrambled) parts.push('<span class="bad">already scrambled</span>');
@@ -272,6 +275,7 @@ async function runDecode() {
       key,
       effect: $('effect').value,
       duration: Number($('duration').value),
+      worker: $('worker').checked,
       onProgress: (p) => { $('bar').style.width = `${p * 100}%`; },
     });
   } catch (err) {

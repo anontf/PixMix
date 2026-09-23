@@ -12,17 +12,21 @@ const utf8 = new TextEncoder();
 const latin1Bytes = (s) => Uint8Array.from(s, (c) => { const n = c.charCodeAt(0); return n < 256 ? n : 63; });
 
 /**
- * @param {{width: number, height: number, data: Uint8Array}} image RGBA8
+ * @param {{width: number, height: number, data: Uint8Array,
+ *   animation?: {frames: {data: Uint8Array, delay: [number, number]}[], plays: number}}} image
+ *   RGBA8; with `animation` (full-canvas frames) the result is an APNG
  * @param {import('../meta/jpeg.js').Metadata} [meta]
  * @returns {{png: Uint8Array, transferred: string[], dropped: string[]}}
  */
 export function buildPng(image, meta = {}) {
   const { width, height } = image;
-  // Uint32 views below need 4-byte alignment (pooled Node Buffers may not have it).
-  const data = image.data.byteOffset % 4 ? image.data.slice() : image.data;
-  if (data.length !== width * height * 4) throw new RangeError('Decoder must return width*height RGBA bytes');
-  const transferred = [];
-  const dropped = [...(meta.dropped ?? [])];
+  const frames = image.animation?.frames.length > 1 ? image.animation.frames : null;
+  // All frames share one colour type (and palette), so analyse them together; Uint32 views
+  // below need 4-byte alignment (pooled Node Buffers may not have it).
+  let data = frames ? concatAll(frames.map((f) => f.data)) : image.data.byteOffset % 4 ? image.data.slice() : image.data;
+  if (data.length !== width * height * 4 * (frames?.length ?? 1)) throw new RangeError('Decoder must return width*height RGBA bytes');
+  const transferred = frames ? ['animation'] : [];
+  const dropped = [...(meta.dropped ?? [])].filter((d) => !(frames && d.startsWith('animation')));
 
   // An ICC profile constrains the colour type: GRAY profiles need grey PNGs, RGB profiles
   // need colour ones, anything else (e.g. CMYK) cannot be embedded in a PNG at all.
@@ -32,11 +36,12 @@ export function buildPng(image, meta = {}) {
     dropped.push(`ICC profile (${iccSpace?.trim() || 'invalid'} colour space)`);
     icc = undefined;
   }
-  let raster = pickRaster(width, height, data, icc ? iccSpace : null);
+  const rows = height * (frames?.length ?? 1);
+  let raster = pickRaster(width, rows, data, icc ? iccSpace : null);
   if (raster.iccMismatch) {
     dropped.push('ICC profile (GRAY profile on a colour image)');
     icc = undefined;
-    raster = pickRaster(width, height, data, null);
+    raster = pickRaster(width, rows, data, null);
   }
 
   const chunks = [{ type: 'IHDR', data: ihdr(width, height, raster.depth, raster.colorType) }];
@@ -68,7 +73,23 @@ export function buildPng(image, meta = {}) {
   if (raster.plte) chunks.push({ type: 'PLTE', data: raster.plte });
   if (raster.trns) chunks.push({ type: 'tRNS', data: raster.trns });
   const header = { width, height, depth: raster.depth, colorType: raster.colorType, interlace: 0 };
-  chunks.push({ type: 'IDAT', data: encodeRaster(header, raster.pixels) });
+  if (!frames) {
+    chunks.push({ type: 'IDAT', data: encodeRaster(header, raster.pixels) });
+  } else {
+    // APNG: every frame full-size, replacing the previous one (dispose none, blend source).
+    const per = raster.pixels.length / frames.length;
+    chunks.push({ type: 'acTL', data: u32(frames.length, image.animation.plays) });
+    let seq = 0;
+    frames.forEach((f, i) => {
+      const fctl = new Uint8Array(26);
+      fctl.set(u32(seq++, width, height, 0, 0));
+      new DataView(fctl.buffer).setUint16(20, f.delay[0]);
+      new DataView(fctl.buffer).setUint16(22, f.delay[1]);
+      chunks.push({ type: 'fcTL', data: fctl });
+      const z = encodeRaster(header, raster.pixels.subarray(i * per, (i + 1) * per));
+      chunks.push(i === 0 ? { type: 'IDAT', data: z } : { type: 'fdAT', data: concat(u32(seq++), z) });
+    });
+  }
   chunks.push({ type: 'IEND', data: new Uint8Array(0) });
   return { png: writeChunks(chunks), transferred, dropped };
 }
@@ -125,6 +146,15 @@ function pickRaster(width, height, rgba, iccSpace) {
   }
   return { colorType: 6, depth: 8, pixels: rgba };
 }
+
+function u32(...values) {
+  const b = new Uint8Array(values.length * 4);
+  const dv = new DataView(b.buffer);
+  values.forEach((v, i) => dv.setUint32(i * 4, v));
+  return b;
+}
+
+const concatAll = (parts) => concat(...parts);
 
 function ihdr(width, height, depth, colorType) {
   const d = new Uint8Array(13);

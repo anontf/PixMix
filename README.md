@@ -11,9 +11,10 @@ so any viewer shows it, just shuffled:
 With the key, the original comes back exactly: the same pixels for PNG and lossless JPEG
 XL, and the same DCT coefficients for JPEG and JPEG-route JPEG XL.
 
-Output is PNG, JPEG or JPEG XL. Input can be PNG, JPEG, GIF, JPEG XL, and, with a decoder
-plugin, WebP, AVIF, HEIC or TIFF. EXIF, ICC, XMP, density and comments are carried over
-where the output format can hold them.
+Output is PNG (and animated APNG), JPEG or JPEG XL. Input can be PNG/APNG, JPEG, GIF
+(animated GIFs become APNG), JPEG XL, and, with a decoder plugin, WebP, AVIF, HEIC or TIFF.
+EXIF, ICC, XMP, density and comments are carried over where the output format can hold
+them.
 
 This is obfuscation, not encryption: a permutation keeps the colour histogram, and in the
 browser use case the key ships to the visitor.
@@ -61,12 +62,18 @@ lists every option.
 | --- | --- | --- |
 | `dist/pixmix-decoder.min.js` | IIFE → `window.PixMix` | drop into any website |
 | `dist/pixmix-decoder.js` | ESM | bundlers / `<script type="module">` |
+| `dist/pixmix-worker.mjs` | ESM (Web Worker) | used by both decoders to decode off the main thread |
 | `dist/pixmix-encoder.mjs` | ESM, platform-neutral | Node, Deno, Bun, workers, browsers |
 | `dist/pixmix-encoder.cjs` | CommonJS | `require()`-based servers |
 | `dist/pixmix-jxl.mjs` + `pixmix-jxl-{enc,dec}.wasm` | ESM + WASM | JPEG XL support, loaded on demand |
 | `dist/pixmix-cjxl/` | CommonJS + WASM | JPEG → JPEG XL recompression, servers only |
 
 The decoder bundle contains no encoding code; the encoder bundle has no DOM code.
+
+Deploy `pixmix-worker.mjs` next to the decoder to keep large decodes off the main thread.
+If it's missing, or a CSP forbids workers, the decoder quietly decodes on the main thread.
+A decoder loaded from another origin (a CDN) starts the worker through a same-origin
+`blob:` module, which needs CORS on the CDN.
 
 JPEG XL support is optional:
 - Copy the three `pixmix-jxl*` files next to whichever bundle you deploy, or call
@@ -130,6 +137,26 @@ const out = await encodeAsync(webpBytes, {
 In browsers, `browserDecoder()` uses the browser's own decoders (WebP, AVIF, BMP, …).
 `convert` / `convertAsync` produce the plain, unscrambled file the encoder would scramble.
 
+### Animation
+
+- **APNG → APNG** is lossless, like still PNG:
+  - Every frame is scrambled with its own permutation (the frame index is part of the
+    seed), including partial frames with offsets and a default image that sits outside the
+    animation.
+  - `acTL`, `fcTL` and every other chunk are copied unchanged, apart from the APNG sequence
+    numbers, which are renumbered.
+  - Viewers without APNG support show the scrambled default image.
+- **Animated GIF → PNG** gives an APNG:
+  - Frames are composited to full size following GIF disposal.
+  - Delays and the loop count are kept; a delay of 0 or 1 plays as 10, as browsers do.
+  - The whole animation shares one colour type, usually a palette.
+- **Other formats:**
+  - Converting an animation to JPEG or JPEG XL keeps the first frame, and the report says
+    so.
+  - Animated JPEG XL and WebP input keep their first frame too.
+- **In the browser,** the reveal animates frame 0, then the `<img>` gets the restored
+  APNG, which plays normally.
+
 ### Embedded previews
 
 Several places inside an image file can hold a small copy of the picture, and that copy
@@ -155,7 +182,7 @@ input is decoded to pixels and re-encoded:
 | PNG | built-in | pixmix's PNG reader |
 | JPEG | built-in (jpeg-js) | pixmix's JPEG reader |
 | JPEG XL | built-in (jxl-oxide, WASM) | pixmix's box reader; the ICC profile comes from the decoder |
-| GIF | built-in (omggif), first frame | – |
+| GIF | built-in (omggif). All frames when writing PNG (as APNG), else the first | – |
 | WebP | `sharpDecoder` / `browserDecoder` | pixmix's WebP reader |
 | AVIF, HEIC, TIFF | `sharpDecoder` / `browserDecoder` | sharp |
 
@@ -212,6 +239,12 @@ const original = await PixMix.decodeAsync(bytes, { key });   // just the bytes
   show the final `<img>`. Browsers differ on EXIF in PNGs, so this is detected once with a
   2×1 test image. Override it with `orientation: 'apply' | 'ignore'`.
 - `revealAll` is lazy by default: each image decodes when it scrolls into view.
+- Decoding runs in a Web Worker by default: unscrambling, inflate/deflate, JPEG entropy
+  coding and JPEG XL.
+  - The page only draws the animation.
+  - `worker: false` (or `data-worker="false"` on the script tag) keeps it on the main
+    thread; a string gives the worker's URL.
+  - All reveals share one worker.
 - The animation runs on a temporary canvas. Afterwards the `<img>` gets the exact restored
   file as a `blob:` URL, so ICC/gamma handling, CSS, alt text and "save image" behave
   normally.
@@ -354,11 +387,12 @@ The permutation stream is pinned by a test. Any change to it must bump the versi
   - Lossless pixel route, and the JPEG route (DCT scramble → lossless JPEG recompression).
   - Custom jxl-oxide WASM for exact decoding and JPEG reconstruction; lazy loading.
   - Browser reveal, CLI, server and lab support.
+- [x] Phase 5: APNG in/out (per-frame permutations), animated GIF → APNG, decoding in a
+  Web Worker with a main-thread fallback
 - [ ] Newer libjxl for recompression (the only prebuilt WASM `cjxl` is 0.7 and Node-only)
-- [ ] Decode off the main thread (Web Worker) for very large images
+- [ ] Animated JPEG XL / WebP (currently the first frame)
 - [ ] 16-bit input through plugins (currently reduced to 8-bit)
 - [ ] Keep progressive JPEGs progressive (write progressive scans)
-- [ ] APNG / animated images
 
 ## Third-party code
 

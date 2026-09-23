@@ -51,10 +51,11 @@ export function keyBytes(key) {
 }
 
 /**
- * Derives the PRNG seed and key check for one image. Dimensions and parameters are
- * mixed in so the same key yields unrelated permutations on different images.
+ * Derives the PRNG seed and key check for one image (or animation frame). Dimensions,
+ * parameters and the frame index are mixed in so the same key yields unrelated
+ * permutations on different images and frames.
  */
-export function deriveSeed(key, params, width, height) {
+export function deriveSeed(key, params, width, height, index = 0) {
   const info = new Uint8Array(32);
   const dv = new DataView(info.buffer);
   info.set(utf8.encode('pixmix/perm'));
@@ -63,6 +64,7 @@ export function deriveSeed(key, params, width, height) {
   dv.setUint16(14, params.block);
   dv.setUint32(16, width);
   dv.setUint32(20, height);
+  dv.setUint32(24, index); // animation frame; 0 (the only value before APNG) keeps v1 intact
   const okm = hkdf(keyBytes(key), params.salt, info, 32 + 12 + CHECK_BYTES);
   return {
     rngKey: okm.subarray(0, 32),

@@ -8,7 +8,8 @@
 //   dist/pixmix-encoder.cjs       CommonJS build of the encoder, for require()-based servers
 //   dist/pixmix-jxl.mjs           JPEG XL codec, loaded on demand by all of the above,
 //   dist/pixmix-jxl-{enc,dec}.wasm  with its WASM (libjxl encoder, native/libjxl; jxl-oxide
-//                                 decoder, native/jxl)
+//                                 decoder, native/jxl), and pixmix-jxl-enc-nosimd.wasm, the
+//                                 encoder for engines without WebAssembly SIMD
 //
 // Deploy the JPEG XL files next to whichever bundle you use (or call configureJxl), and
 // only if you need JPEG XL: nothing is fetched until a JPEG XL image shows up.
@@ -42,7 +43,7 @@ const targets = [
   {
     entryPoints: [`${root}src/formats/jxl/codec.js`], outfile: out('pixmix-jxl.mjs'), format: 'esm', platform: 'neutral',
     minify: true,
-    define: { __PIXMIX_JXL_WASM__: JSON.stringify({ enc: './pixmix-jxl-enc.wasm', dec: './pixmix-jxl-dec.wasm' }) },
+    define: { __PIXMIX_JXL_WASM__: JSON.stringify({ enc: './pixmix-jxl-enc.wasm', encNoSimd: './pixmix-jxl-enc-nosimd.wasm', dec: './pixmix-jxl-dec.wasm' }) },
   },
 ];
 
@@ -53,6 +54,7 @@ for (const t of targets) {
 }
 for (const [from, to] of [
   ['native/libjxl/pkg/pixmix_libjxl.wasm', 'pixmix-jxl-enc.wasm'],
+  ['native/libjxl/pkg/pixmix_libjxl_nosimd.wasm', 'pixmix-jxl-enc-nosimd.wasm'],
   ['native/jxl/pkg/pixmix_jxl_bg.wasm', 'pixmix-jxl-dec.wasm'],
   ['native/libjxl/pkg/THIRD_PARTY_LICENSES.txt', 'pixmix-jxl-enc.LICENSES.txt'], // libjxl, Highway, Brotli, skcms
 ]) {

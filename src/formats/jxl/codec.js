@@ -11,7 +11,10 @@
 // Where the .wasm files come from:
 //   - dist bundles: next to this module (build.js copies them as pixmix-jxl-*.wasm);
 //   - running from source: native/libjxl/pkg (encoder) and native/jxl/pkg (decoder);
-//   - configureJxl({ encoderWasm, decoderWasm }): explicit URLs or bytes, which win.
+//   - configureJxl({ encoderWasm, encoderWasmNoSimd, decoderWasm }): explicit URLs or
+//     bytes, which win.
+// The encoder comes in two builds, with WebAssembly SIMD (faster) and without (for engines
+// that lack it); the one this engine can run is picked on first use.
 
 import createEncoder from '../../../native/libjxl/pkg/pixmix_libjxl.mjs';
 import initDecoder, {
@@ -25,19 +28,38 @@ const BUNDLED = typeof __PIXMIX_JXL_WASM__ !== 'undefined' ? __PIXMIX_JXL_WASM__
 const overrides = {};
 let encoder, decoder; // promises, created on first use
 
-/** @param {{encoderWasm?: string|URL|Uint8Array, decoderWasm?: string|URL|Uint8Array}} opts */
+/**
+ * @param {{encoderWasm?: string|URL|Uint8Array, encoderWasmNoSimd?: string|URL|Uint8Array,
+ *   decoderWasm?: string|URL|Uint8Array}} opts  encoderWasm is used where the engine has
+ *   WebAssembly SIMD, encoderWasmNoSimd elsewhere
+ */
 export function configure(opts) {
   Object.assign(overrides, opts);
 }
 
+// The smallest module using a SIMD instruction (i8x16.splat of an i32.const 0; the same
+// probe as wasm-feature-detect). Engines without SIMD (e.g. some WebKit builds) cannot even
+// compile the SIMD encoder, so they get the plain one.
+const SIMD_PROBE = Uint8Array.of(0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11);
+export const hasSimd = () => {
+  try {
+    return WebAssembly.validate(SIMD_PROBE);
+  } catch {
+    return false;
+  }
+};
+
+const SOURCE = {
+  enc: '../../../native/libjxl/pkg/pixmix_libjxl.wasm',
+  encNoSimd: '../../../native/libjxl/pkg/pixmix_libjxl_nosimd.wasm',
+  dec: '../../../native/jxl/pkg/pixmix_jxl_bg.wasm',
+};
+const OPTION = { enc: 'encoderWasm', encNoSimd: 'encoderWasmNoSimd', dec: 'decoderWasm' };
+
 async function wasmBytes(which) {
-  const given = overrides[which === 'enc' ? 'encoderWasm' : 'decoderWasm'];
+  const given = overrides[OPTION[which]];
   if (given instanceof Uint8Array || given instanceof ArrayBuffer) return given;
-  const url = given
-    ? new URL(given, import.meta.url)
-    : BUNDLED
-      ? new URL(BUNDLED[which], import.meta.url)
-      : new URL(which === 'enc' ? '../../../native/libjxl/pkg/pixmix_libjxl.wasm' : '../../../native/jxl/pkg/pixmix_jxl_bg.wasm', import.meta.url);
+  const url = new URL(given ?? (BUNDLED ? BUNDLED[which] : SOURCE[which]), import.meta.url);
   const fs = globalThis.process?.getBuiltinModule?.('node:fs');
   if (url.protocol === 'file:' && fs) return fs.readFileSync(url);
   const res = await fetch(url);
@@ -125,7 +147,7 @@ function toRgba(px, n, channels, max = 255) {
 // libjxl's JxlEncoderError codes, for messages.
 const ENC_ERRORS = { 1: 'generic error', 2: 'out of memory', 3: 'JPEG bitstream reconstruction data could not be written', 4: 'bad input', 0x80: 'unsupported feature', 0x81: 'API misuse' };
 
-const loadEncoder = () => (encoder ??= wasmBytes('enc').then((wasmBinary) => createEncoder({ wasmBinary })).catch((err) => {
+const loadEncoder = () => (encoder ??= wasmBytes(hasSimd() ? 'enc' : 'encNoSimd').then((wasmBinary) => createEncoder({ wasmBinary })).catch((err) => {
   encoder = null;
   throw err;
 }));

@@ -81,14 +81,19 @@ A decoder loaded from another origin (a CDN) starts the worker through a same-or
 `blob:` module, which needs CORS on the CDN.
 
 JPEG XL support is optional:
-- Copy the three `pixmix-jxl*` files next to whichever bundle you deploy, or call
-  `configureJxl({ moduleUrl, encoderWasm, decoderWasm })`. (`pixmix-jxl-enc.LICENSES.txt`
-  holds the encoder's third-party licences.)
+- Copy the `pixmix-jxl*` files next to whichever bundle you deploy, or call
+  `configureJxl({ moduleUrl, encoderWasm, encoderWasmNoSimd, decoderWasm })`.
+  (`pixmix-jxl-enc.LICENSES.txt` holds the encoder's third-party licences.)
 - Nothing is fetched until a JPEG XL image shows up.
 - Revealing images only needs the decoder WASM (1.8 MB; 580 KB gzipped, 420 KB with
-  Brotli). The encoder WASM (2.3 MB; 880 KB gzipped, 670 KB with Brotli) is fetched only to
-  write JPEG XL: encoding, including the JPEG route, which works in browsers too, and
-  `decodeAsync()` of a JPEG XL file, which returns JPEG XL.
+  Brotli). The encoder WASM is fetched only to write JPEG XL: encoding, including the JPEG
+  route, which works in browsers too, and `decodeAsync()` of a JPEG XL file, which returns
+  JPEG XL.
+- The encoder comes in two builds, and each engine fetches only the one it can run:
+  `pixmix-jxl-enc.wasm` uses WebAssembly SIMD (2.3 MB; 880 KB gzipped, 670 KB with
+  Brotli); `pixmix-jxl-enc-nosimd.wasm` (2.4 MB; 925 KB gzipped, 690 KB with Brotli) is for
+  engines without SIMD, such as some WebKit builds. pixmix checks with
+  `WebAssembly.validate` on a tiny SIMD module.
 
 ## Encoder (servers)
 
@@ -337,8 +342,10 @@ The codec has two parts, both pixmix's own WASM bindings:
   - lossless JPEG recompression with reconstruction data, in a container;
   - an effort setting.
 
-  It's built single-threaded with WebAssembly SIMD (every current browser and Node), so it
-  runs the same on servers and in browsers.
+  It's built single-threaded, twice: with WebAssembly SIMD (Node and most browsers) and
+  without (engines that can't compile SIMD, such as Playwright's WebKit). Both runs are
+  lossless, so they give back the same pixels. Without SIMD, 2 MP block mode is about 15%
+  slower and the JPEG route about 50% slower; pixel mode is about the same.
 - **pixmix's own jxl-oxide binding** (`native/jxl`) for decoding and JPEG reconstruction.
   - It returns raw 8- or 16-bit pixels and the ICC profile, converting colour with `moxcms`,
     a pure-Rust colour-management library.
@@ -355,8 +362,9 @@ shows the same exact pixels.
 
 #### Rebuilding the encoder WASM
 
-`native/libjxl/pkg` (ES module glue, `.wasm` and the third-party licences) is committed, so
-this is only needed after changing `native/libjxl/binding.c` or the pinned versions:
+`native/libjxl/pkg` (ES module glue, the SIMD and non-SIMD `.wasm` and the third-party
+licences) is committed, so this is only needed after changing `native/libjxl/binding.c` or
+the pinned versions:
 
 ```sh
 ./scripts/build-libjxl-wasm.sh              # Linux x86-64; needs curl, tar and python3
@@ -367,9 +375,9 @@ release tarball (checked against its SHA-256) and the dependency commits that re
 `deps.sh` pins (Brotli, Highway, skcms), all into `~/.cache/pixmix-libjxl`
 (`PIXMIX_LIBJXL_WORK` overrides it), never into the repository. Source paths are mapped
 to neutral prefixes and debug info is left out, so the binary carries no local paths (the
-script checks); the output is byte-for-byte reproducible. `-Os` is the default: `-O3`
-(`BUILD_OPT=-O3`) makes the WASM 3% larger (2.44 MB instead of 2.38 MB) and was no faster
-in the benchmarks below.
+script checks); both builds are byte-for-byte reproducible, and share one glue module
+(the script checks that too). `-Os` is the default: `-O3` (`BUILD_OPT=-O3`) makes the SIMD
+WASM 3% larger (2.44 MB instead of 2.38 MB) and was no faster in the benchmarks below.
 
 #### Rebuilding the decoder WASM
 

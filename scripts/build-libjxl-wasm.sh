@@ -1,5 +1,6 @@
 #!/bin/sh
-# Rebuilds native/libjxl/pkg (the JPEG XL encoder WASM: libjxl plus native/libjxl/binding.c).
+# Rebuilds native/libjxl/pkg (the JPEG XL encoder WASM, with and without SIMD: libjxl plus
+# native/libjxl/binding.c).
 # Only needed after changing the binding or the pinned versions; the result is committed.
 #
 # Requirements: Linux x86-64 with curl, tar and python3 (no system compiler). Emscripten,
@@ -57,33 +58,49 @@ for dep in brotli:google/brotli highway:google/highway skcms:google/skcms; do
 done
 
 # --- build ------------------------------------------------------------------------
+# Two variants: with WebAssembly SIMD (pixmix_libjxl.*, used wherever the engine has it) and
+# without (pixmix_libjxl_nosimd.*, for engines that lack it); codec.js picks at run time.
 # Source paths (in assertion messages) are mapped to neutral prefixes so the committed
-# binary carries no home directory.
+# binaries carry no home directory.
 MAP="-ffile-prefix-map=$WORK/$SRC=libjxl -ffile-prefix-map=$EMSDK=emsdk -ffile-prefix-map=$REPO=pixmix"
-FLAGS="$OPT -msimd128 -DNDEBUG $MAP"
-BUILD="build$OPT"
-emcmake cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_FLAGS="$FLAGS" -DCMAKE_CXX_FLAGS="$FLAGS" \
-  -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DJPEGXL_ENABLE_WASM_THREADS=OFF \
-  -DJPEGXL_ENABLE_TOOLS=OFF -DJPEGXL_ENABLE_DOXYGEN=OFF -DJPEGXL_ENABLE_MANPAGES=OFF \
-  -DJPEGXL_ENABLE_BENCHMARK=OFF -DJPEGXL_ENABLE_EXAMPLES=OFF -DJPEGXL_ENABLE_JNI=OFF \
-  -DJPEGXL_ENABLE_SJPEG=OFF -DJPEGXL_ENABLE_OPENEXR=OFF \
-  -DJPEGXL_ENABLE_SKCMS=ON -DJPEGXL_ENABLE_TCMALLOC=OFF \
-  -DJPEGXL_ENABLE_PLUGINS=OFF -DJPEGXL_ENABLE_FUZZERS=OFF -DJPEGXL_ENABLE_DEVTOOLS=OFF \
-  -DJPEGXL_FORCE_SYSTEM_BROTLI=OFF -DJPEGXL_FORCE_SYSTEM_HWY=OFF -DJPEGXL_BUNDLE_LIBPNG=OFF > "$BUILD.log"
-cmake --build "$BUILD" --target jxl jxl_cms >> "$BUILD.log"
-
 OUT="${PIXMIX_LIBJXL_OUT:-$REPO/native/libjxl/pkg}"
 mkdir -p "$OUT"
-LIBS=$(find "$BUILD" -name 'libjxl.a' -o -name 'libjxl_cms.a' -o -name 'libhwy.a' -o -name 'libbrotlienc.a' -o -name 'libbrotlicommon.a' -o -name 'libskcms*.a' | sort)
-# ES module glue; pixmix always hands it the WASM bytes (wasmBinary), so it never fetches or
-# touches the file system, and it runs unchanged in Node, browsers and workers.
-emcc $FLAGS -I "$SRC/lib/include" -I "$BUILD/lib/include" -c "$REPO/native/libjxl/binding.c" -o "$BUILD/binding.o"
-em++ $FLAGS "$BUILD/binding.o" $LIBS -o "$OUT/pixmix_libjxl.mjs" \
-  -sMODULARIZE=1 -sEXPORT_ES6=1 -sEXPORT_NAME=createEncoder -sENVIRONMENT=web,worker \
-  -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4GB -sSTACK_SIZE=1MB -sFILESYSTEM=0 \
-  -sDYNAMIC_EXECUTION=0 -sINCOMING_MODULE_JS_API=wasmBinary -sEXPORTED_RUNTIME_METHODS=HEAPU8 \
-  -sASSERTIONS=0 -g0 --no-entry
+
+build_variant() { # name, extra compiler flags
+  FLAGS="$OPT $2 -DNDEBUG $MAP"
+  BUILD="build$OPT$1"
+  emcmake cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_FLAGS="$FLAGS" -DCMAKE_CXX_FLAGS="$FLAGS" \
+    -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DJPEGXL_ENABLE_WASM_THREADS=OFF \
+    -DJPEGXL_ENABLE_TOOLS=OFF -DJPEGXL_ENABLE_DOXYGEN=OFF -DJPEGXL_ENABLE_MANPAGES=OFF \
+    -DJPEGXL_ENABLE_BENCHMARK=OFF -DJPEGXL_ENABLE_EXAMPLES=OFF -DJPEGXL_ENABLE_JNI=OFF \
+    -DJPEGXL_ENABLE_SJPEG=OFF -DJPEGXL_ENABLE_OPENEXR=OFF \
+    -DJPEGXL_ENABLE_SKCMS=ON -DJPEGXL_ENABLE_TCMALLOC=OFF \
+    -DJPEGXL_ENABLE_PLUGINS=OFF -DJPEGXL_ENABLE_FUZZERS=OFF -DJPEGXL_ENABLE_DEVTOOLS=OFF \
+    -DJPEGXL_FORCE_SYSTEM_BROTLI=OFF -DJPEGXL_FORCE_SYSTEM_HWY=OFF -DJPEGXL_BUNDLE_LIBPNG=OFF > "$BUILD.log"
+  cmake --build "$BUILD" --target jxl jxl_cms >> "$BUILD.log"
+  LIBS=$(find "$BUILD" -name 'libjxl.a' -o -name 'libjxl_cms.a' -o -name 'libhwy.a' -o -name 'libbrotlienc.a' -o -name 'libbrotlicommon.a' -o -name 'libskcms*.a' | sort)
+  # ES module glue; pixmix always hands it the WASM bytes (wasmBinary), so it never fetches
+  # or touches the file system, and it runs unchanged in Node, browsers and workers.
+  emcc $FLAGS -I "$SRC/lib/include" -I "$BUILD/lib/include" -c "$REPO/native/libjxl/binding.c" -o "$BUILD/binding.o"
+  em++ $FLAGS "$BUILD/binding.o" $LIBS -o "$OUT/pixmix_libjxl$1.mjs" \
+    -sMODULARIZE=1 -sEXPORT_ES6=1 -sEXPORT_NAME=createEncoder -sENVIRONMENT=web,worker \
+    -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4GB -sSTACK_SIZE=1MB -sFILESYSTEM=0 \
+    -sDYNAMIC_EXECUTION=0 -sINCOMING_MODULE_JS_API=wasmBinary -sEXPORTED_RUNTIME_METHODS=HEAPU8 \
+    -sASSERTIONS=0 -g0 --no-entry
+  if strings "$OUT/pixmix_libjxl$1.wasm" "$OUT/pixmix_libjxl$1.mjs" | grep -q -e "$HOME" -e /home/; then
+    echo "error: build output contains a home directory path" >&2; exit 1
+  fi
+}
+build_variant "" -msimd128
+build_variant _nosimd ""
+# Both variants export the same functions, so one glue serves both (pixmix passes the
+# bytes of whichever .wasm it picked); the glues differ only in the default file name.
+if ! sed 's/pixmix_libjxl_nosimd\.wasm/pixmix_libjxl.wasm/g' "$OUT/pixmix_libjxl_nosimd.mjs" | cmp -s - "$OUT/pixmix_libjxl.mjs"; then
+  echo "error: the SIMD and non-SIMD glue differ" >&2; exit 1
+fi
+rm "$OUT/pixmix_libjxl_nosimd.mjs"
+
 # The licences that come with the binary: libjxl (BSD-3-Clause, plus its patent grant),
 # Highway (BSD-3-Clause option of its dual licence), Brotli (MIT), skcms (BSD-3-Clause).
 for f in libjxl:LICENSE libjxl:PATENTS highway:third_party/highway/LICENSE-BSD3 \
@@ -92,7 +109,4 @@ for f in libjxl:LICENSE libjxl:PATENTS highway:third_party/highway/LICENSE-BSD3 
   cat "$SRC/${f#*:}"
   printf '\n'
 done > "$OUT/THIRD_PARTY_LICENSES.txt"
-if strings "$OUT/pixmix_libjxl.wasm" "$OUT/pixmix_libjxl.mjs" | grep -q -e "$HOME" -e /home/; then
-  echo "error: build output contains a home directory path" >&2; exit 1
-fi
 ls -l "$OUT"

@@ -199,7 +199,7 @@ function encodeOpts() {
   const o = { key: $('key').value, format: outputFormat() };
   if (o.format !== 'jpeg') {
     // "auto" leaves the choice to pixmix: pixel for PNG; for JPEG XL the JPEG route when
-    // the source is a JPEG and the encoder runs on the server, else pixel.
+    // the source is a JPEG (on the server and in the browser alike), else pixel.
     if ($('mode').value) o.mode = $('mode').value;
     if (o.mode === 'block') o.block = Number($('block').value);
     if (o.format === 'jxl') {
@@ -303,8 +303,8 @@ async function rgba(bytes) {
 
 async function verify() {
   const key = $('decKey').value || activeKey;
-  // A JPEG-route JPEG XL restores to JPEG XL only with cjxl (servers); in the browser,
-  // compare the JPEG inside it with the (sanitised) original JPEG instead.
+  // A JPEG-route JPEG XL restores to a JPEG XL holding the JPEG: compare that JPEG (what
+  // the <img> shows) with the (sanitised) original JPEG.
   const info = Enc.inspect(scrambled);
   const jpegRoute = info.format === 'jxl' && info.mode === 'mcu';
   const restored = jpegRoute ? (await Dec.restoreForDisplay(scrambled, { key })).bytes : await Dec.decodeAsync(scrambled, { key });
@@ -327,7 +327,7 @@ async function verify() {
 }
 
 // PNG chunks or JPEG segments; image data and pixmix markers are the "coding" parts.
-const CODING = new Set(['IDAT', 'pmIx', 'DHT', 'SOS', 'DRI', 'APP15', 'jxlc', 'jxlp', 'ftyp']);
+const CODING = new Set(['IDAT', 'pmIx', 'DHT', 'SOS', 'DRI', 'APP15', 'jxlc', 'jxlp', 'jxll', 'ftyp']);
 const structure = (b) => { const i = Enc.inspect(b); return i.chunks ?? i.segments ?? i.boxes; };
 
 function renderChunks(before, after, converted) {

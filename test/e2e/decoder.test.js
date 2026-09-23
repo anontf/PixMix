@@ -6,7 +6,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import sharp from 'sharp';
 import { GifWriter } from 'omggif';
-import { encode, encodeAsync, decodeAsync, inspect } from '../../src/index.js';
+import { encode, encodeAsync, decodeAsync, inspect, convert } from '../../src/index.js';
 import { readPng } from '../../src/formats/png/index.js';
 import { toRGBA8 } from '../../src/formats/png/rgba.js';
 import { readSegments } from '../../src/formats/jpeg/markers.js';
@@ -66,13 +66,14 @@ const CASES = [
   ['JPEG XL pixel route', async () => encodeAsync(F.jxlSource, { key: 'k', mode: 'block', block: 8 }), 'jxl'],
   ['JPEG XL JPEG route', async () => encodeAsync(F.jpeg, { key: 'k', format: 'jxl' }), 'jxl-jpeg'],
   ['APNG from GIF', async () => encode(F.gif, { key: 'k', mode: 'block', block: 4 }), 'apng'],
+  ['animated JPEG XL from GIF', async () => encodeAsync(F.gif, { key: 'k', format: 'jxl', mode: 'block', block: 4 }), 'jxl-anim'],
 ];
 
 for (const [name, make, kind] of CASES) {
   for (const effect of ['blocks', 'dissolve', 'scan', 'none']) {
     test(`${name} · ${effect}`, async () => {
       const scrambled = await make();
-      const ext = { png: 'png', apng: 'png', jpeg: 'jpg', 'jpeg-progressive': 'jpg', jxl: 'jxl', 'jxl-jpeg': 'jxl' }[kind];
+      const ext = { png: 'png', apng: 'png', jpeg: 'jpg', 'jpeg-progressive': 'jpg', jxl: 'jxl', 'jxl-jpeg': 'jxl', 'jxl-anim': 'jxl' }[kind];
       const { page: p, errors, workers } = await page(decoderPage({ src: `/s.${ext}`, effect }), { [`/s.${ext}`]: scrambled });
       const r = await revealed(p);
       assert.equal(r.state, 'done');
@@ -89,6 +90,9 @@ for (const [name, make, kind] of CASES) {
       } else if (kind === 'jxl') {
         const want = Buffer.from((await (await loadJxlCodec()).decode(F.jxlSource)).data);
         assert.ok(pngFrames(shown)[0].equals(want), 'PNG of the exact JPEG XL pixels');
+      } else if (kind === 'jxl-anim') {
+        assert.equal(inspect(shown).frames, 4, 'an APNG of every frame');
+        assert.deepEqual(pngFrames(shown), pngFrames(convert(F.gif, { format: 'png' }).bytes), 'every frame exact');
       } else {
         const source = kind === 'apng' ? encode(F.gif, { key: 'x' }) : F.png;
         const want = kind === 'apng' ? pngFrames(await decodeAsync(source, { key: 'x' })) : pngFrames(F.png);
@@ -176,6 +180,34 @@ test('browser plugin: animated WebP keeps every frame through WebCodecs ImageDec
   assert.ok(out.transferred.includes('animation'));
   const px = pngFrames(new Uint8Array(out.png)).map((f) => [...f.subarray(0, 4)]);
   assert.deepEqual(px, [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]]);
+  assert.deepEqual(errors, []);
+  await p.close();
+});
+
+test('encoder in the browser: JPEG -> JPEG XL takes the JPEG route, and 16-bit / ICC / animation survive', async () => {
+  const { page: p, errors } = await page('<!doctype html><body></body>', {});
+  const out = await p.evaluate(async ({ jpeg, gif }) => {
+    const Enc = await import('/dist/pixmix-encoder.mjs');
+    const Dec = await import('/dist/pixmix-decoder.js');
+    const jxl = await Enc.encodeAsync(new Uint8Array(jpeg), { key: 'k', format: 'jxl' });
+    const restored = await Dec.decodeAsync(jxl, { key: 'k' }); // back to JPEG XL, in the browser
+    const anim = await Enc.encodeAsync(new Uint8Array(gif), { key: 'k', format: 'jxl' });
+    const w = 5, h = 3, d16 = new Uint16Array(w * h * 4).map((_, i) => (i * 4099 + 7) & 0xffff);
+    const codec = await Enc.loadJxlCodec();
+    const deep = await Enc.encodeAsync(await codec.encode({ width: w, height: h, depth: 16, data: d16 }), { key: 'k', mode: 'block', block: 2 });
+    const deepBack = (await codec.decode(await Dec.decodeAsync(deep, { key: 'k' }), { high: true })).data;
+    return {
+      info: Enc.inspect(jxl), jxl: Array.from(jxl), restored: Array.from(restored),
+      anim: Enc.inspect(anim), deep: Enc.inspect(deep).bitDepth, deepExact: deepBack.every((v, i) => v === d16[i]),
+    };
+  }, { jpeg: Array.from(F.jpeg), gif: Array.from(F.gif) });
+  assert.equal(out.info.mode, 'mcu', 'JPEG route');
+  const plain = convert(F.jpeg, { format: 'jpeg' }).bytes;
+  const { unscrambleJxlDetailed, reconstructJpeg } = await import('../../src/formats/jxl/index.js');
+  assert.ok(sameCoefs((await unscrambleJxlDetailed(new Uint8Array(out.jxl), { key: 'k' })).jpeg.toJpeg(), plain), 'Node restores what the browser wrote');
+  assert.ok(sameCoefs(await reconstructJpeg(new Uint8Array(out.restored)), plain), 'the browser restored it to a JPEG XL of the original JPEG');
+  assert.deepEqual([out.anim.animated, out.anim.mode], [true, 'pixel']);
+  assert.deepEqual([out.deep, out.deepExact], [16, true]);
   assert.deepEqual(errors, []);
   await p.close();
 });

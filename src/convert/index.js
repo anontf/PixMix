@@ -9,8 +9,9 @@ import { PixmixError } from '../core/params.js';
 import { readJpegMetadata } from '../meta/jpeg.js';
 import { readWebpMetadata } from '../meta/webp.js';
 import { readJxlMetadata } from '../meta/jxl.js';
-import { readJxl, writeJxl } from '../formats/jxl/container.js';
+import { readJxl, writeJxl, wrapCodestream } from '../formats/jxl/container.js';
 import { sanitizeBoxes } from '../formats/jxl/index.js';
+import { iccSpace, iccFits } from '../formats/jxl/icc.js';
 import { loadJxlCodec } from '../formats/jxl/load.js';
 import { stripExifThumbnail } from '../meta/thumbnails.js';
 import { readChunks, writeChunks } from '../formats/png/chunks.js';
@@ -67,38 +68,59 @@ export async function convertAsync(input, opts = {}) {
   const job = prepare(bytes, opts);
   if (job.done) return job.done;
   if (job.target === 'jxl') {
-    const { image, meta, from, decoder } = await decodeJob(bytes, job, opts);
-    const { boxes, transferred, dropped } = jxlBoxes(meta);
+    const { image, boxes, report } = await decodeJob(bytes, job, opts);
     const codestream = await (await loadJxlCodec()).encode(image);
-    return { bytes: writeJxl(boxes, codestream), format: 'jxl', from, decoder, transferred, dropped };
+    return { bytes: wrapCodestream(boxes, codestream), ...report };
   }
   return finish(bytes, job, await job.decoder.decode(bytes, job.from), opts);
 }
 
 /**
- * For JPEG XL output from another format: the decoded RGBA and the metadata as JXL boxes,
- * so the encoder can scramble the pixels before the one and only (lossless) encode.
+ * For JPEG XL output from another format: the decoded pixels (see formats/jxl JxlImage) and
+ * the metadata as JXL boxes, so the encoder can scramble the pixels before the one and only
+ * (lossless) encode.
  */
 export async function decodeForJxl(input, opts = {}) {
   const bytes = toBytes(input);
   const job = prepare(bytes, { ...opts, format: 'jxl' });
   if (job.done) throw new Error('decodeForJxl is for non-JXL input');
-  const { image, meta, from, decoder } = await decodeJob(bytes, job, opts);
-  const { boxes, transferred, dropped } = jxlBoxes(meta);
-  return { image, boxes, report: { format: 'jxl', from, decoder, transferred, dropped } };
+  return decodeJob(bytes, job, opts);
 }
 
 async function decodeJob(bytes, job, { keepThumbnails = false }) {
-  const decoded = await job.decoder.decode(bytes, job.from);
+  const decoded = normalise(await job.decoder.decode(bytes, job.from));
   const meta = mergedMeta(bytes, job.from, decoded, keepThumbnails);
-  const image = to8bit(normalise(decoded), meta); // the JPEG XL encoder is 8-bit
-  return { image, meta, from: job.from, decoder: job.decoder.name };
+  const { image, boxes, transferred, dropped } = jxlImage(decoded, meta);
+  return { image, boxes, report: { format: 'jxl', from: job.from, decoder: job.decoder.name, transferred, dropped } };
 }
 
-// JPEG XL keeps EXIF and XMP in boxes; the colour profile would go in the codestream,
-// which the bundled encoder always writes as sRGB.
-function jxlBoxes(meta) {
-  const boxes = [], transferred = [], dropped = [...meta.dropped];
+/**
+ * Decoded pixels and metadata as JPEG XL has them: EXIF and XMP in boxes; the ICC profile,
+ * animation frames and 16-bit samples in the codestream.
+ */
+function jxlImage(decoded, meta) {
+  const boxes = [], transferred = [];
+  let dropped = [...meta.dropped];
+  let image = { width: decoded.width, height: decoded.height, depth: decoded.depth === 16 ? 16 : 8, data: decoded.data };
+  const frames = decoded.animation?.frames.length > 1 ? decoded.animation.frames : null;
+  if (frames) {
+    // Animations are 8-bit (so are the frames decoders hand over).
+    if (image.depth === 16) image = to8bit(image, { dropped });
+    image = { ...image, data: frames[0].data, frames, plays: decoded.animation.plays };
+    dropped = dropped.filter((d) => !d.startsWith('animation'));
+    transferred.push('animation');
+  } else if (image.depth === 16 && image.data.every((v) => v % 257 === 0)) {
+    image = { ...image, depth: 8, data: Uint8Array.from(image.data, (v) => v / 257) }; // 8 bits lose nothing
+  }
+  if (meta.icc) {
+    const space = iccSpace(meta.icc);
+    if (iccFits(meta.icc, frames ? frames.map((f) => f.data) : [image.data])) {
+      image.icc = meta.icc;
+      transferred.push('ICC profile');
+    } else {
+      dropped.push(space === 'GRAY' ? 'ICC profile (GRAY profile on a colour image)' : `ICC profile (${space?.trim() || 'invalid'} colour space)`);
+    }
+  }
   if (meta.exif?.length) {
     const d = new Uint8Array(4 + meta.exif.length);
     d.set(meta.exif, 4);
@@ -106,10 +128,9 @@ function jxlBoxes(meta) {
     transferred.push('EXIF');
   }
   if (meta.xmp) { boxes.push({ type: 'xml ', data: new TextEncoder().encode(meta.xmp) }); transferred.push('XMP'); }
-  if (meta.icc) dropped.push('ICC profile (the bundled JPEG XL encoder writes sRGB only)');
   if (meta.density) dropped.push('density (JPEG XL has no field for it)');
   if (meta.comments?.length) dropped.push('comments (JPEG XL has no field for them)');
-  return { boxes, transferred, dropped: [...new Set(dropped)] };
+  return { image, boxes, transferred, dropped: [...new Set(dropped)] };
 }
 
 function prepare(bytes, { format, decoders = [], keepThumbnails = false }) {

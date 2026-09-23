@@ -1,5 +1,5 @@
 // JPEG XL files: a bare codestream (FF 0A …) or an ISO-BMFF container of boxes. Only the
-// headers are parsed here; pixels go through the libjxl WASM codec (codec.js).
+// headers are parsed here; pixels go through the WASM codec (codec.js).
 
 import { PixmixError } from '../../core/params.js';
 
@@ -66,6 +66,15 @@ export function writeJxl(boxes, codestream) {
   return out;
 }
 
+/**
+ * writeJxl for encoder output: a bare codestream, or a container when the codestream needs
+ * level 10 (e.g. 16-bit lossless), whose `jxll` level box is kept right after `ftyp`.
+ */
+export function wrapCodestream(boxes, encoded) {
+  const { container, boxes: own, codestream } = readJxl(encoded);
+  return writeJxl([...(container ? own.filter((b) => b.type === 'jxll') : []), ...boxes], codestream);
+}
+
 // --- codestream headers (ISO/IEC 18181-1 SizeHeader and the start of ImageMetadata) ---
 
 class Bits {
@@ -126,9 +135,9 @@ export function readJxlHeader(codestream) {
       }
       if (r.bool()) { // animation
         info.animated = true;
-        r.u32([[100, 0], [1000, 0], [1, 10], [1, 30]]);
+        r.u32([[100, 0], [1000, 0], [1, 10], [1, 30]]); // ticks per second
         r.u32([[1, 0], [1001, 0], [1, 8], [1, 10]]);
-        r.u32([[0, 0], [0, 3], [0, 16], [0, 32]]);
+        info.loops = r.u32([[0, 0], [0, 3], [0, 16], [0, 32]]);
         r.bool();
       }
     }

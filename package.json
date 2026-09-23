@@ -17,7 +17,8 @@
     "src",
     "dist",
     "bin",
-    "native/jxl/pkg"
+    "native/jxl/pkg",
+    "native/libjxl/pkg"
   ],
   "scripts": {
     "build": "node scripts/build.js",
@@ -30,10 +31,8 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@jsquash/jxl": "^1.3.0",
     "fflate": "^0.8.2",
     "jpeg-js": "^0.4.4",
-    "jxl-wasm": "^0.7.0",
     "omggif": "^1.0.10"
   },
   "devDependencies": {

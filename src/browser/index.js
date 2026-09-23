@@ -33,8 +33,8 @@ export async function decodeAsync(input, { key } = {}) {
 
 /**
  * The restored image in a form every browser displays: PNG and JPEG as they are; JPEG XL
- * (which most browsers cannot show) as a lossless PNG of its pixels, or, on the JPEG
- * route, as the original JPEG. Works without the JPEG XL encoder or cjxl.
+ * (which most browsers cannot show) as a lossless PNG of its pixels (an APNG when it is
+ * animated), or, on the JPEG route, as the original JPEG. Needs only the JPEG XL decoder.
  * @returns {Promise<{bytes: Uint8Array, type: string}>}
  */
 export async function restoreForDisplay(input, { key, worker } = {}) {

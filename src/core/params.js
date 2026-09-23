@@ -98,8 +98,11 @@ export function readMarker(data) {
   if (!mode) throw new PixmixError('Corrupt pixmix marker (mode)');
   const saltLen = dv.getUint8(4);
   if (data.length !== 5 + saltLen + CHECK_BYTES) throw new PixmixError('Corrupt pixmix marker (length)');
+  const block = dv.getUint16(2);
+  // The same range makeParams allows: a tile size of 0 made the tile grid infinite.
+  if (mode === 'block' && !(block >= 2 && block <= 4096)) throw new PixmixError('Corrupt pixmix marker (block size)');
   return {
-    params: { version, mode, block: dv.getUint16(2), salt: data.slice(5, 5 + saltLen) },
+    params: { version, mode, block, salt: data.slice(5, 5 + saltLen) },
     check: data.slice(5 + saltLen),
   };
 }

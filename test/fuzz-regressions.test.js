@@ -1,6 +1,6 @@
 // Regression tests for the bugs the fuzzer found (test/fuzz). Each input is the minimal
-// shape of the failing case, built here rather than stored as a binary. Every one used to
-// throw something other than a PixmixError, or hang.
+// shape of the failing case, built here rather than stored as a binary. Each one used to
+// throw something other than a PixmixError, hang, or encode a file decode could not restore.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -11,7 +11,7 @@ import { gifDecoder } from '../src/convert/decoders.js';
 import { encode, encodeAsync, decode, decodeAsync, rekeyAsync, inspect, convert, convertAsync } from '../src/index.js';
 import { compute } from '../src/browser/compute.js';
 import { sharpDecoder } from '../src/plugins/sharp.js';
-import { writeChunks } from '../src/formats/png/chunks.js';
+import { writeChunks, readChunks } from '../src/formats/png/chunks.js';
 import { encodeRaster } from '../src/formats/png/raster.js';
 import { writeJxl } from '../src/formats/jxl/container.js';
 import { loadJxlCodec } from '../src/formats/jxl/load.js';
@@ -207,6 +207,27 @@ test('sharp plugin: libvips errors on a corrupt WebP come out as PixmixErrors', 
   const decoders = [sharpDecoder(sharp)];
   await rejectsPixmix(() => encodeAsync(broken, { key: 'k', decoders }), 'BAD_WEBP');
   await rejectsPixmix(() => convertAsync(broken, { format: 'jpeg', decoders }), 'BAD_WEBP');
+});
+
+test('PNG: a marker claiming mcu mode, or a block size of 0, is refused (the tile grid was infinite)', async () => {
+  const png = writeChunks([
+    { type: 'IHDR', data: cat(u32(6, 5), Uint8Array.of(8, 0, 0, 0, 0)) },
+    { type: 'IDAT', data: encodeRaster({ width: 6, height: 5, depth: 8, colorType: 0, interlace: 0 }, new Uint8Array(30).map((_, i) => i * 8)) },
+    { type: 'IEND', data: new Uint8Array(0) },
+  ]);
+  const scrambled = encode(png, { key: 'k' });
+  for (const [mode, block] of [[2, 0], [2, 1], [1, 0], [1, 1]]) {
+    const chunks = readChunks(scrambled).map((c) => {
+      if (c.type !== 'pmIx') return c;
+      const data = c.data.slice();
+      data[1] = mode;
+      data[2] = block >> 8; data[3] = block & 255;
+      return { ...c, data };
+    });
+    const bad = writeChunks(chunks);
+    await rejectsPixmix(() => decode(bad, { key: 'k' }));
+    await rejectsPixmix(() => compute(bad, 'k'));
+  }
 });
 
 test('decode of a scrambled file is still fine after all that', () => {

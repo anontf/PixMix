@@ -36,6 +36,7 @@ to the demo gallery. Only use `serve:lan` on a network you trust.
   where the browser can't encode WebP, as in Safari).
   - Encode it on the server or in the browser, and see what metadata was kept or dropped.
   - Watch it decode with each animation, compare chunks, rekey, try a wrong key.
+  - Create and edit watermarks, with a live preview, and save them to `watermarks/`.
 - **Demo site** (`/site.html`): images published from the lab, served scrambled and
   revealed by the standalone `<script>` decoder as they scroll into view.
 
@@ -52,6 +53,10 @@ pixmix decode scrambled/photo.scrambled.jpg   # -> scrambled/photo.jpg
 pixmix rekey --in-place --to-file new.key scrambled/*
 pixmix inspect photo.jpg scrambled/photo.scrambled.jpg
 cat in.webp | pixmix encode -o - - > out.png  # stdin/stdout
+pixmix encode photo.jpg --watermark vivi-gold # carry a watermark for the decoder to draw
+pixmix encode photo.jpg --visible-watermark vivi-pixel   # drawn on the scrambled image too
+pixmix decode photo.scrambled.jpg --watermark embedded   # draw the one it carries
+pixmix decode photo.scrambled.jpg --watermark my-mark.json
 ```
 
 For each file it reports how the input was decoded and what metadata was kept or dropped.
@@ -69,11 +74,15 @@ lists every option.
 | `dist/pixmix-decoder.min.js` | IIFE → `window.PixMix` | drop into any website |
 | `dist/pixmix-decoder.js` | ESM | bundlers / `<script type="module">` |
 | `dist/pixmix-worker.mjs` | ESM (Web Worker) | used by both decoders to decode off the main thread |
+| `dist/pixmix-watermark.mjs` | ESM | draws watermarks, loaded on demand (36 KB; 16 KB gzipped) |
 | `dist/pixmix-encoder.mjs` | ESM, platform-neutral | Node, Deno, Bun, workers, browsers |
 | `dist/pixmix-encoder.cjs` | CommonJS | `require()`-based servers |
 | `dist/pixmix-jxl.mjs` + `pixmix-jxl-{enc,dec}.wasm` | ESM + WASM | JPEG XL support, loaded on demand |
 
 The decoder bundle contains no encoding code; the encoder bundle has no DOM code.
+
+Deploy `pixmix-watermark.mjs` next to the decoder if you use watermarks (or call
+`configureWatermarks({ moduleUrl })`); it is only fetched when one is drawn.
 
 Deploy `pixmix-worker.mjs` next to the decoder to keep large decodes off the main thread.
 If it's missing, or a CSP forbids workers, the decoder quietly decodes on the main thread.
@@ -128,6 +137,7 @@ Options:
 - `decoders`: extra input decoders.
 - `onConvert(report)`: reports how the input was decoded and what metadata was kept or
   dropped: `{ format, from, decoder, transferred, dropped }`.
+- `watermark`, `visibleWatermark`: see "Watermarks" below.
 
 `encode` is synchronous and handles PNG, JPEG and GIF on its own. JPEG XL, in or out,
 goes through `encodeAsync`, `decodeAsync` and `rekeyAsync`, because its codec is WASM loaded
@@ -273,7 +283,8 @@ It needs only the JPEG XL decoder, not the encoder.
   - `none`.
   - `prefers-reduced-motion` forces `none`.
 - Per-image overrides: `data-pixmix-key`, `data-pixmix-effect`, `data-pixmix-src` (fetch from
-  here instead of `src`, e.g. to show a placeholder first).
+  here instead of `src`, e.g. to show a placeholder first), `data-pixmix-watermark`.
+- Watermarks (see below): `watermark` / `data-watermark` on the script tag.
 - EXIF orientation: the animation is drawn rotated or flipped the same way the browser will
   show the final `<img>`. Browsers differ on EXIF in PNGs, so this is detected once with a
   2×1 test image. Override it with `orientation: 'apply' | 'ignore'`.
@@ -389,6 +400,139 @@ cargo install wasm-bindgen-cli --version 0.2.128   # must match native/jxl/Cargo
 ./scripts/build-jxl-wasm.sh
 ```
 
+## Watermarks
+
+A watermark is a small footer drawn on the revealed image: text in a committed font, with an
+outline, a shadow, a background box and ornaments. The decoder draws it at the end of the
+reveal, and the `<img>` then shows the watermarked file.
+
+- **Definitions** live in `watermarks/<id>.json`, one small JSON file each, in a fixed key
+  order and layout so diffs stay clean. The lab edits them (`/`), or edit them by hand and
+  run `npm run watermarks` (`--check` reports stale compiled files; a test does too).
+- **Compiled watermarks** (`watermarks/compiled/<id>.json`, plus an `.svg` preview) hold the
+  text as glyph outlines, made with opentype.js when a definition is saved. Drawing needs no
+  font, so nothing depends on what is installed. This is what decoders fetch.
+- **Fonts** are in `watermarks/fonts/` with their licences (SIL OFL): Press Start 2P,
+  Pixelify Sans, Cinzel Decorative. Logos for image ornaments go in `watermarks/assets/`
+  (PNG, up to 256×256).
+
+The three defaults are bottom-right footers reading "Vivi":
+- `vivi-pixel`: crisp Press Start 2P, off-white with a dark 1-pixel outline and a hard
+  shadow; sized in whole font pixels (8, 16 or 24 px).
+- `vivi-window`: a JRPG dialogue window, dark-blue gradient box with a silver border and
+  rounded corners, the name in Pixelify Sans.
+- `vivi-gold`: Cinzel Decorative in a metallic gold gradient, with a sparkle and a thin
+  gold line that fades out at both ends.
+
+What a definition can set (lengths in em, the font size, unless named otherwise):
+- `text` (up to 4 lines), `font`, `letterSpacing`, `lineHeight`, `align`.
+- `size`: `px`, or `relative` to the image's `short` / `long` side, `width`, `height` or
+  `diagonal`, clamped to `min` / `max` px and optionally snapped (`snap`, for pixel fonts).
+  `fit.maxWidth` / `fit.maxHeight` (fractions of the image) shrink it on small images, and
+  below `fit.minSize` px it is left out.
+- `anchor` (9 positions), `margin` (`relative` with `min` / `max` px), `offset`.
+- `fill`: a colour (`#rrggbb` or `#rrggbbaa`) or a linear gradient (CSS angle, 2–8 stops);
+  `opacity`; `crisp` (no anti-aliasing).
+- `stroke` (colour, width, round or square join, opacity), `shadow` (colour, opacity,
+  offset, blur).
+- `background`: `box`, `pill` or `strip` (full width), with its own fill, opacity, radius,
+  padding and `border`.
+- `ornaments` (up to 8): `sparkle`, `star`, `diamond`, `dot`, `heart`, `line` or `image`,
+  before / after / above / below the text or at a corner, with size, gap, offset, own fill.
+
+Rendering is plain JavaScript: a scanline rasteriser for the outlines, the outline as a
+dilation, the shadow as an offset, box-blurred copy. It uses only exactly specified maths
+(no `Math.sin`, no canvas), so Node, Chromium and WebKit draw the same pixels; the browser
+tests check that the `<img>` shows exactly what Node draws (the same JPEG file, byte for
+byte; for PNG the same pixels, as each engine deflates its own way). EXIF orientation is respected:
+the watermark sits bottom-right of the image as displayed.
+
+Drawn on a restored file:
+- PNG keeps its colour type, bit depth and every chunk. Palette and 1/2/4-bit images become
+  8-bit RGBA. In an APNG, every frame that holds the whole watermark gets it.
+- JPEG is painted in the DCT domain: only the blocks under the watermark are decoded,
+  painted and quantised again, with the file's own tables. Everything else keeps its exact
+  coefficients, and the metadata stays.
+- JPEG XL: its pixels (lossless again), or the JPEG inside on the JPEG route.
+
+```html
+<script src="pixmix-decoder.min.js" data-key="site-key" data-watermark="vivi-gold"></script>
+```
+
+```js
+PixMix.revealAll({ key, watermark: 'vivi-gold' });   // an id: fetched from watermarks/<id>.json
+PixMix.revealAll({ key, watermark: compiled });      // or a compiled watermark object
+PixMix.revealAll({ key, watermark: false });         // none, even if the file carries one
+const exact = await PixMix.decodeAsync(bytes, { key });                     // never watermarked
+const shown = await decodeAsync(bytes, { key, watermark: 'embedded' });     // Node: the file's own
+```
+
+- The default (`'auto'`) draws the watermark the file carries, if any.
+- Ids are looked up at `watermarkBase` (`data-watermark-base`, default `watermarks/` next
+  to the page). The dev server serves the compiled ones there.
+- A watermark that cannot be loaded or drawn is skipped with a warning; the image still
+  shows.
+- `decodeAsync`, `restoreForDisplay` and `decodeToURL` stay exact unless given `watermark`.
+
+### Watermarks in scrambled files
+
+A scrambled file can carry two things, in private places other software ignores (PNG
+chunks, JPEG APP15 segments, JPEG XL boxes). Restored files carry neither.
+
+**The watermark for the decoder** (`encode(…, { watermark })`, `--watermark`): a whole
+compiled watermark (2–3 KB), or just its id (`{ id }`, `--watermark-ref`), which the decoder
+looks up. The reveal then draws it without being told which. Rekey keeps it (`watermark:
+null` removes it, another value replaces it). It is not authenticated: like the image
+itself, anyone can change it.
+
+**A visible watermark on the scrambled image** (`visibleWatermark`, `--visible-watermark`):
+every viewer shows the scrambled image with the watermark on it, and pixmix still restores
+the original exactly.
+- The scrambled pixels under it (for JPEG, the coefficients of its whole MCUs) are kept in
+  the file, compressed and encrypted with a key-derived ChaCha20 stream, so the watermark
+  can't be taken off without the key. The decoder puts them back before unscrambling.
+- It costs a few KB: with the defaults, 2–6 KB on an 800×500 image, 7–23 KB at 4000×2600
+  (noisy content; JPEG less than PNG). It includes the watermark itself, 1–3 KB.
+- The marker becomes v2 (see below), so older pixmix versions refuse the file instead of
+  restoring it with the watermark scattered over the image.
+- Rekey draws it again under the new key; `visibleWatermark: null` removes it.
+- PNG: any colour type (palette images use their nearest palette colours); APNG frames that
+  hold the whole watermark. JPEG: baseline, progressive, grey. JPEG XL: both routes, but on
+  the pixel route only for 8-bit sRGB images (the browser reveals 8-bit sRGB pixels, and
+  the stored ones must be the same); others are refused.
+- Tests check that pngjs, sharp (libpng, libjpeg) and jxl-oxide still read these files.
+
+Considered and left out:
+- Drawing on the scrambled image without keeping what is under it: restoring would no
+  longer be exact.
+- Keeping those pixels unencrypted: anyone could remove the watermark.
+- Visible watermarks on 16-bit or non-sRGB JPEG XL: the reveal decodes such files to
+  converted 8-bit pixels, which the stash cannot match.
+- Signing the carried watermark with the key: in the browser use case the key is public.
+
+Limits on untrusted input: compiled watermarks are validated (sizes, counts, path syntax);
+carried JSON is at most 512 KB; stashed regions must lie inside the image and are inflated
+into a buffer of exactly their size.
+
+### Server and CLI
+
+The dev server keeps definitions in `watermarks/` (`PIXMIX_WATERMARKS_DIR` overrides it):
+- `GET /api/watermarks` (definitions, fonts, assets), `GET /api/watermarks/<id>`;
+  `POST /api/watermarks` creates, `PUT /api/watermarks/<id>` creates or replaces,
+  `DELETE /api/watermarks/<id>`; `POST /api/watermarks/preview` compiles without saving.
+- `GET /watermarks/<id>.json` (compiled) and `.svg`.
+- `/api/encode` takes `watermark`, `watermarkEmbed=id` and `visibleWatermark`;
+  `/api/decode` takes `watermark=<id>` or `watermark=embedded`.
+- Ids must match `[a-z0-9-]`, bodies are limited to 256 KB and validated strictly.
+
+CLI: `--watermark <id|file|embedded>`, `--watermark-ref`, `--visible-watermark <id|file>`,
+`--no-watermark` (rekey) and `--watermarks <dir>`. A file is a definition (compiled with
+the directory's fonts) or a compiled watermark.
+
+In Node, `pixmix/watermarks` exports `compileWatermark`, `normalizeDefinition`,
+`formatDefinition`, `validateCompiled`, `watermarkStore`, `loadWatermark` and
+`renderWatermark`.
+
 ## How it works
 
 1. **Seed.** HKDF-SHA-256 over the key, with the per-image random salt, and info = version,
@@ -430,7 +574,9 @@ cargo install wasm-bindgen-cli --version 0.2.128   # must match native/jxl/Cargo
        padding blocks either.
      - The JPEG inside a JPEG-route JPEG XL is always baseline (see jxl-oxide above).
 
-Marker v1: `u8 version | u8 mode | u16 block | u8 saltLen | salt | u8[4] check`.
+Marker v1: `u8 version | u8 mode | u16 block | u8 saltLen | salt | u8[4] check`. Marker v2
+adds `u8 flags` (bit 0: a visible watermark's stash is in the file); it's only written when a
+flag is set, and the permutation is the same as v1's.
 - In `mcu` mode, `block` holds flags: bit 0 = transforms, bit 1 = restore as progressive.
 - APNG frames mix their index into the seed; it's 0 for still images.
 The permutation stream is pinned by a test. Any change to it must bump the version.
@@ -484,8 +630,10 @@ effort 7 and 5–7% larger (higher efforts close that gap only slowly).
 - a decoder loaded from another origin, a wrong key, EXIF rotation;
 - animated WebP through `ImageDecoder`, and the first-frame fallback without it;
 - the encoder in the page: JPEG → JPEG XL on the JPEG route, animated and 16-bit JPEG XL;
-- the lab (every input/output/mode, encoded on the server and in the browser) and the demo
-  site.
+- watermarks drawn by the reveal (exactly what Node draws), carried and visible ones,
+  and the painter only being fetched when needed;
+- the lab (every input/output/mode, encoded on the server and in the browser, the watermark
+  editor) and the demo site.
 
 Console errors fail a test.
 
@@ -529,6 +677,9 @@ ship.
   input kept in PNG; progressive JPEGs stay progressive
 - [x] Phase 7: pixmix's own libjxl 0.12 WASM encoder: JPEG recompression in browsers too;
   JPEG XL output keeps ICC profiles, 16-bit samples and animations
+- [x] Phase 8: watermarks: committed definitions compiled to outlines, a deterministic
+  renderer, drawn by the reveal, the server and the CLI; carried in scrambled files, or
+  visible on them with exact restoring; lab editor
 - [ ] Firefox in the browser suite
 
 ## Third-party code
@@ -542,6 +693,10 @@ Everything is bundled or loaded under permissive licences:
 - jxl-oxide and its crates (MIT or Apache-2.0), moxcms (BSD-3-Clause or Apache-2.0),
   brotli-decompressor (BSD-3-Clause/MIT).
 - sharp is an optional peer (Apache-2.0).
+- opentype.js (MIT) compiles watermark text; it is not in any bundle.
+- Watermark fonts (SIL Open Font License 1.1, texts in `watermarks/fonts/`): Press Start 2P,
+  Pixelify Sans (both by their project authors) and Cinzel Decorative (Natanael Gama), from
+  the Google Fonts repository.
 
 Test images: [PngSuite](http://www.schaik.com/pngsuite/) by Willem van Schaik (see
 `test/fixtures/pngsuite/PngSuite.LICENSE`).

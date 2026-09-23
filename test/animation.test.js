@@ -8,6 +8,7 @@ import { readPng } from '../src/formats/png/index.js';
 import { readChunks } from '../src/formats/png/chunks.js';
 import { toRGBA8 } from '../src/formats/png/rgba.js';
 import { loadJxlCodec } from '../src/formats/jxl/load.js';
+import { readWebpLoopCount } from '../src/meta/webp.js';
 
 const frameRgba = (png) => { const p = readPng(png); return p.frames.map((f) => Buffer.from(toRGBA8(p, f))); };
 const delays = (png) => readChunks(png).filter((c) => c.type === 'fcTL').map((c) => {
@@ -30,6 +31,14 @@ test('animated WebP (via sharp) becomes an APNG with all frames, delays and loop
   const restored = await decodeAsync(scrambled, { key: 'k' });
   assert.deepEqual(frameRgba(restored), colours.map((c) => solid(24, 16, c)));
   assert.deepEqual(delays(restored), [0.1, 0.2, 0.3]);
+});
+
+test('WebP loop count comes from the ANIM chunk (the browser plugin trusts it over ImageDecoder)', async () => {
+  const frames = await Promise.all([[255, 0, 0], [0, 0, 255]].map((c) => sharp(solid(8, 8, c), { raw: { width: 8, height: 8, channels: 4 } }).png().toBuffer()));
+  const webp = (loop) => sharp(frames, { join: { animated: true } }).webp({ loop, lossless: true }).toBuffer();
+  assert.equal(readWebpLoopCount(await webp(2)), 2);
+  assert.equal(readWebpLoopCount(await webp(0)), 0);
+  assert.equal(readWebpLoopCount(await sharp(frames[0]).webp().toBuffer()), null);
 });
 
 async function animatedJxl() {

@@ -3,6 +3,8 @@
 // one (JPEG, WebP); the pixels go through a canvas, so semi-transparent pixels can lose
 // a little precision to premultiplied alpha.
 
+import { readWebpLoopCount } from '../meta/webp.js';
+
 const DEFAULT_FORMATS = ['webp', 'avif', 'bmp', 'heic', 'jxl', 'tiff'];
 // Animated WebP/AVIF keep every frame (as APNG) where WebCodecs' ImageDecoder exists.
 
@@ -48,17 +50,28 @@ async function frames(bytes, format) {
     if (!track?.animated || track.frameCount < 2) return null;
     const out = [];
     let width = 0, height = 0;
-    for (let i = 0; i < track.frameCount; i++) {
+    const frame = async (i) => {
       const { image } = await decoder.decode({ frameIndex: i });
       width = image.displayWidth;
       height = image.displayHeight;
       const canvas = new OffscreenCanvas(width, height);
       const ctx = canvas.getContext('2d');
       ctx.drawImage(image, 0, 0);
-      out.push({ data: new Uint8Array(ctx.getImageData(0, 0, width, height).data.buffer), delay: [Math.round((image.duration ?? 100000) / 1000), 1000] });
+      const f = { data: new Uint8Array(ctx.getImageData(0, 0, width, height).data.buffer), delay: [Math.round((image.duration ?? 100000) / 1000), 1000] };
       image.close();
+      return f;
+    };
+    for (let i = 0; i < track.frameCount; i++) {
+      let f = await frame(i);
+      // WebKit's first decode() comes back blank, so a fully transparent first frame is
+      // decoded again (harmless when it really is transparent).
+      if (i === 0 && f.data.every((v, j) => (j & 3) !== 3 || v === 0)) f = await frame(0);
+      out.push(f);
     }
-    return { width, height, frames: out, plays: track.repetitionCount === Infinity ? 0 : track.repetitionCount + 1 };
+    // Engines disagree on WebP's loop count (Chromium: plays, WebKit: repeats), so read it
+    // from the file.
+    const plays = format === 'webp' ? readWebpLoopCount(bytes) ?? 0 : track.repetitionCount === Infinity ? 0 : track.repetitionCount + 1;
+    return { width, height, frames: out, plays };
   } finally {
     decoder.close();
   }

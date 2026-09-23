@@ -1,7 +1,10 @@
 // Decoder plugin using the browser's own image decoders (WebP, AVIF, BMP, ICO, …).
 // Container metadata (EXIF/ICC/XMP) still comes from pixmix's own extractors where it has
 // one (JPEG, WebP); the pixels go through a canvas, so semi-transparent pixels can lose
-// a little precision to premultiplied alpha.
+// a little precision to premultiplied alpha. The size limits are checked once the browser
+// knows the size, before any pixels are copied out of it.
+
+import { resolveLimits, checkPixels, checkFrames } from '../core/limits.js';
 
 import { readWebpLoopCount } from '../meta/webp.js';
 
@@ -12,8 +15,9 @@ export function browserDecoder({ formats = DEFAULT_FORMATS } = {}) {
   return {
     name: 'browser',
     formats,
-    async decode(bytes, format) {
-      const animation = await frames(bytes, format);
+    async decode(bytes, format, { limits } = {}) {
+      const l = resolveLimits(limits);
+      const animation = await frames(bytes, format, l);
       if (animation) {
         const [first] = animation.frames;
         return { width: animation.width, height: animation.height, data: first.data, animation, metadata: { dropped: [] } };
@@ -23,6 +27,12 @@ export function browserDecoder({ formats = DEFAULT_FORMATS } = {}) {
         premultiplyAlpha: 'none',
         imageOrientation: 'none', // keep stored orientation; EXIF travels as metadata
       });
+      try {
+        checkPixels(bitmap.width, bitmap.height, l);
+      } catch (err) {
+        bitmap.close();
+        throw err;
+      }
       const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
       const ctx = canvas.getContext('2d');
       ctx.drawImage(bitmap, 0, 0);
@@ -39,7 +49,7 @@ const MIME = { webp: 'image/webp', avif: 'image/avif', gif: 'image/gif', jxl: 'i
  * Every frame of an animated image through WebCodecs' ImageDecoder, where the browser has
  * it; null for still images or when it is unavailable.
  */
-async function frames(bytes, format) {
+async function frames(bytes, format, limits) {
   if (typeof ImageDecoder === 'undefined' || !MIME[format]) return null;
   if (!(await ImageDecoder.isTypeSupported(MIME[format]))) return null;
   const decoder = new ImageDecoder({ data: bytes, type: MIME[format], colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
@@ -48,12 +58,20 @@ async function frames(bytes, format) {
     const track = decoder.tracks.selectedTrack;
     await decoder.completed;
     if (!track?.animated || track.frameCount < 2) return null;
+    checkFrames(track.frameCount, 0, limits);
     const out = [];
     let width = 0, height = 0;
     const frame = async (i) => {
       const { image } = await decoder.decode({ frameIndex: i });
       width = image.displayWidth;
       height = image.displayHeight;
+      try {
+        checkPixels(width, height, limits);
+        checkFrames(track.frameCount, track.frameCount * width * height, limits);
+      } catch (err) {
+        image.close();
+        throw err;
+      }
       const canvas = new OffscreenCanvas(width, height);
       const ctx = canvas.getContext('2d');
       ctx.drawImage(image, 0, 0);

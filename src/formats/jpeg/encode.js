@@ -6,8 +6,17 @@
 import { M, writeSegments } from './markers.js';
 import { ZIGZAG } from './decode.js';
 import { buildOptimalSpec, buildEncodeTable, writeDht, BitWriter } from './huffman.js';
+import { PixmixError } from '../../core/params.js';
 
 const category = (v) => (v ? 32 - Math.clz32(v < 0 ? -v : v) : 0);
+
+// An AC symbol holds the category in 4 bits. A coefficient of -32768 (category 16) only
+// comes from corrupt data that overflowed on decoding; coding it would garble the stream.
+const acCategory = (v) => {
+  const c = category(v);
+  if (c > 15) throw new PixmixError('JPEG coefficient out of range (corrupt data)', 'BAD_JPEG');
+  return c;
+};
 
 /**
  * @param {import('./decode.js').Frame} frame
@@ -60,7 +69,7 @@ export function encodeScan(frame, { restartInterval = 0 } = {}) {
       const v = coefs[blk + ZIGZAG[k]];
       if (!v) { run++; continue; }
       while (run > 15) { acFreq[t][0xf0]++; run -= 16; }
-      acFreq[t][(run << 4) | category(v)]++;
+      acFreq[t][(run << 4) | acCategory(v)]++;
       run = 0;
     }
     if (run) acFreq[t][0]++;
@@ -93,7 +102,7 @@ export function encodeScan(frame, { restartInterval = 0 } = {}) {
       const v = coefs[blk + ZIGZAG[k]];
       if (!v) { run++; continue; }
       while (run > 15) { w.put(acT.code[0xf0], acT.size[0xf0]); run -= 16; }
-      const cat = category(v);
+      const cat = acCategory(v);
       const sym = (run << 4) | cat;
       w.put(acT.code[sym], acT.size[sym]);
       w.put(v < 0 ? v - 1 : v, cat);
@@ -192,7 +201,7 @@ function codeScan(frame, { comps, ss, se }, put) {
       if (!v) { run++; continue; }
       flush();
       while (run > 15) { put(0, 0xf0, 0, 0); run -= 16; }
-      const cat = category(v);
+      const cat = acCategory(v);
       put(0, (run << 4) | cat, v < 0 ? v - 1 : v, cat);
       run = 0;
     }

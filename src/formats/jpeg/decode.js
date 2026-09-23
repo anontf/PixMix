@@ -7,6 +7,7 @@
 import { M, isSof } from './markers.js';
 import { parseDht, buildDecodeTable } from './huffman.js';
 import { PixmixError } from '../../core/params.js';
+import { resolveLimits, checkPixels, limitError } from '../../core/limits.js';
 
 export const ZIGZAG = Uint8Array.from([
   0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21,
@@ -29,8 +30,16 @@ export const ZIGZAG = Uint8Array.from([
  * @property {Component[]} components
  */
 
-/** @param {import('./markers.js').Segment[]} segments @returns {Frame} */
-export function decodeFrame(segments) {
+/**
+ * @param {import('./markers.js').Segment[]} segments
+ * @param {Partial<import('../../core/limits.js').Limits>} [limits]
+ * @returns {Frame}
+ */
+export function decodeFrame(segments, limits) {
+  const { maxScans } = resolveLimits(limits);
+  // Every scan is a pass over the whole image, even with no data left (it is zero-filled).
+  const scans = segments.reduce((n, s) => n + (s.marker === M.SOS), 0);
+  if (scans > maxScans) throw limitError(`JPEG has ${scans} scans, over the limit of ${maxScans} (limits.maxScans)`);
   const dc = [], ac = [];
   let frame = null;
   let restartInterval = 0;
@@ -42,7 +51,7 @@ export function decodeFrame(segments) {
       restartInterval = (data[0] << 8) | data[1];
     } else if (isSof(marker)) {
       if (frame) throw new PixmixError('JPEG has more than one frame', 'UNSUPPORTED');
-      frame = parseSof(marker, data);
+      frame = parseSof(marker, data, limits);
     } else if (marker === M.SOS) {
       if (!frame) throw new PixmixError('JPEG scan before frame header', 'BAD_JPEG');
       decodeScan(frame, data, seg.ecs, dc, ac, restartInterval);
@@ -54,7 +63,7 @@ export function decodeFrame(segments) {
   return frame;
 }
 
-function parseSof(marker, data) {
+function parseSof(marker, data, limits) {
   if (marker !== M.SOF0 && marker !== M.SOF1 && marker !== M.SOF2) {
     const kind = marker === 0xc3 || marker === 0xc7 || marker === 0xcb || marker === 0xcf ? 'lossless'
       : marker >= 0xc9 ? 'arithmetic-coded' : 'hierarchical';
@@ -65,13 +74,17 @@ function parseSof(marker, data) {
   const height = (data[1] << 8) | data[2];
   const width = (data[3] << 8) | data[4];
   if (!height) throw new PixmixError('JPEG with height defined by DNL is not supported', 'UNSUPPORTED');
+  checkPixels(width, height, limits);
   const n = data[5];
   if (!n || n > 4) throw new PixmixError(`JPEG with ${n} components is not supported`, 'UNSUPPORTED');
+  if (data.length < 6 + 3 * n) throw new PixmixError('Truncated JPEG frame header', 'BAD_JPEG');
   const raw = [];
   for (let i = 0; i < n; i++) {
     const o = 6 + i * 3;
     raw.push({ id: data[o], h: data[o + 1] >> 4, v: data[o + 1] & 15, tq: data[o + 2] });
   }
+  // Sampling factors are 1-4 (B.2.2); a 0 made the MCU grid infinite.
+  if (raw.some((c) => c.h < 1 || c.h > 4 || c.v < 1 || c.v > 4)) throw new PixmixError('Invalid JPEG sampling factors', 'BAD_JPEG');
   // A single-component frame is never interleaved: its MCU is one block, whatever the
   // sampling factors say.
   if (n === 1) { raw[0].h = 1; raw[0].v = 1; }

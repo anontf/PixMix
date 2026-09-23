@@ -6,6 +6,7 @@ import { unscrambleJpeg, unscrambleJpegDetailed, inspectJpeg } from './formats/j
 import { unscrambleJxl, unscrambleJxlDetailed, inspectJxl } from './formats/jxl/index.js';
 import { PixmixError } from './core/params.js';
 import { loadPainter } from './watermark/load.js';
+import { withLimits } from './core/limits.js';
 
 export { configureJxl } from './formats/jxl/load.js';
 export { configureWatermarks } from './watermark/load.js';
@@ -19,11 +20,13 @@ const DECODERS = {
 
 export { detectFormat };
 export { PixmixError, WrongKeyError } from './core/params.js';
+export { DEFAULT_LIMITS } from './core/limits.js';
 
 /**
  * Restores the original image.
  * @param {Uint8Array|ArrayBuffer} input scrambled image bytes
- * @param {{key: string|Uint8Array, level?: number}} opts
+ * @param {{key: string|Uint8Array, level?: number, limits?: Partial<import('./core/limits.js').Limits>}} opts
+ *        limits: resource limits for untrusted input (see core/limits.js)
  * @returns {Uint8Array}
  */
 export function decode(input, opts) {
@@ -31,7 +34,7 @@ export function decode(input, opts) {
   const d = pick(DECODERS, bytes);
   if (opts?.watermark) throw new PixmixError('Drawing a watermark is async; use decodeAsync', 'ASYNC_DECODER');
   if (!d.unscramble) throw new PixmixError('JPEG XL decoding is async; use decodeAsync', 'ASYNC_DECODER');
-  return d.unscramble(bytes, opts);
+  return d.unscramble(bytes, withLimits(bytes, opts));
 }
 
 /**
@@ -46,12 +49,13 @@ export function decode(input, opts) {
 export async function decodeAsync(input, opts) {
   const bytes = toBytes(input);
   const d = pick(DECODERS, bytes);
-  if (!opts?.watermark) return d.unscramble ? d.unscramble(bytes, opts) : d.unscrambleAsync(bytes, opts);
+  opts = withLimits(bytes, opts);
+  if (!opts.watermark) return d.unscramble ? d.unscramble(bytes, opts) : d.unscrambleAsync(bytes, opts);
   const format = detectFormat(bytes);
   const detail = format === 'png' ? unscramblePngDetailed(bytes, opts)
     : format === 'jpeg' ? unscrambleJpegDetailed(bytes, opts) : await unscrambleJxlDetailed(bytes, opts);
   const watermark = await chooseWatermark(opts.watermark, detail.watermark, opts.resolveWatermark);
-  const paint = watermark ? { painter: await loadPainter(), watermark } : null;
+  const paint = watermark ? { painter: await loadPainter(), watermark, limits: opts.limits } : null;
   return format === 'png' ? detail.toPng(paint) : format === 'jpeg' ? detail.toJpeg(paint) : detail.toJxl(paint);
 }
 
@@ -75,8 +79,9 @@ export async function chooseWatermark(requested, embedded, resolve) {
   return requested;
 }
 
-/** Describes an image and whether it carries a pixmix marker. */
-export function inspect(input) {
+/** Describes an image and whether it carries a pixmix marker (checking the limits too). */
+export function inspect(input, opts) {
   const bytes = toBytes(input);
-  return pick(DECODERS, bytes).inspect(bytes);
+  const { limits } = withLimits(bytes, opts);
+  return pick(DECODERS, bytes).inspect(bytes, limits);
 }

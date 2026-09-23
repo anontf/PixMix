@@ -8,7 +8,7 @@
 // compatibility with existing images, so bump the marker version if you ever do.
 
 import { ChaChaRng } from './prng.js';
-import { deriveSeed } from './params.js';
+import { deriveSeed, PixmixError } from './params.js';
 
 /**
  * @typedef {object} Layout
@@ -25,7 +25,7 @@ export function computeLayout(key, params, width, height, index = 0) {
   const { rngKey, nonce, check } = deriveSeed(key, params, width, height, index);
   const rng = new ChaChaRng(rngKey, nonce);
   const total = width * height;
-  if (total > 0xffffffff) throw new RangeError('Image too large');
+  if (total > 0xffffffff) throw new PixmixError('Image too large (more than 2^32 pixels)', 'LIMIT');
   const map = new Uint32Array(total);
 
   if (params.mode === 'pixel') {
@@ -34,7 +34,11 @@ export function computeLayout(key, params, width, height, index = 0) {
     return { width, height, map, tiles: null, check };
   }
 
+  // Pixel grids only know pixel and block mode: an mcu marker here (a JPEG's) is corrupt.
   const size = params.block;
+  if (params.mode !== 'block' || !(size >= 2 && size <= 4096)) {
+    throw new PixmixError(`Corrupt pixmix marker (mode ${params.mode}, block ${size}) for this image`);
+  }
   const cols = Math.floor(width / size);
   const rows = Math.floor(height / size);
   const perm = new Uint32Array(cols * rows);

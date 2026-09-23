@@ -2,6 +2,7 @@
 // headers are parsed here; pixels go through the WASM codec (codec.js).
 
 import { PixmixError } from '../../core/params.js';
+import { resolveLimits, checkChunks, checkPixels } from '../../core/limits.js';
 
 const SIGNATURE_BOX = Uint8Array.from([0, 0, 0, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87, 0x0a]);
 const FTYP = Uint8Array.from([0x6a, 0x78, 0x6c, 0x20, 0, 0, 0, 0, 0x6a, 0x78, 0x6c, 0x20]); // 'jxl ' 0 'jxl '
@@ -17,17 +18,20 @@ export function isJxl(bytes) {
  * @typedef {{type: string, data: Uint8Array}} Box
  * @returns {{container: boolean, boxes: Box[], codestream: Uint8Array}}
  */
-export function readJxl(bytes) {
+export function readJxl(bytes, limits) {
   if (bytes[0] === 0xff && bytes[1] === 0x0a) return { container: false, boxes: [], codestream: bytes };
   if (!isJxl(bytes)) throw new PixmixError('Not a JPEG XL file', 'BAD_JXL');
+  const { maxChunks } = resolveLimits(limits);
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const boxes = [];
   for (let pos = 12; pos < bytes.length;) {
+    if (boxes.length >= maxChunks) checkChunks(boxes.length + 1, limits, 'boxes');
     if (pos + 8 > bytes.length) throw new PixmixError('Truncated JPEG XL box', 'BAD_JXL');
     let size = dv.getUint32(pos);
     const type = fourcc(bytes, pos + 4);
     let head = 8;
-    if (size === 1) {
+    if (size === 1) { // 64-bit size, which must be there too
+      if (pos + 16 > bytes.length) throw new PixmixError('Truncated JPEG XL box', 'BAD_JXL');
       size = Number(dv.getBigUint64(pos + 8));
       head = 16;
     } else if (size === 0) size = bytes.length - pos;
@@ -116,12 +120,14 @@ function bitDepth(r) {
 /**
  * Size and the headline properties of a codestream: orientation, animation, bit depth,
  * alpha, whether it is XYB (lossy) and whether its colour encoding is sRGB. Fields past
- * anything unexpected are left null rather than guessed.
+ * anything unexpected are left null rather than guessed. The size is checked against the
+ * limits, so this doubles as the cheap check before handing a file to the decoder.
  */
-export function readJxlHeader(codestream) {
+export function readJxlHeader(codestream, limits) {
   const r = new Bits(codestream);
   if (r.u(16) !== 0x0aff) throw new PixmixError('Not a JPEG XL codestream', 'BAD_JXL');
   const info = { ...sizeHeader(r), orientation: 1, animated: false, bits: 8, float: false, alpha: false, lossy: null, srgb: null };
+  checkPixels(info.width, info.height, limits);
   try {
     if (r.bool()) { info.lossy = true; info.srgb = true; return info; } // all_default: 8-bit sRGB, XYB
     if (r.bool()) { // extra_fields

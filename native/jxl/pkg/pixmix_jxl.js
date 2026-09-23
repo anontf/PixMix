@@ -187,14 +187,16 @@ if (Symbol.dispose) Decoded.prototype[Symbol.dispose] = Decoded.prototype.free;
  * @param {Uint8Array} bytes
  * @param {boolean} srgb
  * @param {boolean} high
+ * @param {number} max_pixels
+ * @param {number} alloc_bytes
  * @returns {Decoded}
  */
-export function decode(bytes, srgb, high) {
+export function decode(bytes, srgb, high, max_pixels, alloc_bytes) {
     try {
         const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
         const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_export2);
         const len0 = WASM_VECTOR_LEN;
-        wasm.decode(retptr, ptr0, len0, srgb, high);
+        wasm.decode(retptr, ptr0, len0, srgb, high, max_pixels, alloc_bytes);
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
@@ -211,14 +213,18 @@ export function decode(bytes, srgb, high) {
  * All keyframes (composited, orientation applied), like `decode` but for animations.
  * @param {Uint8Array} bytes
  * @param {boolean} srgb
+ * @param {number} max_pixels
+ * @param {number} max_frames
+ * @param {number} max_total_pixels
+ * @param {number} alloc_bytes
  * @returns {Animation}
  */
-export function decodeAnimation(bytes, srgb) {
+export function decodeAnimation(bytes, srgb, max_pixels, max_frames, max_total_pixels, alloc_bytes) {
     try {
         const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
         const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_export2);
         const len0 = WASM_VECTOR_LEN;
-        wasm.decodeAnimation(retptr, ptr0, len0, srgb);
+        wasm.decodeAnimation(retptr, ptr0, len0, srgb, max_pixels, max_frames, max_total_pixels, alloc_bytes);
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
@@ -254,14 +260,16 @@ export function lastPanic() {
 /**
  * `None` when the file carries no JPEG reconstruction data.
  * @param {Uint8Array} bytes
+ * @param {number} max_pixels
+ * @param {number} alloc_bytes
  * @returns {Uint8Array | undefined}
  */
-export function reconstructJpeg(bytes) {
+export function reconstructJpeg(bytes, max_pixels, alloc_bytes) {
     try {
         const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
         const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_export2);
         const len0 = WASM_VECTOR_LEN;
-        wasm.reconstructJpeg(retptr, ptr0, len0);
+        wasm.reconstructJpeg(retptr, ptr0, len0, max_pixels, alloc_bytes);
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
@@ -513,3 +521,9 @@ async function __wbg_init(module_or_path) {
 }
 
 export { initSync, __wbg_init as default };
+
+/** Added by pixmix's build script: forgets the instance after a trap, so init starts afresh. */
+export function __pixmixReset() {
+    wasm = undefined;
+    wasmInstance = undefined;
+}

@@ -21,11 +21,13 @@ import { zlibSync, unzlibSync } from 'fflate';
 import { PixmixError, keyBytes } from '../core/params.js';
 import { hkdf } from '../core/sha256.js';
 import { ChaChaRng } from '../core/prng.js';
+import { resolveLimits, limitError } from '../core/limits.js';
 
 export const WATERMARK_TAG = 'pmWm';
 export const STASH_TAG = 'pmWs';
+// What pixmix itself writes; on reading, carried JSON counts as metadata (maxMetadataBytes),
+// and a stash can only hold pixels of the image, whose size the limits already bound.
 const MAX_JSON = 512 * 1024;
-const MAX_STASH = 64 * 1024 * 1024; // restored bytes; regions are bounded by the image anyway
 
 const utf8 = new TextEncoder(), fromUtf8 = new TextDecoder('utf-8', { fatal: true });
 const bad = (what) => new PixmixError(`Corrupt pixmix watermark data (${what})`, 'BAD_WATERMARK');
@@ -50,8 +52,9 @@ export function encodeWatermark(wm) {
  * @returns {{id: string, name?: string, compiled: object|null}}  compiled is not validated
  *          here (drawing validates it)
  */
-export function decodeWatermark(data) {
-  if (data.length < 3 || data[0] !== 1 || data[1] > 1 || data.length > MAX_JSON + 2) throw bad('header');
+export function decodeWatermark(data, limits) {
+  if (data.length < 3 || data[0] !== 1 || data[1] > 1) throw bad('header');
+  checkJson(data.length - 2, limits);
   let text;
   try { text = fromUtf8.decode(data.subarray(2)); } catch { throw bad('text'); }
   if (data[1] === 0) return { id: text, compiled: null };
@@ -59,6 +62,11 @@ export function decodeWatermark(data) {
   try { obj = JSON.parse(text); } catch { throw bad('JSON'); }
   if (!obj || typeof obj !== 'object' || typeof obj.id !== 'string') throw bad('JSON');
   return { id: obj.id, name: typeof obj.name === 'string' ? obj.name : undefined, compiled: obj };
+}
+
+function checkJson(n, limits) {
+  const { maxMetadataBytes } = resolveLimits(limits);
+  if (n > maxMetadataBytes) throw limitError(`Carried watermark is ${n} bytes, over the limit of ${maxMetadataBytes} (limits.maxMetadataBytes)`);
 }
 
 /** The keystream that encrypts stashed pixels: HKDF of the key and the image's salt. */
@@ -98,7 +106,7 @@ export function encodeStash({ watermark, regions, raw, key, salt }) {
  * is inflated into a buffer of exactly the expected length (a hostile file cannot make it
  * grow further).
  */
-export function decodeStash(payload, key, salt, bytesOf) {
+export function decodeStash(payload, key, salt, bytesOf, limits) {
   const dv = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
   const need = (o, n) => { if (o + n > payload.length) throw bad('truncated'); };
   let o = 0;
@@ -106,6 +114,7 @@ export function decodeStash(payload, key, salt, bytesOf) {
   if (payload[o++] !== 1) throw bad('version');
   const jl = dv.getUint32(o); o += 4;
   need(o, jl + 1);
+  checkJson(jl, limits);
   let watermark;
   try { watermark = JSON.parse(fromUtf8.decode(payload.subarray(o, o + jl))); } catch { throw bad('JSON'); }
   o += jl;
@@ -120,7 +129,6 @@ export function decodeStash(payload, key, salt, bytesOf) {
     total += bytesOf(r); // throws for a region outside the image
     regions.push(r);
   }
-  if (total > MAX_STASH) throw bad('size');
   const dl = dv.getUint32(o); o += 4;
   need(o, dl);
   let raw;
@@ -159,8 +167,8 @@ export function jpegRect(frame, r, buf, toBuffer) {
 }
 
 /** Puts a JPEG stash back into the (scrambled) frame. */
-export function restoreJpegStash(frame, payload, key, salt) {
-  const { regions, raw, watermark } = decodeStash(payload, key, salt, (r) => jpegRectBytes(frame, r));
+export function restoreJpegStash(frame, payload, key, salt, limits) {
+  const { regions, raw, watermark } = decodeStash(payload, key, salt, (r) => jpegRectBytes(frame, r), limits);
   if (regions.length !== 1) throw bad('regions');
   jpegRect(frame, regions[0], raw, false);
   return watermark;
@@ -170,13 +178,13 @@ export function restoreJpegStash(frame, payload, key, salt) {
  * Puts pixel stashes back: frames[i] is {pixels, width, height, bpp} (native PNG samples, or
  * JPEG XL RGBA bytes).
  */
-export function restorePixelStash(frames, payload, key, salt) {
+export function restorePixelStash(frames, payload, key, salt, limits) {
   const size = (r) => {
     const f = frames[r.frame];
     if (!f || !r.width || !r.height || r.x + r.width > f.width || r.y + r.height > f.height) throw bad('region');
     return r.width * r.height * f.bpp;
   };
-  const { regions, raw, watermark } = decodeStash(payload, key, salt, size);
+  const { regions, raw, watermark } = decodeStash(payload, key, salt, size, limits);
   let at = 0;
   for (const r of regions) {
     const f = frames[r.frame];

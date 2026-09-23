@@ -8,8 +8,14 @@
 // The result is a patch: premultiplied RGBA floats (0..1, sRGB) over the pixels it covers.
 
 import { UNITS } from './schema.js';
+import { PixmixError } from '../core/params.js';
+import { resolveLimits } from '../core/limits.js';
 
 const TOLERANCE = 0.2; // px, curve flattening
+// A watermark is a footer, never the whole image: bounds for what a (possibly hostile)
+// compiled watermark can make the renderer allocate and loop over.
+export const MAX_PATCH_PIXELS = 4_000_000;
+const MAX_RADIUS = 32; // px, outline and blur
 
 /**
  * Where the watermark goes on a width x height image and at what size, or null when it
@@ -64,18 +70,20 @@ export function placeWatermark(c, width, height) {
 }
 
 const anchorOf = (a) => [a.endsWith('left') ? -1 : a.endsWith('right') ? 1 : 0, a.startsWith('top') ? -1 : a.startsWith('bottom') ? 1 : 0];
-const shadowPx = (sh, em) => ({ dx: Math.round(sh.x * em), dy: Math.round(sh.y * em), blur: Math.round((sh.blur * em) / 2) });
+const shadowPx = (sh, em) => ({ dx: Math.round(sh.x * em), dy: Math.round(sh.y * em), blur: Math.min(MAX_RADIUS, Math.round((sh.blur * em) / 2)) });
 
 /**
  * Renders the watermark for a width x height image.
  * @returns {null | {x: number, y: number, width: number, height: number, data: Float32Array}}
  *          premultiplied RGBA (0..1) for the pixels x..x+width, y..y+height
  */
-export function renderWatermark(c, width, height) {
+export function renderWatermark(c, width, height, limits) {
   const place = placeWatermark(c, width, height);
   if (!place) return null;
   const { s, em, rect: [rx0, ry0, rx1, ry1] } = place;
   const w = rx1 - rx0, h = ry1 - ry0;
+  const cap = Math.min(MAX_PATCH_PIXELS, resolveLimits(limits).maxPixels);
+  if (w * h > cap) throw new PixmixError(`Watermark would cover ${w}x${h} pixels, over the limit of ${cap}`, 'LIMIT');
   const ox = place.ox - rx0, oy = place.oy - ry0;
   const out = new Float32Array(w * h * 4);
   const crisp = c.crisp;
@@ -103,7 +111,7 @@ export function renderWatermark(c, width, height) {
       const cov = masks[i].cov;
       for (let k = 0; k < union.length; k++) if (cov[k] > union[k]) union[k] = cov[k];
     });
-    const r = Math.max(crisp ? 1 : 0.25, c.stroke.width * em);
+    const r = Math.min(MAX_RADIUS, Math.max(crisp ? 1 : 0.25, c.stroke.width * em));
     paintOver(out, dilate(union, w, h, crisp ? Math.round(r) : r, c.stroke.join === 'square', crisp), w, h, c.stroke.color, shapeBox, c.stroke.opacity);
   }
   c.shapes.forEach((sh, i) => {
@@ -380,7 +388,8 @@ function paintOver(out, cov, w, h, paint, box, opacity) {
  * fall inside it (nearest when enlarging, which keeps pixel art crisp).
  */
 function imageCoverage(img, s, ox, oy, w, h) {
-  const bin = atob(img.rgba);
+  let bin;
+  try { bin = atob(img.rgba); } catch { throw new PixmixError('watermark image: not base64', 'BAD_WATERMARK'); }
   const src = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) src[i] = bin.charCodeAt(i);
   const [bx0, by0, bx1, by1] = img.box.map((v, i) => (i % 2 ? oy : ox) + v * s);

@@ -47,19 +47,19 @@ export class Decoded {
 /**
  * `high`: 16-bit samples instead of 8-bit (for images with more than 8 bits).
  */
-export function decode(bytes: Uint8Array, srgb: boolean, high: boolean): Decoded;
+export function decode(bytes: Uint8Array, srgb: boolean, high: boolean, max_pixels: number, alloc_bytes: number): Decoded;
 
 /**
  * All keyframes (composited, orientation applied), like `decode` but for animations.
  */
-export function decodeAnimation(bytes: Uint8Array, srgb: boolean): Animation;
+export function decodeAnimation(bytes: Uint8Array, srgb: boolean, max_pixels: number, max_frames: number, max_total_pixels: number, alloc_bytes: number): Animation;
 
 export function lastPanic(): string;
 
 /**
  * `None` when the file carries no JPEG reconstruction data.
  */
-export function reconstructJpeg(bytes: Uint8Array): Uint8Array | undefined;
+export function reconstructJpeg(bytes: Uint8Array, max_pixels: number, alloc_bytes: number): Uint8Array | undefined;
 
 /**
  * Panics abort the WASM instance (a JS RuntimeError without a message); keep the message
@@ -80,8 +80,8 @@ export interface InitOutput {
     readonly animation_loops: (a: number) => number;
     readonly animation_takePixels: (a: number, b: number) => void;
     readonly animation_width: (a: number) => number;
-    readonly decode: (a: number, b: number, c: number, d: number, e: number) => void;
-    readonly decodeAnimation: (a: number, b: number, c: number, d: number) => void;
+    readonly decode: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly decodeAnimation: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly decoded_channels: (a: number) => number;
     readonly decoded_height: (a: number) => number;
     readonly decoded_icc: (a: number, b: number) => void;
@@ -89,7 +89,7 @@ export interface InitOutput {
     readonly decoded_takePixels16: (a: number, b: number) => void;
     readonly decoded_width: (a: number) => number;
     readonly lastPanic: (a: number) => void;
-    readonly reconstructJpeg: (a: number, b: number, c: number) => void;
+    readonly reconstructJpeg: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly start: () => void;
     readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
     readonly __wbindgen_export: (a: number, b: number, c: number) => void;

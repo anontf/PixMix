@@ -47,6 +47,9 @@ Watermarks (<wm> is an id in the watermarks directory, or a .json definition / c
   --in-place               rekey: overwrite the input
   -f, --force              overwrite existing outputs
   --no-sharp               do not use sharp even if installed
+  --max-pixels <n>         refuse images (or frames) larger than n pixels (default 100000000)
+  --max-frames <n>         refuse animations with more than n frames (default 1000)
+  --max-input-bytes <n>    refuse input files larger than n bytes (default 268435456)
   -q, --quiet              only print errors
   --json                   inspect: machine-readable output
   -h, --help
@@ -82,6 +85,9 @@ const OPTIONS = {
   'in-place': { type: 'boolean' },
   force: { type: 'boolean', short: 'f' },
   'no-sharp': { type: 'boolean' },
+  'max-pixels': { type: 'string' },
+  'max-frames': { type: 'string' },
+  'max-input-bytes': { type: 'string' },
   quiet: { type: 'boolean', short: 'q' },
   json: { type: 'boolean' },
   help: { type: 'boolean', short: 'h' },
@@ -107,7 +113,7 @@ async function main(argv) {
   if (o.out === '-' && files.length > 1) throw new UsageError('-o - (stdout) needs exactly one input');
 
   const log = o.quiet ? () => {} : (msg) => process.stderr.write(`${msg}\n`);
-  if (command === 'inspect') return runInspect(files, o);
+  if (command === 'inspect') return runInspect(files, o, limitsFrom(o));
 
   const opts = await commandOptions(command, o);
   const outDir = await resolveOutDir(o.out, files.length);
@@ -146,6 +152,7 @@ async function commandOptions(command, o) {
   if (o.progressive) opts.progressive = true;
   if (o.baseline) opts.progressive = false;
   if (o['keep-thumbnails']) opts.keepThumbnails = true;
+  opts.limits = limitsFrom(o);
   Object.assign(opts, await watermarkOptions(command, o));
   if (command === 'rekey') {
     opts.from = await keyFrom(o.key, o['key-file'], 'PIXMIX_KEY', 'old key (-k, --key-file or $PIXMIX_KEY)');
@@ -202,12 +209,12 @@ async function run(command, input, opts) {
   return { bytes, note: bits.join('; ') };
 }
 
-async function runInspect(files, o) {
+async function runInspect(files, o, limits) {
   let failed = 0;
   const all = [];
   for (const file of files) {
     try {
-      const info = inspect(file === '-' ? await readStdin() : await readFile(file));
+      const info = inspect(file === '-' ? await readStdin() : await readFile(file), { limits });
       if (o.json) { all.push({ file, ...info }); continue; }
       const dims = info.width ? `${info.width}x${info.height}` : '';
       const scramble = info.scrambled ? `scrambled (${info.mode}${info.block ? ` ${info.block}px` : ''})` : 'not scrambled';
@@ -283,6 +290,18 @@ async function readStdin() {
 
 const exists = (p) => stat(p).then(() => true, () => false);
 const size = (n) => (n < 1048576 ? `${(n / 1024).toFixed(1)} KiB` : `${(n / 1048576).toFixed(2)} MiB`);
+
+/** The --max-* options as pixmix limits ("Infinity" turns one off). */
+function limitsFrom(o) {
+  const limits = {};
+  for (const [flag, key] of [['max-pixels', 'maxPixels'], ['max-frames', 'maxFrames'], ['max-input-bytes', 'maxInputBytes']]) {
+    if (o[flag] === undefined) continue;
+    const n = Number(o[flag]);
+    if (!(n > 0) || (!Number.isInteger(n) && n !== Infinity)) throw new UsageError(`--${flag} must be a positive integer (or Infinity)`);
+    limits[key] = n;
+  }
+  return limits;
+}
 
 function int(v, name) {
   const n = Number(v);

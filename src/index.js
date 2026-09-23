@@ -1,5 +1,5 @@
 export {
   encode, encodeAsync, rekey, rekeyAsync, inspect, convert, convertAsync, detectFormat, OUTPUT_FORMATS,
-  configureJxl, configureWatermarks, PixmixError, WrongKeyError,
+  configureJxl, configureWatermarks, PixmixError, WrongKeyError, DEFAULT_LIMITS,
 } from './encoder.js';
 export { decode, decodeAsync } from './decoder.js';

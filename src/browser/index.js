@@ -12,14 +12,15 @@
 // file. The painter (dist/pixmix-watermark.mjs) is only fetched when that happens.
 
 import {
-  decode, decodeAsync as decodeAnyAsync, inspect, detectFormat, configureJxl, configureWatermarks, PixmixError, WrongKeyError,
+  decode, decodeAsync as decodeAnyAsync, inspect, detectFormat, configureJxl, configureWatermarks, PixmixError, WrongKeyError, DEFAULT_LIMITS,
 } from '../decoder.js';
 import { unscramblePngDetailedAsync } from '../formats/png/index.js';
 import { computeAnywhere } from './worker-client.js';
 import { readOrientation } from '../meta/exif.js';
+import { resolveLimits, checkInputSize } from '../core/limits.js';
 import { orientationTransform, swapsAxes, browserHonoursPngOrientation } from './orient.js';
 
-export { decode, inspect, detectFormat, configureJxl, configureWatermarks, PixmixError, WrongKeyError };
+export { decode, inspect, detectFormat, configureJxl, configureWatermarks, PixmixError, WrongKeyError, DEFAULT_LIMITS };
 
 export const EFFECTS = ['dissolve', 'scan', 'blocks', 'none'];
 const MAX_ANIMATED_TILES = 12000;
@@ -30,15 +31,18 @@ const TYPES = { png: 'image/png', jpeg: 'image/jpeg' };
  * for PNG. JPEG XL comes back as lossless JPEG XL, which needs the JPEG XL encoder too;
  * for display, decodeToURL (a PNG for JPEG XL) is cheaper.
  */
-export async function decodeAsync(input, { key, watermark, watermarkBase, fetchOptions } = {}) {
+export async function decodeAsync(input, { key, limits, watermark, watermarkBase, fetchOptions } = {}) {
   const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
   const format = detectFormat(bytes);
   if (!watermark) {
-    if (format === 'png') return (await unscramblePngDetailedAsync(bytes, { key })).toPng();
-    return decodeAnyAsync(bytes, { key });
+    if (format === 'png') {
+      checkInputSize(bytes, limits);
+      return (await unscramblePngDetailedAsync(bytes, { key, limits })).toPng();
+    }
+    return decodeAnyAsync(bytes, { key, limits });
   }
   // Exact restoring stays the default; a watermark is only drawn when asked for.
-  return decodeAnyAsync(bytes, { key, watermark, resolveWatermark: (id) => fetchWatermark(id, watermarkBase, fetchOptions) });
+  return decodeAnyAsync(bytes, { key, limits, watermark, resolveWatermark: (id) => fetchWatermark(id, watermarkBase, fetchOptions) });
 }
 
 /**
@@ -47,16 +51,16 @@ export async function decodeAsync(input, { key, watermark, watermarkBase, fetchO
  * animated), or, on the JPEG route, as the original JPEG. Needs only the JPEG XL decoder.
  * @returns {Promise<{bytes: Uint8Array, type: string}>}
  */
-export async function restoreForDisplay(input, { key, worker, watermark = false, watermarkBase, fetchOptions } = {}) {
+export async function restoreForDisplay(input, { key, worker, limits, watermark = false, watermarkBase, fetchOptions } = {}) {
   const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
-  const wm = await watermarkFor(watermark, bytes, watermarkBase, fetchOptions);
-  const job = await prepare(bytes, key, 'ignore', false, worker, wm);
+  const wm = await watermarkFor(watermark, bytes, watermarkBase, fetchOptions, limits);
+  const job = await prepare(bytes, key, 'ignore', false, worker, limits, wm);
   return { bytes: job.restored(), type: job.type };
 }
 
 /** Fetches, restores for display (see restoreForDisplay) and returns a blob: URL. */
-export async function decodeToURL(url, { key, fetchOptions, worker, watermark, watermarkBase } = {}) {
-  const { bytes, type } = await restoreForDisplay(await fetchBytes(url, fetchOptions), { key, worker, watermark, watermarkBase, fetchOptions });
+export async function decodeToURL(url, { key, fetchOptions, worker, limits, watermark, watermarkBase } = {}) {
+  const { bytes, type } = await restoreForDisplay(await fetchBytes(url, fetchOptions, limits), { key, worker, limits, watermark, watermarkBase, fetchOptions });
   return URL.createObjectURL(new Blob([bytes], { type }));
 }
 
@@ -86,10 +90,10 @@ export function fetchWatermark(ref, base = 'watermarks/', fetchOptions) {
  * id or URL string; or a compiled watermark object.
  * @returns {Promise<object|'embedded'|null>}
  */
-async function watermarkFor(spec, bytes, base, fetchOptions) {
+async function watermarkFor(spec, bytes, base, fetchOptions, limits) {
   if (spec === false || spec === null || spec === '' || spec === 'none') return null;
   if (spec === undefined || spec === true || spec === 'auto' || spec === 'embedded') {
-    const info = inspect(bytes).watermark;
+    const info = inspect(bytes, { limits }).watermark;
     if (!info) return null;
     return info.embedded ? 'embedded' : fetchWatermark(info.id, base, fetchOptions);
   }
@@ -117,6 +121,8 @@ async function watermarkFor(spec, bytes, base, fetchOptions) {
  *        the file's own if it carries one, false none, an id / URL, or a compiled watermark;
  *        data-pixmix-watermark overrides it per image
  * @param {string} [opts.watermarkBase='watermarks/'] where ids are looked up (id.json)
+ * @param {Partial<import('../core/limits.js').Limits>} [opts.limits] resource limits for the
+ *        fetched file (see core/limits.js); the download stops at maxInputBytes
  */
 export async function reveal(img, opts = {}) {
   const {
@@ -127,6 +133,7 @@ export async function reveal(img, opts = {}) {
     fetchOptions,
     orientation = 'auto',
     worker = true,
+    limits,
   } = opts;
   const key = img.dataset.pixmixKey ?? optKey;
   let effect = img.dataset.pixmixEffect ?? opts.effect ?? 'dissolve';
@@ -136,11 +143,11 @@ export async function reveal(img, opts = {}) {
   const url = opts.src ?? img.dataset.pixmixSrc ?? (img.currentSrc || img.src);
   img.dataset.pixmixState = 'decoding';
   try {
-    const bytes = await fetchBytes(url, fetchOptions);
+    const bytes = await fetchBytes(url, fetchOptions, limits);
     // A watermark that cannot be had never stops the image itself from showing.
-    const wm = await watermarkFor(img.dataset.pixmixWatermark ?? opts.watermark, bytes, opts.watermarkBase, fetchOptions)
+    const wm = await watermarkFor(img.dataset.pixmixWatermark ?? opts.watermark, bytes, opts.watermarkBase, fetchOptions, limits)
       .catch((err) => { console.warn('[pixmix] watermark:', err.message); return null; });
-    const job = await prepare(bytes, key, orientation, effect !== 'none', worker, wm);
+    const job = await prepare(bytes, key, orientation, effect !== 'none', worker, limits, wm);
     if (job.watermarkError) console.warn('[pixmix] watermark:', job.watermarkError);
 
     if (effect !== 'none') {
@@ -199,8 +206,8 @@ export async function reveal(img, opts = {}) {
  * @returns {Promise<{width: number, height: number, o: number, type: string,
  *   restored: () => Uint8Array, animate?: Function}>}
  */
-async function prepare(bytes, key, orientation, animated, worker = true, watermark = null) {
-  const r = await computeAnywhere(bytes, key, { animated, worker, watermark });
+async function prepare(bytes, key, orientation, animated, worker = true, limits, watermark = null) {
+  const r = await computeAnywhere(bytes, key, { animated, worker, limits, watermark });
   const { width, height } = r.layout;
   const restored = () => r.restored;
   const wm = { overlay: r.overlay ?? null, watermarkError: r.watermarkError };
@@ -251,10 +258,33 @@ async function effectiveOrientation(exif, mode, browserHonours) {
   return (await browserHonours()) ? o : 1;
 }
 
-async function fetchBytes(url, fetchOptions) {
+/** The response body, read no further than limits.maxInputBytes. */
+async function fetchBytes(url, fetchOptions, limits) {
+  const { maxInputBytes } = resolveLimits(limits);
   const res = await fetch(url, fetchOptions);
   if (!res.ok) throw new PixmixError(`Failed to load ${url} (${res.status})`, 'FETCH');
-  return new Uint8Array(await res.arrayBuffer());
+  const tooLarge = (n) => checkInputSize({ length: n }, limits);
+  const declared = Number(res.headers?.get?.('Content-Length'));
+  if (declared > maxInputBytes) { res.body?.cancel?.().catch(() => {}); tooLarge(declared); }
+  if (!res.body?.getReader) {
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    checkInputSize(bytes, limits);
+    return bytes;
+  }
+  const reader = res.body.getReader();
+  const parts = [];
+  let n = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    n += value.length;
+    if (n > maxInputBytes) { reader.cancel().catch(() => {}); tooLarge(n); }
+    parts.push(value);
+  }
+  const bytes = new Uint8Array(n);
+  let o = 0;
+  for (const p of parts) { bytes.set(p, o); o += p.length; }
+  return bytes;
 }
 
 function setImageSource(img, bytes, type) {

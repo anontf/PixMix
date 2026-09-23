@@ -1,5 +1,7 @@
 // Built-in pure-JS pixel decoders (synchronous, work everywhere).
-// A decoder: { name, formats: string[], decode(bytes, format) -> DecodedImage | Promise }.
+// A decoder: { name, formats: string[], decode(bytes, format, { limits }) -> DecodedImage | Promise }.
+// `limits` (see core/limits.js) is always passed fully resolved; decoders check what they
+// can before allocating, and pixmix checks the result's size again afterwards.
 //
 // @typedef {object} DecodedImage
 // @property {number} width
@@ -11,10 +13,13 @@
 
 import decodeJpeg from 'jpeg-js/lib/decoder.js';
 import { GifReader } from 'omggif';
+import { blitFrame, clearRect } from './gif.js';
 import { PixmixError } from '../core/params.js';
+import { resolveLimits, checkPixels, checkFrames } from '../core/limits.js';
 import { readPng } from '../formats/png/index.js';
 import { toRGBA8 } from '../formats/png/rgba.js';
 import { readPngMetadata } from '../meta/png.js';
+import { readJpegMetadata } from '../meta/jpeg.js';
 import { loadJxlCodec } from '../formats/jxl/load.js';
 import { readJxlHeader, readJxl } from '../formats/jxl/container.js';
 
@@ -24,10 +29,10 @@ import { readJxlHeader, readJxl } from '../formats/jxl/container.js';
 export const pngDecoder = {
   name: 'pixmix',
   formats: ['png'],
-  decode(bytes) {
-    const img = readPng(bytes);
+  decode(bytes, _format, { limits } = {}) {
+    const img = readPng(bytes, limits);
     const { width, height, depth } = img.ihdr;
-    const metadata = readPngMetadata(img.chunks);
+    const metadata = readPngMetadata(img.chunks, limits);
     const animation = img.animated ? apngFrames(img) : null;
     if (animation) metadata.dropped.push('animation (first frame kept)');
     const data = depth === 16 ? toRGBA16(img, img.pixels) : new Uint8Array(toRGBA8(img, img.pixels).buffer);
@@ -98,17 +103,23 @@ function apngFrames(img) {
 export const jpegDecoder = {
   name: 'jpeg-js',
   formats: ['jpeg'],
-  decode(bytes) {
+  decode(bytes, _format, { limits } = {}) {
+    const l = resolveLimits(limits);
+    // The frame header first, so jpeg-js never starts on an image over the limit.
+    const { width, height, components = 3 } = readJpegMetadata(bytes);
+    if (width && height) checkPixels(width, height, l);
     try {
       const img = decodeJpeg(bytes, {
         useTArray: true,
         formatAsRGBA: true,
         tolerantDecoding: true,
-        maxResolutionInMP: 500,
-        maxMemoryUsageInMB: 4096,
+        maxResolutionInMP: l.maxPixels / 1e6,
+        // Coefficients (2 bytes per sample, padded) plus the RGBA output, with headroom.
+        maxMemoryUsageInMB: Math.ceil((l.maxPixels * (4 + 4 * Math.max(components, 1))) / 2 ** 20) + 64,
       });
       return { width: img.width, height: img.height, data: img.data };
     } catch (err) {
+      if (err instanceof PixmixError) throw err;
       throw new PixmixError(`JPEG decode failed: ${err.message}`, 'BAD_JPEG');
     }
   },
@@ -117,7 +128,9 @@ export const jpegDecoder = {
 export const gifDecoder = {
   name: 'omggif',
   formats: ['gif'],
-  decode(bytes) {
+  decode(bytes, _format, { limits } = {}) {
+    // The logical screen, straight from the header, before omggif parses anything.
+    if (bytes.length >= 10) checkPixels(bytes[6] | (bytes[7] << 8), bytes[8] | (bytes[9] << 8), limits);
     let reader;
     try {
       reader = new GifReader(bytes);
@@ -126,9 +139,15 @@ export const gifDecoder = {
     }
     const { width, height } = reader;
     const n = reader.numFrames();
-    if (n <= 1) {
+    if (n > 1) checkFrames(n, n * width * height, limits);
+    for (let i = 0; i < n; i++) {
+      const f = reader.frameInfo(i);
+      checkPixels(f.width, f.height, limits, `GIF frame ${i}`);
+    }
+    if (!n) throw new PixmixError('GIF has no image', 'BAD_GIF');
+    if (n === 1) {
       const data = new Uint8Array(width * height * 4);
-      reader.decodeAndBlitFrameRGBA(0, data);
+      blitFrame(reader, bytes, 0, data, width, height);
       return { width, height, data, metadata: { dropped: [] } };
     }
     // Composite every frame onto the full canvas, following GIF disposal, so each becomes a
@@ -138,12 +157,11 @@ export const gifDecoder = {
     for (let i = 0; i < n; i++) {
       const info = reader.frameInfo(i);
       const saved = info.disposal === 3 ? canvas.slice() : null;
-      reader.decodeAndBlitFrameRGBA(i, canvas);
+      blitFrame(reader, bytes, i, canvas, width, height);
       // Browsers play delays of 0 or 1 (1/100 s) at 10; do the same so timing matches.
       frames.push({ data: canvas.slice(), delay: info.delay <= 1 ? 10 : info.delay });
-      if (info.disposal === 2) {
-        for (let y = info.y; y < info.y + info.height; y++) canvas.fill(0, (y * width + info.x) * 4, (y * width + info.x + info.width) * 4);
-      } else if (saved) canvas.set(saved);
+      if (info.disposal === 2) clearRect(canvas, width, height, info);
+      else if (saved) canvas.set(saved);
     }
     const loops = reader.loopCount(); // 0 = forever; null = no loop extension, play once
     return {
@@ -161,11 +179,11 @@ export const gifDecoder = {
 export const jxlDecoder = {
   name: 'jxl-oxide',
   formats: ['jxl'],
-  async decode(bytes) {
-    const header = readJxlHeader(readJxl(bytes).codestream);
+  async decode(bytes, _format, { limits } = {}) {
+    const header = readJxlHeader(readJxl(bytes, limits).codestream, limits);
     const codec = await loadJxlCodec();
     const deep = header.bits > 8 || header.float;
-    const image = await codec.decode(bytes, { srgb: false, high: !header.animated && deep });
+    const image = await codec.decode(bytes, { srgb: false, high: !header.animated && deep, limits });
     const dropped = [];
     if (header.animated) dropped.push('animation (first frame kept)');
     if (header.animated && deep) dropped.push(`${header.float ? 'floating-point' : `${header.bits}-bit`} precision (reduced to 8-bit)`);
@@ -173,7 +191,7 @@ export const jxlDecoder = {
     const metadata = { dropped, ...(icc ? { icc } : {}) };
     if (!header.animated) return { ...image, metadata };
     // Animations: every frame, for APNG or animated JPEG XL output (other targets keep the first).
-    const anim = await codec.decodeAnimation(bytes, { srgb: false, icc: false });
+    const anim = await codec.decodeAnimation(bytes, { srgb: false, icc: false, limits });
     return { ...image, animation: { frames: anim.frames, plays: anim.plays }, metadata };
   },
 };

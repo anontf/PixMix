@@ -25,6 +25,7 @@ browser use case the key ships to the visitor.
 npm install
 npm test            # PngSuite and JPEG round trips, conversion, CLI, browser reveal (fake DOM)
 npm run test:browser  # the same in real Chromium and WebKit: decoder, worker, lab, demo site (see below)
+npm run fuzz        # the long fuzz run (see "Fuzzing")
 npm run serve       # builds dist/ and starts http://127.0.0.1:8080
 npm run serve:lan   # the same, reachable from other machines on the network (HOST=0.0.0.0)
 ```
@@ -138,6 +139,7 @@ Options:
 - `onConvert(report)`: reports how the input was decoded and what metadata was kept or
   dropped: `{ format, from, decoder, transferred, dropped }`.
 - `watermark`, `visibleWatermark`: see "Watermarks" below.
+- `limits`: resource limits, see "Untrusted input" below.
 
 `encode` is synchronous and handles PNG, JPEG and GIF on its own. JPEG XL, in or out,
 goes through `encodeAsync`, `decodeAsync` and `rekeyAsync`, because its codec is WASM loaded
@@ -157,6 +159,36 @@ const out = await encodeAsync(webpBytes, {
 
 In browsers, `browserDecoder()` uses the browser's own decoders (WebP, AVIF, BMP, …).
 `convert` / `convertAsync` produce the plain, unscrambled file the encoder would scramble.
+
+### Untrusted input
+
+Every entry point takes a `limits` option: `encode`, `decode`, `rekey`, `convert`, their
+async versions, `inspect(bytes, { limits })`, and the browser's `reveal`, `revealAll`,
+`restoreForDisplay`, `decodeToURL` and `decodeAsync`. Pass only what you want to change;
+the rest keep their defaults (`DEFAULT_LIMITS`), and `Infinity` turns one off.
+
+| Limit | Default | What it caps |
+| --- | --- | --- |
+| `maxInputBytes` | 256 MiB | the input file (the browser stops downloading there) |
+| `maxPixels` | 100 megapixels | width × height of the image, and of any one frame |
+| `maxFrames` | 1000 | frames in an animation |
+| `maxTotalPixels` | 200 megapixels | all frames together |
+| `maxDecompressedBytes` | 1 GiB | inflated PNG image data, per frame |
+| `maxMetadataBytes` | 16 MiB | inflated metadata: `iCCP`, `zTXt`, `iTXt`, JPEG XL `brob` |
+| `maxChunks` | 1,000,000 | PNG chunks, JPEG segments or JPEG XL boxes in one file |
+| `maxScans` | 256 | scans in a JPEG (each is a pass over the whole image) |
+
+They are checked from the headers before anything large is allocated: PNG `IHDR` and
+`fcTL`, the JPEG frame header, the GIF screen and frames, and the JPEG XL header (the
+decoder WASM checks the size and frame count again, and caps its own allocations).
+Inflating stops at the size the `IHDR` declares, so a decompression bomb costs nothing.
+`sharpDecoder` passes `maxPixels` on as sharp's `limitInputPixels`. A violation throws a
+`PixmixError` with code `LIMIT`; `inspect` checks the same limits, so it works as a cheap
+check before the real work. Anything wrong with the file itself also throws a `PixmixError`
+(`BAD_PNG`, `BAD_JPEG`, …), including errors from jpeg-js, libvips and the JPEG XL codecs.
+
+The CLI has `--max-pixels`, `--max-frames` and `--max-input-bytes`. The dev server applies
+the limits to every upload, with its 64 MiB body limit as `maxInputBytes`, and answers 413.
 
 ### Animation
 
@@ -618,6 +650,35 @@ noisy photo-like images (so block mode is slower here than on real photos):
 
 The JPEG route's files are the same size as before. Block mode is 2–4 times faster at
 effort 7 and 5–7% larger (higher efforts close that gap only slowly).
+
+## Fuzzing
+
+`test/fuzz/` is a deterministic fuzzer. It builds valid seed files for every input
+format and every kind of scrambled output (PNG and APNG in both modes, JPEG baseline and
+progressive, GIF, JPEG XL on both routes, WebP and TIFF for sharp), then mutates them:
+bit flips, byte and word replacements, truncation, insertions, chunk, segment and box
+length edits, duplicated, reordered and dropped chunks, header fields, garbage after valid
+headers, and splices of two files. PNG CRCs are usually repaired so mutants get past them.
+
+Each mutant goes through `inspect`, `encode`, `encodeAsync`, `decode`, `decodeAsync`,
+`rekeyAsync`, `convertAsync` and the browser reveal's decoding, with the right key and
+small limits. The only acceptable outcomes are success or a `PixmixError`. It is a
+failure when anything else is thrown (a `PixmixError` wrapping a `TypeError` counts too),
+when a case runs past its time budget (cases run in worker threads, which are replaced),
+when a worker dies or runs out of heap, and when the process's memory runs away. A file
+`encode` accepts must also come back from `decode` with the same PNG pixels or JPEG
+coefficients.
+
+```sh
+npm test                 # includes a smoke run: fixed seed, 300 cases
+npm run fuzz             # 20,000 cases; settings from the environment:
+PIXMIX_FUZZ_ITERATIONS=100000 PIXMIX_FUZZ_SEED=7 PIXMIX_FUZZ_WORKERS=4 npm run fuzz
+PIXMIX_FUZZ_SEED=7 PIXMIX_FUZZ_CASE=1234 npm run fuzz   # rerun one case, verbosely
+```
+
+`PIXMIX_FUZZ_TIMEOUT` sets the budget per case (20 s), `PIXMIX_FUZZ_OUT` a directory for
+failing inputs. Every bug it has found has a regression test in
+`test/fuzz-regressions.test.js`, with the input built in code.
 
 ## Browser tests
 

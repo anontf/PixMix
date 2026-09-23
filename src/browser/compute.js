@@ -4,12 +4,13 @@
 import { detectFormat, inspect, PixmixError } from '../decoder.js';
 import { unscramblePngDetailedAsync } from '../formats/png/index.js';
 import { unscrambleJpegDetailed } from '../formats/jpeg/index.js';
-import { unscrambleJxlDetailed, reconstructJpeg } from '../formats/jxl/index.js';
+import { unscrambleJxlDetailed, scrambledJpegOf } from '../formats/jxl/index.js';
 import { toRGBA8 } from '../formats/png/rgba.js';
 import { writeChunks } from '../formats/png/chunks.js';
 import { encodeRasterAsync } from '../formats/png/raster.js';
 import { readOrientation } from '../meta/exif.js';
 import { loadPainter } from '../watermark/load.js';
+import { checkInputSize } from '../core/limits.js';
 
 /**
  * @typedef {object} PixelsResult  PNG, and JPEG XL on the pixel route
@@ -30,16 +31,18 @@ import { loadPainter } from '../watermark/load.js';
  */
 
 /**
- * @param {{animated?: boolean, watermark?: object|'embedded'|null}} [opts]  watermark: a
- *        compiled watermark to draw on the restored image, or 'embedded' for the file's own
+ * @param {{animated?: boolean, limits?: object, watermark?: object|'embedded'|null}} [opts]
+ *        watermark: a compiled watermark to draw on the restored image, or 'embedded' for the
+ *        file's own
  * @returns {Promise<PixelsResult|JpegResult>}
  */
-export async function compute(bytes, key, { animated = true, watermark = null } = {}) {
+export async function compute(bytes, key, { animated = true, limits, watermark = null } = {}) {
+  checkInputSize(bytes, limits);
   const format = detectFormat(bytes);
   if (format === 'png') {
-    const d = await unscramblePngDetailedAsync(bytes, { key });
+    const d = await unscramblePngDetailedAsync(bytes, { key, limits });
     const exif = d.img.chunks.find((c) => c.type === 'eXIf')?.data.slice() ?? null;
-    const w = await painting(watermark, d.watermark, d.layout, exif, (paint) => d.toPng(paint));
+    const w = await painting(watermark, d.watermark, d.layout, exif, (paint) => d.toPng(paint), limits);
     return {
       kind: 'pixels',
       type: 'image/png',
@@ -50,14 +53,14 @@ export async function compute(bytes, key, { animated = true, watermark = null } 
     };
   }
   if (format === 'jpeg') {
-    const d = unscrambleJpegDetailed(bytes, { key });
+    const d = unscrambleJpegDetailed(bytes, { key, limits });
     const app1 = d.segments.find((s) => s.marker === 0xe1 && s.data[0] === 0x45 && s.data[4] === 0 && s.data[5] === 0);
     const exif = app1 ? app1.data.slice(6) : null;
     const { perm, transforms, cols, rows, tileW, tileH, width, height } = d.layout;
     return {
       kind: 'jpeg',
       type: 'image/jpeg',
-      ...(await painting(watermark, d.watermark, d.layout, exif, (paint) => d.toJpeg(paint))),
+      ...(await painting(watermark, d.watermark, d.layout, exif, (paint) => d.toJpeg(paint), limits)),
       scrambled: bytes,
       exif,
       layout: { perm, transforms, cols, rows, tileW, tileH, width, height },
@@ -65,14 +68,14 @@ export async function compute(bytes, key, { animated = true, watermark = null } 
   }
   if (format === 'jxl') {
     // JPEG route: rebuild the scrambled JPEG and reveal that; visitors get the JPEG.
-    if (inspect(bytes).mode === 'mcu') return compute(await reconstructJpeg(bytes), key, { animated, watermark });
+    if (inspect(bytes, { limits }).mode === 'mcu') return compute(await scrambledJpegOf(bytes, limits), key, { animated, limits, watermark });
     // Pixel route: the <img> gets a PNG (an APNG for an animation), since most browsers
     // cannot display JPEG XL. The reveal animates frame 0.
-    const d = await unscrambleJxlDetailed(bytes, { key, display: true });
+    const d = await unscrambleJxlDetailed(bytes, { key, display: true, limits });
     const w = await painting(watermark, d.watermark, d.layout, null, (paint) => {
       const image = d.paint(paint);
       return rgbaPng(d.layout.width, d.layout.height, image.frames ?? [{ data: image.data }], image.plays);
-    });
+    }, limits);
     return {
       kind: 'pixels',
       type: 'image/png',
@@ -89,13 +92,13 @@ export async function compute(bytes, key, { animated = true, watermark = null } 
  * The restored file, with the watermark drawn when one is wanted. A watermark that cannot
  * be drawn (it failed to validate, say) leaves the image as it is and says why.
  */
-async function painting(requested, embedded, { width, height }, exif, write) {
+async function painting(requested, embedded, { width, height }, exif, write, limits) {
   const watermark = requested === 'embedded' ? embedded?.compiled ?? null : requested;
   if (!watermark) return { restored: await write(null) };
   try {
     const painter = await loadPainter();
-    const restored = await write({ painter, watermark });
-    return { restored, overlay: painter.overlayFor(watermark, width, height, exif ? readOrientation(exif) : 1) };
+    const restored = await write({ painter, watermark, limits });
+    return { restored, overlay: painter.overlayFor(watermark, width, height, exif ? readOrientation(exif) : 1, limits) };
   } catch (err) {
     return { restored: await write(null), watermarkError: err.message };
   }

@@ -1,7 +1,11 @@
 // zlib wrapper: native node:zlib when running under Node (several times faster),
 // fflate everywhere else. process.getBuiltinModule keeps the bundle platform-neutral.
+//
+// Inflating always has a ceiling: untrusted data can claim to be anything, and a few
+// kilobytes of deflate can expand to gigabytes. inflateUpTo stops decompressing at the
+// ceiling instead of allocating (or even computing) the rest.
 
-import { unzlibSync, zlibSync } from 'fflate';
+import { Unzlib, zlibSync } from 'fflate';
 
 const native = globalThis.process?.getBuiltinModule?.('node:zlib');
 
@@ -10,11 +14,41 @@ export const deflate = native
   ? (data, level) => native.deflateSync(data, { level })
   : (data, level) => zlibSync(data, { level });
 
-/** @type {(data: Uint8Array) => Uint8Array} */
-export const inflate = native ? (data) => native.inflateSync(data) : (data) => unzlibSync(data);
+// Input is fed to the JS inflater in slices, so one step can produce at most about
+// 1032 x STEP bytes (deflate's maximum ratio) before the ceiling is checked again.
+const STEP = 1 << 14;
 
-// Async variants for browsers: (De)CompressionStream('deflate') is native zlib and far
-// faster than any JS implementation. Falls back to the sync versions elsewhere.
+/**
+ * Inflates a zlib stream, stopping once `limit` bytes are out: the result holds at most
+ * `limit` bytes, plus `more` when the stream would have produced more than that.
+ * @param {Uint8Array} data @param {number} limit
+ * @returns {Uint8Array & {more?: boolean}}
+ */
+export function inflateUpTo(data, limit) {
+  if (native) {
+    try {
+      const out = native.inflateSync(data, Number.isFinite(limit) ? { maxOutputLength: Math.max(1, limit) } : {});
+      return new Uint8Array(out.buffer, out.byteOffset, out.length);
+    } catch (err) {
+      if (err?.code !== 'ERR_BUFFER_TOO_LARGE') throw err;
+      // Over the limit: take the first `limit` bytes with the stepwise inflater below.
+    }
+  }
+  const parts = [];
+  let n = 0, ended = false;
+  const z = new Unzlib((chunk, final) => { parts.push(chunk); n += chunk.length; ended ||= final; });
+  for (let i = 0; !ended && n <= limit; i += STEP) {
+    const last = i + STEP >= data.length;
+    z.push(data.subarray(i, i + STEP), last);
+    if (last) break;
+  }
+  const out = concat(parts, Math.min(n, limit));
+  if (n > limit) out.more = true;
+  return out;
+}
+
+/** Async variants for browsers: (De)CompressionStream('deflate') is native zlib and far
+ * faster than any JS implementation. Falls back to the sync versions elsewhere. */
 const streams = !native && typeof CompressionStream !== 'undefined' && typeof DecompressionStream !== 'undefined';
 
 async function pipe(data, stream) {
@@ -22,14 +56,44 @@ async function pipe(data, stream) {
   return new Uint8Array(await res.arrayBuffer());
 }
 
-/** @type {(data: Uint8Array) => Promise<Uint8Array>} */
-export const inflateAsync = streams
+/** inflateUpTo through a native stream, cancelled as soon as the limit is reached. */
+async function inflateStream(data, limit) {
+  const reader = new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate')).getReader();
+  const parts = [];
+  let n = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    parts.push(value);
+    n += value.length;
+    if (n > limit) { reader.cancel().catch(() => {}); break; }
+  }
+  const out = concat(parts, Math.min(n, limit));
+  if (n > limit) out.more = true;
+  return out;
+}
+
+/** @type {(data: Uint8Array, limit: number) => Promise<Uint8Array & {more?: boolean}>} */
+export const inflateUpToAsync = streams
   // Native streams reject trailing bytes after the zlib stream; the JS inflater tolerates them.
-  ? (data) => pipe(data, new DecompressionStream('deflate')).catch(() => inflate(data))
-  : async (data) => inflate(data);
+  ? (data, limit) => inflateStream(data, limit).catch(() => inflateUpTo(data, limit))
+  : async (data, limit) => inflateUpTo(data, limit);
 
 /** Native streams have no level setting; they use the platform default. */
 export const deflateAsync = streams ? (data) => pipe(data, new CompressionStream('deflate')) : async (data, level) => deflate(data, level);
+
+function concat(parts, n) {
+  if (parts.length === 1 && parts[0].length === n) return parts[0];
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (const p of parts) {
+    if (o >= n) break;
+    const take = Math.min(p.length, n - o);
+    out.set(take === p.length ? p : p.subarray(0, take), o);
+    o += take;
+  }
+  return out;
+}
 
 const CRC_TABLE = (() => {
   const t = new Uint32Array(256);

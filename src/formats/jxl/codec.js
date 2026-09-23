@@ -18,15 +18,18 @@
 
 import createEncoder from '../../../native/libjxl/pkg/pixmix_libjxl.mjs';
 import initDecoder, {
-  decode as decodeRaw, decodeAnimation as decodeAnimationRaw, reconstructJpeg as reconstructRaw, lastPanic,
+  decode as decodeRaw, decodeAnimation as decodeAnimationRaw, reconstructJpeg as reconstructRaw, lastPanic, __pixmixReset,
 } from '../../../native/jxl/pkg/pixmix_jxl.js';
 import { iccSpace } from './icc.js';
+import { PixmixError } from '../../core/params.js';
+import { resolveLimits } from '../../core/limits.js';
 
 /* global __PIXMIX_JXL_WASM__ */
 const BUNDLED = typeof __PIXMIX_JXL_WASM__ !== 'undefined' ? __PIXMIX_JXL_WASM__ : null;
 
 const overrides = {};
 let encoder, decoder; // promises, created on first use
+let decoderModule; // the compiled decoder, kept to start a fresh instance after a trap
 
 /**
  * @param {{encoderWasm?: string|URL|Uint8Array, encoderWasmNoSimd?: string|URL|Uint8Array,
@@ -67,7 +70,19 @@ async function wasmBytes(which) {
   return new Uint8Array(await res.arrayBuffer());
 }
 
-const ready = () => (decoder ??= wasmBytes('dec').then((wasm) => initDecoder({ module_or_path: wasm })));
+const ready = () => (decoder ??= (async () => {
+  decoderModule ??= await WebAssembly.compile(await wasmBytes('dec'));
+  return initDecoder({ module_or_path: decoderModule });
+})().catch((err) => { decoder = null; throw err; }));
+
+// jxl-oxide's buffers get this much per allowed pixel (it works in 32-bit planes, several of
+// them for colour conversion and upsampling); WASM caps the total at 4 GiB anyway.
+const ALLOC_PER_PIXEL = 64;
+
+function wasmLimits(limits) {
+  const l = resolveLimits(limits);
+  return { maxPixels: l.maxPixels, maxFrames: l.maxFrames, maxTotal: l.maxTotalPixels, alloc: l.maxPixels * ALLOC_PER_PIXEL };
+}
 
 /**
  * First frame, orientation applied, as RGBA: 8-bit (`data` a Uint8Array), or with `high`
@@ -75,17 +90,20 @@ const ready = () => (decoder ??= wasmBytes('dec').then((wasm) => initDecoder({ m
  * to sRGB; without it they stay in the image's own colour space and `icc` describes it.
  * @returns {Promise<{width: number, height: number, depth: 8|16, data: Uint8Array|Uint16Array, icc: Uint8Array|null}>}
  */
-export async function decode(bytes, { srgb = true, high = false } = {}) {
+export async function decode(bytes, { srgb = true, high = false, limits } = {}) {
   await ready();
-  const d = guard(() => decodeRaw(bytes, srgb, high));
-  try {
-    const { width, height, channels } = d;
-    const icc = d.icc;
-    const px = high ? d.takePixels16() : d.takePixels();
-    return { width, height, depth: high ? 16 : 8, data: toRgba(px, width * height, channels, high ? 65535 : 255), icc: icc.length ? icc : null };
-  } finally {
-    d.free();
-  }
+  const l = wasmLimits(limits);
+  return guard(() => {
+    const d = decodeRaw(bytes, srgb, high, l.maxPixels, l.alloc);
+    try {
+      const { width, height, channels } = d;
+      const icc = d.icc;
+      const px = high ? d.takePixels16() : d.takePixels();
+      return { width, height, depth: high ? 16 : 8, data: toRgba(px, width * height, channels, high ? 65535 : 255), icc: icc.length ? icc : null };
+    } finally {
+      d.free();
+    }
+  });
 }
 
 /**
@@ -94,40 +112,65 @@ export async function decode(bytes, { srgb = true, high = false } = {}) {
  * `icc: false`, which saves decoding the first frame once more).
  * @returns {Promise<{width: number, height: number, frames: {data: Uint8Array, delay: [number, number]}[], plays: number, icc: Uint8Array|null}>}
  */
-export async function decodeAnimation(bytes, { srgb = true, icc: wantIcc = !srgb } = {}) {
+export async function decodeAnimation(bytes, { srgb = true, icc: wantIcc = !srgb, limits } = {}) {
   await ready();
-  const a = guard(() => decodeAnimationRaw(bytes, srgb));
-  try {
-    const { width, height, channels, count, loops } = a;
-    const durations = a.durationsMs;
-    const all = a.takePixels();
-    const per = width * height * channels;
-    const frames = [];
-    for (let i = 0; i < count; i++) {
-      frames.push({ data: toRgba(all.subarray(i * per, (i + 1) * per), width * height, channels), delay: [durations[i], 1000] });
+  const l = wasmLimits(limits);
+  const anim = guard(() => {
+    const a = decodeAnimationRaw(bytes, srgb, l.maxPixels, l.maxFrames, l.maxTotal, l.alloc);
+    try {
+      const { width, height, channels, count, loops } = a;
+      const durations = a.durationsMs;
+      const all = a.takePixels();
+      const per = width * height * channels;
+      const frames = [];
+      for (let i = 0; i < count; i++) {
+        frames.push({ data: toRgba(all.subarray(i * per, (i + 1) * per), width * height, channels), delay: [durations[i], 1000] });
+      }
+      return { width, height, frames, plays: loops };
+    } finally {
+      a.free();
     }
-    // The ICC profile is the same for every frame; the still-image call reports it.
-    const icc = wantIcc && !srgb ? (await decode(bytes, { srgb: false })).icc : null;
-    return { width, height, frames, plays: loops, icc };
-  } finally {
-    a.free();
-  }
+  });
+  // The ICC profile is the same for every frame; the still-image call reports it.
+  const icc = wantIcc && !srgb ? (await decode(bytes, { srgb: false, limits })).icc : null;
+  return { ...anim, icc };
 }
 
 /** The original JPEG of a losslessly recompressed JPEG XL, or null if it is not one. */
-export async function reconstructJpeg(bytes) {
+export async function reconstructJpeg(bytes, { limits } = {}) {
   await ready();
-  return guard(() => reconstructRaw(bytes)) ?? null;
+  const l = wasmLimits(limits);
+  return guard(() => reconstructRaw(bytes, l.maxPixels, l.alloc)) ?? null;
 }
 
-// A Rust panic aborts the call as a bare RuntimeError; recover the message it left. (jxl-oxide
-// 0.12 panics reconstructing some progressive JPEGs; pixmix's own JPEGs are baseline.)
+/**
+ * Runs a call into the decoder, turning what it throws into a PixmixError: its own errors
+ * are strings ("LIMIT: …" for a limit), and a Rust panic or running out of WASM memory
+ * aborts the call as a bare RuntimeError, whose message the panic hook kept.
+ * After a trap the instance is dropped, and the next call starts a fresh one.
+ * (jxl-oxide 0.12 panics reconstructing some progressive JPEGs; pixmix's own are baseline.)
+ */
 function guard(fn) {
   try {
     return fn();
   } catch (err) {
-    if (err instanceof WebAssembly.RuntimeError) throw new Error(`JPEG XL decoder failed: ${lastPanic() || err.message}`);
-    throw new Error(`JPEG XL decoder failed: ${err?.message ?? err}`);
+    if (err instanceof WebAssembly.RuntimeError) {
+      const panic = lastPanicSafe();
+      __pixmixReset();
+      decoder = null;
+      throw new PixmixError(`JPEG XL decoder failed: ${panic || err.message}`, 'BAD_JXL');
+    }
+    if (typeof err !== 'string') throw err; // not from the decoder: a bug on this side
+    if (err.startsWith('LIMIT: ')) throw new PixmixError(err.slice(7), 'LIMIT');
+    throw new PixmixError(`JPEG XL decoder failed: ${err}`, 'BAD_JXL');
+  }
+}
+
+function lastPanicSafe() {
+  try {
+    return lastPanic();
+  } catch {
+    return ''; // the instance is too broken to say
   }
 }
 
@@ -152,30 +195,44 @@ const loadEncoder = () => (encoder ??= wasmBytes(hasSimd() ? 'enc' : 'encNoSimd'
   throw err;
 }));
 
-/** Runs one encode on a fresh libjxl encoder; `feed(m, e, copyIn)` adds the input. */
+/**
+ * Runs one encode on a fresh libjxl encoder; `feed(m, e, copyIn)` adds the input. libjxl's
+ * own errors (a bad JPEG to recompress, say) become PixmixErrors with `code` JXL_ENCODE and
+ * libjxl's number as `status`. A trap (an abort, or running out of WASM memory) leaves the
+ * module unusable, so it is dropped and the next call loads a fresh one.
+ */
 async function runEncoder({ effort = 7, container = false, distance = 0 }, feed) {
   const m = await loadEncoder();
-  const e = m._pmx_new(effort, container ? 1 : 0, distance);
-  if (!e) throw new Error('JPEG XL encoder could not be created (out of memory?)');
+  const fail = (message, status) => Object.assign(new PixmixError(message, 'JXL_ENCODE'), status ? { status } : {});
   const buffers = [];
-  const copyIn = (bytes) => {
-    const p = m._pmx_malloc(bytes.length || 1);
-    if (!p) throw new Error('JPEG XL encoder is out of memory');
-    buffers.push(p);
-    m.HEAPU8.set(bytes, p);
-    return p;
-  };
-  const check = (code, what) => {
-    if (code) throw Object.assign(new Error(`JPEG XL encoding failed (${what}: ${ENC_ERRORS[code] ?? `error ${code}`})`), { code });
-  };
+  let e = 0;
   try {
+    e = m._pmx_new(effort, container ? 1 : 0, distance);
+    if (!e) throw fail('JPEG XL encoder could not be created (out of memory?)');
+    const copyIn = (bytes) => {
+      const p = m._pmx_malloc(bytes.length || 1);
+      if (!p) throw fail('JPEG XL encoder is out of memory');
+      buffers.push(p);
+      m.HEAPU8.set(bytes, p);
+      return p;
+    };
+    const check = (code, what) => {
+      if (code) throw fail(`JPEG XL encoding failed (${what}: ${ENC_ERRORS[code] ?? `error ${code}`})`, code);
+    };
     feed(m, e, copyIn, check);
     check(m._pmx_finish(e), 'finish');
     const p = m._pmx_out(e), n = m._pmx_out_len(e);
     return m.HEAPU8.slice(p, p + n);
+  } catch (err) {
+    if (err instanceof PixmixError) throw err;
+    if (!(err instanceof WebAssembly.RuntimeError) && !/abort/i.test(err?.message ?? String(err))) throw err; // a bug on this side
+    encoder = null;
+    e = 0;
+    buffers.length = 0;
+    throw Object.assign(fail(`JPEG XL encoder failed: ${err?.message ?? err}`), { cause: err });
   } finally {
     for (const p of buffers) m._pmx_release(p);
-    m._pmx_free(e);
+    if (e) m._pmx_free(e);
   }
 }
 

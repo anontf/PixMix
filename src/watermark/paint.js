@@ -23,10 +23,10 @@ export { renderWatermark, placeWatermark, patchToRGBA8, validateCompiled };
  * laid out on the image as displayed (bottom-right stays bottom-right, text upright), then
  * mapped back onto the stored pixel grid.
  */
-export function renderFor(c, width, height, o = 1) {
-  if (o === 1 || !(o >= 2 && o <= 8)) return renderWatermark(c, width, height);
+export function renderFor(c, width, height, o = 1, limits) {
+  if (o === 1 || !(o >= 2 && o <= 8)) return renderWatermark(c, width, height, limits);
   const dw = swapsAxes(o) ? height : width, dh = swapsAxes(o) ? width : height;
-  const p = renderWatermark(c, dw, dh);
+  const p = renderWatermark(c, dw, dh, limits);
   if (!p) return null;
   // stored -> displayed is m; walk the stored pixels of the patch's preimage.
   const [a, b, cc, d, e, f] = orientationTransform(o, width, height);
@@ -302,9 +302,9 @@ const DROP_WHEN_PROMOTED = new Set(['PLTE', 'tRNS', 'bKGD', 'hIST', 'sBIT']);
  * @param {Uint8Array[]} frames  native samples, frame 0 first
  * @returns {{img: object, frames: Uint8Array[]}|null}  null: nothing drawn
  */
-export function paintPng(img, frames, c, o = 1) {
+export function paintPng(img, frames, c, o = 1, limits) {
   const { width, height, colorType, depth } = img.ihdr;
-  const patch = renderFor(validateCompiled(c), width, height, o);
+  const patch = renderFor(validateCompiled(c), width, height, o, limits);
   if (!patch) return null;
   if (colorType === 3 || depth < 8) {
     const ihdrBytes = img.chunks[0].data.slice();
@@ -337,8 +337,8 @@ export function paintPng(img, frames, c, o = 1) {
 const holds = (f, p) => (f.x ?? 0) <= p.x && (f.y ?? 0) <= p.y && (f.x ?? 0) + f.width >= p.x + p.width && (f.y ?? 0) + f.height >= p.y + p.height;
 
 /** Paints a restored JPEG frame (its coefficients) in place. */
-export function paintJpegImage(frame, segments, c, o = 1) {
-  const patch = renderFor(validateCompiled(c), frame.width, frame.height, o);
+export function paintJpegImage(frame, segments, c, o = 1, limits) {
+  const patch = renderFor(validateCompiled(c), frame.width, frame.height, o, limits);
   return paintJpeg(patch, frame, quantTables(segments), jpegColour(segments, frame));
 }
 
@@ -346,15 +346,15 @@ export function paintJpegImage(frame, segments, c, o = 1) {
  * Paints full-canvas RGBA frames (JPEG XL pixels: 8-bit, or 16-bit in a Uint16Array) in place.
  * @param {{width: number, height: number, frames: (Uint8Array|Uint16Array)[]}} image
  */
-export function paintRgba({ width, height, frames }, c) {
-  const patch = renderFor(validateCompiled(c), width, height, 1);
+export function paintRgba({ width, height, frames }, c, limits) {
+  const patch = renderFor(validateCompiled(c), width, height, 1, limits);
   for (const data of frames) paintSamples(patch, { width, height, channels: 4, depth: data instanceof Uint16Array ? 16 : 8, data });
   return !!patch;
 }
 
 /** The watermark as a straight RGBA patch for a canvas overlay (stored pixel grid). */
-export function overlayFor(c, width, height, o = 1) {
-  return overlayPixels(renderFor(validateCompiled(c), width, height, o));
+export function overlayFor(c, width, height, o = 1, limits) {
+  return overlayPixels(renderFor(validateCompiled(c), width, height, o, limits));
 }
 
 // --- visible watermarks on scrambled images ------------------------------------------

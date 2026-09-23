@@ -8,15 +8,15 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { encodeAsync, rekey, inspect, detectFormat, sharpDecoder, PixmixError } from '../dist/pixmix-encoder.mjs';
-import { decode } from '../src/decoder.js';
+import { encodeAsync, rekeyAsync, inspect, detectFormat, sharpDecoder, PixmixError } from '../dist/pixmix-encoder.mjs';
+import { decodeAsync } from '../src/decoder.js';
 
 const PORT = Number(process.env.PORT) || 8080;
 const HOST = process.env.HOST || '127.0.0.1';
 const ROOT = new URL('..', import.meta.url).pathname;
 const MAX_BODY = 64 * 1024 * 1024;
-const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.map': 'application/json' };
-const IMAGE = { png: ['image/png', 'png'], jpeg: ['image/jpeg', 'jpg'] };
+const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.map': 'application/json', '.wasm': 'application/wasm' };
+const IMAGE = { png: ['image/png', 'png'], jpeg: ['image/jpeg', 'jpg'], jxl: ['image/jxl', 'jxl'] };
 
 // sharp is optional: with it the server also accepts WebP, AVIF, HEIC and TIFF uploads.
 const sharp = await import('sharp').then((m) => m.default, () => null);
@@ -35,6 +35,7 @@ const routes = {
       mode: q.get('mode') || undefined,
       block: num('block'),
       level: num('level'),
+      effort: num('effort'),
       format: q.get('format') || undefined,
       quality: num('quality'),
       transforms: q.get('transforms') !== '0',
@@ -44,8 +45,8 @@ const routes = {
     const { bytes: _, ...info } = report;
     return { ...image(out), headers: { 'X-Pixmix-Convert': JSON.stringify(info) } };
   },
-  'POST /api/decode': async (req, q) => image(decode(await body(req), { key: q.get('key') })),
-  'POST /api/rekey': async (req, q) => image(rekey(await body(req), {
+  'POST /api/decode': async (req, q) => image(await decodeAsync(await body(req), { key: q.get('key') })),
+  'POST /api/rekey': async (req, q) => image(await rekeyAsync(await body(req), {
     from: q.get('from'),
     to: q.get('to'),
     mode: q.get('mode') || undefined,
@@ -89,7 +90,7 @@ createServer(async (req, res) => {
 }).listen(PORT, HOST, () => console.log(`pixmix dev server on http://${HOST}:${PORT}${sharp ? ' (sharp: on)' : ''}`));
 
 async function staticFile(pathname) {
-  const img = pathname.match(/^\/images\/([\w-]+)\.(png|jpg)$/);
+  const img = pathname.match(/^\/images\/([\w-]+)\.(png|jpg|jxl)$/);
   if (img) {
     const g = gallery.get(img[1]);
     return g ? image(g.bytes) : json({ error: 'Not found' }, 404);

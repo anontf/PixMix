@@ -29,6 +29,12 @@ function markerSegment(segments) {
   return segments.find((s) => s.marker === M.APP15 && startsWith(s.data, SIG)) ?? null;
 }
 
+/** The raw pixmix marker (without the APP15 signature) of a scrambled JPEG, or null. */
+export function jpegMarkerBytes(bytes) {
+  const seg = markerSegment(readSegments(bytes).segments);
+  return seg ? seg.data.subarray(SIG.length) : null;
+}
+
 function readMarkerFrom(segments) {
   const seg = markerSegment(segments);
   return seg ? readMarker(seg.data.subarray(SIG.length)) : null;

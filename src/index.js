@@ -1,5 +1,5 @@
 export {
-  encode, encodeAsync, rekey, inspect, convert, convertAsync, detectFormat, OUTPUT_FORMATS,
-  PixmixError, WrongKeyError,
+  encode, encodeAsync, rekey, rekeyAsync, inspect, convert, convertAsync, detectFormat, OUTPUT_FORMATS,
+  configureJxl, PixmixError, WrongKeyError,
 } from './encoder.js';
-export { decode } from './decoder.js';
+export { decode, decodeAsync } from './decoder.js';

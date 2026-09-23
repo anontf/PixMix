@@ -16,20 +16,21 @@
     <label>Image
       <div class="row"><input type="file" id="file" accept="image/*">
         <button id="sample">Sample</button>
-        <select id="sampleType" aria-label="Sample format"><option value="image/png">PNG</option><option value="image/jpeg">JPEG</option><option value="image/webp">WebP</option></select></div>
+        <select id="sampleType" aria-label="Sample format"><option value="image/png">PNG</option><option value="image/jpeg">JPEG</option><option value="image/webp">WebP</option><option value="jxl">JPEG XL</option></select></div>
     </label>
     <label>Key <input id="key" value="correct horse battery staple" size="26"></label>
     <label>Output
-      <select id="format"><option value="">same as input</option><option value="png">PNG</option><option value="jpeg">JPEG</option></select>
+      <select id="format"><option value="">same as input</option><option value="png">PNG</option><option value="jpeg">JPEG</option><option value="jxl">JPEG XL</option></select>
     </label>
-    <label class="png-only">PNG mode
-      <select id="mode"><option value="pixel">pixel</option><option value="block">block</option></select>
+    <label class="png-only">Mode
+      <select id="mode"><option value="">auto</option><option value="pixel">pixel</option><option value="block">block</option><option value="mcu" class="jxl-only">mcu (JPEG route)</option></select>
     </label>
     <label class="png-only">Block <input type="number" id="block" value="16" min="2" max="512"></label>
-    <label class="jpeg-only">JPEG MCUs
+    <label class="mcu-opts">JPEG MCUs
       <select id="transforms"><option value="1">shuffle + flip/rotate</option><option value="0">shuffle only</option></select>
     </label>
     <label class="jpeg-only">Quality <input type="number" id="quality" value="90" min="1" max="100" title="only used when converting to JPEG"></label>
+    <label class="jxl-only">Effort <input type="number" id="effort" min="1" max="9" placeholder="auto" title="JPEG XL encoder effort; auto = 2 for pixel, 7 for block"></label>
     <label>Encode on
       <select id="where"><option value="server">server (Node)</option><option value="browser">browser</option></select>
     </label>
@@ -84,8 +85,8 @@ const $ = (id) => document.getElementById(id);
 const kib = (n) => n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KiB` : `${(n / 1048576).toFixed(2)} MiB`;
 const ms = (t) => `${t.toFixed(0)} ms`;
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => `&#${c.charCodeAt(0)};`);
-const TYPES = { png: 'image/png', jpeg: 'image/jpeg' };
-const EXT = { png: 'png', jpeg: 'jpg' };
+const TYPES = { png: 'image/png', jpeg: 'image/jpeg', jxl: 'image/jxl' };
+const EXT = { png: 'png', jpeg: 'jpg', jxl: 'jxl' };
 const typeOf = (bytes) => TYPES[Enc.detectFormat(bytes)] ?? '';
 const blobUrl = (bytes, type = typeOf(bytes)) => URL.createObjectURL(new Blob([bytes], { type }));
 const browserDecoders = [Enc.browserDecoder()];
@@ -94,9 +95,17 @@ let reference = null; // original as PNG: the input itself, or its conversion
 
 function showImage(stageId, bytes, type = typeOf(bytes) || `image/${Enc.detectFormat(bytes)}`) {
   const img = new Image();
-  img.src = blobUrl(bytes, type);
   $(stageId).replaceChildren(img);
+  // Most browsers cannot display JPEG XL: decode it with pixmix's codec and show a PNG.
+  if (Enc.detectFormat(bytes) === 'jxl') {
+    img.title = 'JPEG XL, decoded by the pixmix codec for display';
+    jxlToPng(bytes).then((png) => { img.src = blobUrl(png, 'image/png'); }, (err) => { img.alt = err.message; });
+  } else img.src = blobUrl(bytes, type);
   return img;
+}
+
+async function jxlToPng(bytes) {
+  return (await Enc.convertAsync(bytes, { format: 'png' })).bytes;
 }
 
 async function loadOriginal(bytes, name, note = '') {
@@ -120,6 +129,8 @@ async function loadOriginal(bytes, name, note = '') {
     parts.push(`depth ${info.bitDepth} · colour type ${info.colorType}${info.interlaced ? ' · interlaced' : ''}`);
   } else if (info.format === 'jpeg') {
     parts.push(`${info.components} comp · MCU ${info.mcu}${info.progressive ? ' · progressive' : ''}`);
+  } else if (info.format === 'jxl') {
+    parts.push(`${info.lossy ? 'lossy' : 'lossless'} · ${info.bitDepth}-bit${info.alpha ? ' · alpha' : ''}${info.animated ? ' · animated' : ''}${info.srgb === false ? ' · non-sRGB' : ''}`);
   }
   if (info.scrambled) parts.push('<span class="bad">already scrambled</span>');
   if (info.format !== 'png' && info.metadata) {
@@ -139,9 +150,11 @@ function outputFormat() {
   return $('format').value || (Enc.OUTPUT_FORMATS.includes(from) ? from : 'png');
 }
 function syncOptions() {
-  const jpeg = outputFormat() === 'jpeg';
-  for (const el of document.querySelectorAll('.png-only')) el.hidden = jpeg;
-  for (const el of document.querySelectorAll('.jpeg-only')) el.hidden = !jpeg;
+  const f = outputFormat();
+  for (const el of document.querySelectorAll('.png-only')) el.hidden = f === 'jpeg';
+  for (const el of document.querySelectorAll('.jpeg-only')) el.hidden = f !== 'jpeg';
+  for (const el of document.querySelectorAll('.jxl-only')) el.hidden = f !== 'jxl';
+  for (const el of document.querySelectorAll('.mcu-opts')) el.hidden = f === 'png';
 }
 $('format').addEventListener('change', syncOptions);
 
@@ -167,8 +180,9 @@ $('sample').addEventListener('click', async () => {
   g.fillStyle = '#fff'; g.font = 'bold 96px system-ui'; g.fillText('pixmix', 48, 130);
   g.font = '28px system-ui'; g.fillText('scrambled, valid, reversible', 52, 176);
   const type = $('sampleType').value;
-  const blob = await c.convertToBlob({ type, quality: 0.9 });
-  loadOriginal(new Uint8Array(await blob.arrayBuffer()), `sample.${type.split('/')[1]}`, ' · generated sample');
+  const png = new Uint8Array(await (await c.convertToBlob({ type: type === 'jxl' ? 'image/png' : type, quality: 0.9 })).arrayBuffer());
+  const bytes = type === 'jxl' ? (await Enc.convertAsync(png, { format: 'jxl' })).bytes : png;
+  loadOriginal(bytes, `sample.${type === 'jxl' ? 'jxl' : type.split('/')[1]}`, ' · generated sample');
 });
 
 async function serverCall(path, params, bytes) {
@@ -180,9 +194,15 @@ async function serverCall(path, params, bytes) {
 
 function encodeOpts() {
   const o = { key: $('key').value, format: outputFormat() };
-  if (o.format === 'png') {
-    o.mode = $('mode').value;
+  if (o.format !== 'jpeg') {
+    // "auto" leaves the choice to pixmix: pixel for PNG; for JPEG XL the JPEG route when
+    // the source is a JPEG and the encoder runs on the server, else pixel.
+    if ($('mode').value) o.mode = $('mode').value;
     if (o.mode === 'block') o.block = Number($('block').value);
+    if (o.format === 'jxl') {
+      if ($('effort').value) o.effort = Number($('effort').value);
+      o.transforms = $('transforms').value === '1'; // used by the JPEG route
+    }
   } else {
     o.transforms = $('transforms').value === '1';
     o.quality = Number($('quality').value);
@@ -263,6 +283,7 @@ async function runDecode() {
 }
 
 async function rgba(bytes) {
+  if (Enc.detectFormat(bytes) === 'jxl') return (await (await Enc.loadJxlCodec()).decode(bytes)).data;
   const bmp = await createImageBitmap(new Blob([bytes], { type: typeOf(bytes) }), {
     premultiplyAlpha: 'none', colorSpaceConversion: 'none', imageOrientation: 'none',
   });
@@ -292,8 +313,8 @@ async function verify() {
 }
 
 // PNG chunks or JPEG segments; image data and pixmix markers are the "coding" parts.
-const CODING = new Set(['IDAT', 'pmIx', 'DHT', 'SOS', 'DRI', 'APP15']);
-const structure = (b) => { const i = Enc.inspect(b); return i.chunks ?? i.segments; };
+const CODING = new Set(['IDAT', 'pmIx', 'DHT', 'SOS', 'DRI', 'APP15', 'jxlc', 'jxlp', 'ftyp']);
+const structure = (b) => { const i = Enc.inspect(b); return i.chunks ?? i.segments ?? i.boxes; };
 
 function renderChunks(before, after, converted) {
   const fmt = (list) => {
@@ -314,7 +335,7 @@ function renderChunks(before, after, converted) {
   const cell = (c) => c ? `${c.type}${c.n > 1 ? ` ×${c.n}` : ''}</td><td>${c.length.toLocaleString()} B` : '</td><td>';
   $('chunks').innerHTML = `<table><tr><th>${converted ? 'converted' : 'original'}</th><th>size</th><th>scrambled</th><th>size</th></tr>` +
     rows.map(([x, y, added]) => `<tr class="${added ? 'added' : ''}"><td>${cell(x)}</td><td>${cell(y)}</td></tr>`).join('') +
-    `</table><p>Everything except the image data (PNG <b>IDAT</b>; JPEG <b>DHT</b>/<b>SOS</b>, re-entropy-coded) is copied byte for byte. ` +
+    `</table><p>Everything except the image data (PNG <b>IDAT</b>; JPEG <b>DHT</b>/<b>SOS</b>, re-entropy-coded; JPEG XL <b>jxlc</b>, re-encoded losslessly) is copied byte for byte. ` +
     `The marker (<b>pmIx</b> / <b>APP15</b>) carries the version, mode and salt.` +
     `${converted ? ' The left column is the input after conversion, with its metadata mapped to the new format.' : ''}</p>`;
 }
@@ -325,13 +346,15 @@ $('rekey').addEventListener('click', async () => {
   const to = $('newKey').value;
   if (!to) return $('newKey').focus();
   const opts = { from: activeKey, to };
-  if (Enc.detectFormat(scrambled) === 'png') {
-    opts.mode = $('mode').value;
+  const info = Enc.inspect(scrambled);
+  if (info.mode === 'mcu') opts.transforms = $('transforms').value === '1';
+  else {
+    opts.mode = $('mode').value || info.mode;
     if (opts.mode === 'block') opts.block = Number($('block').value);
-  } else opts.transforms = $('transforms').value === '1';
+  }
   const t0 = performance.now();
   try {
-    scrambled = $('where').value === 'server' ? (await serverCall('/api/rekey', toQuery(opts), scrambled)).bytes : Enc.rekey(scrambled, opts);
+    scrambled = $('where').value === 'server' ? (await serverCall('/api/rekey', toQuery(opts), scrambled)).bytes : await Enc.rekeyAsync(scrambled, opts);
   } catch (err) {
     $('scrMeta').innerHTML = `<span class="bad">${esc(err.message)}</span>`;
     return;

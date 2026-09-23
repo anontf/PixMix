@@ -4,13 +4,16 @@ Keyed, reversible pixel scrambling. A scrambled image is still a completely vali
 so any viewer shows it, just shuffled:
 - same dimensions;
 - PNG: same bit depth and colour type, every metadata chunk copied byte for byte;
-- JPEG: same quantisation tables and metadata segments.
+- JPEG: same quantisation tables and metadata segments;
+- JPEG XL: same metadata boxes. It is either re-encoded losslessly, or it holds a
+  DCT-scrambled JPEG (the "JPEG route").
 
-With the key, the original comes back exactly: the same pixels for PNG, the same DCT
-coefficients for JPEG.
+With the key, the original comes back exactly: the same pixels for PNG and lossless JPEG
+XL, and the same DCT coefficients for JPEG and JPEG-route JPEG XL.
 
-Output is PNG or JPEG. Input can be PNG, JPEG, GIF, and, with a decoder plugin, WebP, AVIF,
-HEIC or TIFF. EXIF, ICC, XMP, density and comments are carried over.
+Output is PNG, JPEG or JPEG XL. Input can be PNG, JPEG, GIF, JPEG XL, and, with a decoder
+plugin, WebP, AVIF, HEIC or TIFF. EXIF, ICC, XMP, density and comments are carried over
+where the output format can hold them.
 
 This is obfuscation, not encryption: a permutation keeps the colour histogram, and in the
 browser use case the key ships to the visitor.
@@ -36,6 +39,8 @@ export PIXMIX_KEY='site-key'                  # or -k / --key-file
 pixmix encode photos/*.jpg -o scrambled/      # photo.jpg -> scrambled/photo.scrambled.jpg (lossless)
 pixmix encode logo.png --mode block --block 16
 pixmix encode shot.png --format jpeg --quality 85
+pixmix encode art.png --format jxl --mode block --block 16
+pixmix encode photo.jpg --format jxl               # JPEG route: stays lossy-small
 pixmix decode scrambled/photo.scrambled.jpg   # -> scrambled/photo.jpg
 pixmix rekey --in-place --to-file new.key scrambled/*
 pixmix inspect photo.jpg scrambled/photo.scrambled.jpg
@@ -58,8 +63,19 @@ lists every option.
 | `dist/pixmix-decoder.js` | ESM | bundlers / `<script type="module">` |
 | `dist/pixmix-encoder.mjs` | ESM, platform-neutral | Node, Deno, Bun, workers, browsers |
 | `dist/pixmix-encoder.cjs` | CommonJS | `require()`-based servers |
+| `dist/pixmix-jxl.mjs` + `pixmix-jxl-{enc,dec}.wasm` | ESM + WASM | JPEG XL support, loaded on demand |
+| `dist/pixmix-cjxl/` | CommonJS + WASM | JPEG → JPEG XL recompression, servers only |
 
 The decoder bundle contains no encoding code; the encoder bundle has no DOM code.
+
+JPEG XL support is optional:
+- Copy the three `pixmix-jxl*` files next to whichever bundle you deploy, or call
+  `configureJxl({ moduleUrl, encoderWasm, decoderWasm })`.
+- Nothing is fetched until a JPEG XL image shows up.
+- A browser only ever needs the decoder WASM (1.8 MB, about 650 KB compressed). The
+  1.3 MB encoder is fetched only for `decodeAsync()` of a JPEG XL file, which returns JPEG
+  XL.
+- `pixmix-cjxl/` is only for servers that write JPEG-route files; websites never need it.
 
 ## Encoder (servers)
 
@@ -76,11 +92,17 @@ inspect(scrambled); // { format, width, height, scrambled: true, mode, … }
 
 Options:
 - `key`: string or `Uint8Array`.
-- `format`: `png` or `jpeg`. The default is the input's own format when pixmix can write
-  it, otherwise PNG. So JPEG stays JPEG and GIF/WebP/AVIF become PNG.
-- `mode`, `block`: PNG only. `pixel`, or `block` with a tile size of 2–4096.
+- `format`: `png`, `jpeg` or `jxl`. The default is the input's own format when pixmix can
+  write it, otherwise PNG. So JPEG stays JPEG, JPEG XL stays JPEG XL, and GIF/WebP/AVIF
+  become PNG.
+- `mode`, `block`: `pixel`, or `block` with a tile size of 2–4096.
+  - PNG and JPEG XL use them; JPEG is always `mcu`.
+  - JPEG XL can also be `mcu`, the JPEG route. That's the default when the source is a
+    JPEG, or a JPEG XL made from one, and the encoder runs in Node.
+- `effort`: JPEG XL encoder effort, 1–9. Defaults to 2 in pixel mode and 7 in block mode.
 - `level`: PNG only, the zlib level.
-- `transforms`: JPEG only, default `true`. Also flips and rotates each MCU, still lossless.
+- `transforms`: JPEG and JPEG-route JPEG XL, default `true`. Also flips and rotates each
+  MCU, still lossless.
 - `quality`, `subsampling`, `background`: only when converting to JPEG from another format.
   Defaults are 90, `4:2:0` (or `4:2:2` / `4:4:4`), and `#ffffff` as the colour transparency
   is flattened onto.
@@ -89,7 +111,9 @@ Options:
 - `onConvert(report)`: reports how the input was decoded and what metadata was kept or
   dropped: `{ format, from, decoder, transferred, dropped }`.
 
-`encode` is synchronous and handles PNG, JPEG and GIF on its own. Use `encodeAsync` with a
+`encode` is synchronous and handles PNG, JPEG and GIF on its own. JPEG XL, in or out,
+goes through `encodeAsync`, `decodeAsync` and `rekeyAsync`, because its codec is WASM loaded
+on first use. The sync functions throw a clear error pointing at the async ones. Use `encodeAsync` with a
 decoder plugin for everything else:
 
 ```js
@@ -130,19 +154,20 @@ input is decoded to pixels and re-encoded:
 | --- | --- | --- |
 | PNG | built-in | pixmix's PNG reader |
 | JPEG | built-in (jpeg-js) | pixmix's JPEG reader |
+| JPEG XL | built-in (jxl-oxide, WASM) | pixmix's box reader; the ICC profile comes from the decoder |
 | GIF | built-in (omggif), first frame | – |
 | WebP | `sharpDecoder` / `browserDecoder` | pixmix's WebP reader |
 | AVIF, HEIC, TIFF | `sharpDecoder` / `browserDecoder` | sharp |
 
 Where each kind of metadata ends up:
 
-| Metadata | PNG | JPEG |
-| --- | --- | --- |
-| EXIF | `eXIf` | APP1 `Exif` |
-| ICC profile | `iCCP` | APP2 `ICC_PROFILE`, split across segments |
-| XMP | `iTXt XML:com.adobe.xmp` | APP1 XMP |
-| Density | `pHYs` | JFIF APP0 |
-| Comments | `tEXt Comment` | COM |
+| Metadata | PNG | JPEG | JPEG XL |
+| --- | --- | --- | --- |
+| EXIF | `eXIf` | APP1 `Exif` | `Exif` box |
+| ICC profile | `iCCP` | APP2 `ICC_PROFILE`, split across segments | dropped (encoder writes sRGB only) |
+| XMP | `iTXt XML:com.adobe.xmp` | APP1 XMP | `xml ` box |
+| Density | `pHYs` | JFIF APP0 | dropped (no field) |
+| Comments | `tEXt Comment` | COM | dropped (no field) |
 
 The pixels stay exactly as stored. They aren't rotated (the EXIF orientation travels with
 the EXIF) and aren't converted to sRGB (the ICC profile travels with the image).
@@ -194,6 +219,70 @@ const original = await PixMix.decodeAsync(bytes, { key });   // just the bytes
   image stays and a warning is logged.
 - Cross-origin images need CORS, since the decoder `fetch`es the bytes.
 
+### JPEG XL
+
+There are two routes.
+
+**JPEG route** (`mode: 'mcu'`), for photos. It's the default when the source is a JPEG, or
+a JPEG XL made by recompressing one (it has a `jbrd` box):
+- The JPEG is scrambled in the DCT domain exactly as in JPEG → JPEG. Nothing is
+  requantised.
+- It's then losslessly recompressed into JPEG XL by libjxl's `cjxl`, run in a child process.
+  So the file stays as small as a lossy JPEG XL; a 12 MP photo is 28% smaller than its JPEG.
+- Decoding rebuilds that JPEG bit for bit from the JPEG XL, unscrambles it, and either
+  recompresses it (Node) or shows it (browsers get the original JPEG).
+- Speed at 12 MP: about 1.2 s to encode, 1.0 s to reveal in a browser, 1.5 s to restore to
+  JPEG XL.
+- Writing these files needs Node. In a browser, JPEG input falls back to the pixel route
+  unless you ask for `mcu`, which then gives a clear error.
+- Reconstruction uses jxl-oxide. jxl-oxide 0.12 can't rebuild some *progressive* JPEGs from
+  third-party JPEG XL files. Those fall back to the pixel route; pixmix's own JPEGs are
+  always baseline.
+
+**Pixel route** (`mode: 'pixel' | 'block'`), for everything else:
+- Decode JPEG XL with pixmix → the exact pixels the input decodes to, as 8-bit sRGB.
+- Scramble in `pixel` or `block` mode.
+- Encode losslessly with libjxl.
+
+So the key always gives back exactly those pixels. What the report lists under `dropped`
+when re-encoding a JPEG XL input on the pixel route:
+- **Lossy input** that isn't a recompressed JPEG (VarDCT/XYB) is stored losslessly from its
+  decoded pixels, so the file grows.
+- **Colour space:** anything other than sRGB is converted to sRGB. The bundled encoder
+  can't tag another colour space.
+- **Precision:** above 8 bits is reduced to 8, and animation keeps the first frame.
+- **Boxes that would be stale or leak the image:**
+  - `jbrd` (JPEG reconstruction data, no longer matching the pixels);
+  - `jhgm` (an HDR gain map, a second image);
+  - `jxli` / `jxll` (a frame index and codestream level, rewritten).
+
+  `Exif`, `xml `, `jumb`, Brotli-compressed `brob` boxes and unknown boxes are copied
+  unchanged. EXIF thumbnails are stripped as for the other formats.
+
+The codec has three parts:
+- **libjxl's encoder** (the single-threaded build from `@jsquash/jxl`) for lossless encoding.
+- **libjxl's `cjxl`** (from `jxl-wasm`, libjxl 0.7) for JPEG recompression, on servers only.
+- **pixmix's own jxl-oxide binding** (`native/jxl`) for decoding and JPEG reconstruction.
+  - It returns raw 8-bit pixels and the ICC profile, converting colour with `moxcms`, a
+    pure-Rust colour-management library.
+  - Neither published option would do. `@jsquash/jxl`'s decoder isn't bit-exact: it
+    colour-converts even sRGB images and turns (4,255,0) into (3,255,0). The
+    `jxl-oxide-wasm` package can't reconstruct JPEGs. A test guards the exactness.
+
+In the browser, most engines can't display JPEG XL. So the pixel route decodes it in WASM,
+animates like PNG, and gives the `<img>` a lossless PNG of the restored pixels. The JPEG
+route shows the restored JPEG.
+
+#### Rebuilding the decoder WASM
+
+`native/jxl/pkg` is committed, so this is only needed after changing `native/jxl`:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.128   # must match native/jxl/Cargo.toml
+./scripts/build-jxl-wasm.sh
+```
+
 ## How it works
 
 1. **Seed.** HKDF-SHA-256 over the key, with the per-image random salt, and info = version,
@@ -243,6 +332,15 @@ The permutation stream is pinned by a test. Any change to it must bump the versi
   Progressive input comes out about the same size as before.
 - Converting 12 MP PNG → scrambled JPEG takes about 1.7 s (colour conversion, DCT and
   entropy coding in JS).
+- JPEG XL, JPEG route: see above. It's fast because nothing is DCT'd or entropy-optimised
+  twice.
+- JPEG XL, pixel route (single-threaded WASM):
+  - Pixel mode at effort 2: 2 MP encodes in 0.5 s and 12 MP in 3.3 s.
+  - Block mode at effort 7: 5.4 s and 29 s, but the result is 20% smaller than PNG block
+    mode.
+  - Decoding 12 MP takes 5–9 s.
+  - Lower `effort` trades size for speed: at 2 MP, effort 5 gives 0.92 MB in 3.0 s,
+    against 0.78 MB in 4.4 s at effort 7.
 
 ## Roadmap
 
@@ -252,11 +350,25 @@ The permutation stream is pinned by a test. Any change to it must bump the versi
 - [x] Phase 3: JPEG output. JPEG → JPEG is scrambled losslessly in the DCT domain (MCU
   shuffle and flips, metadata untouched); other formats → JPEG via a built-in encoder;
   embedded previews stripped; JPEG reveal animations in the browser
-- [ ] JXL: lossless via libjxl WASM, then lossy via the JPEG-reconstruction path
+- [x] Phase 4: JPEG XL in and out.
+  - Lossless pixel route, and the JPEG route (DCT scramble → lossless JPEG recompression).
+  - Custom jxl-oxide WASM for exact decoding and JPEG reconstruction; lazy loading.
+  - Browser reveal, CLI, server and lab support.
+- [ ] Newer libjxl for recompression (the only prebuilt WASM `cjxl` is 0.7 and Node-only)
 - [ ] Decode off the main thread (Web Worker) for very large images
 - [ ] 16-bit input through plugins (currently reduced to 8-bit)
 - [ ] Keep progressive JPEGs progressive (write progressive scans)
 - [ ] APNG / animated images
+
+## Third-party code
+
+Everything is bundled or loaded under permissive licences:
+- fflate (MIT), jpeg-js (BSD-3-Clause), omggif (MIT).
+- `@jsquash/jxl` (Apache-2.0; libjxl is BSD-3-Clause).
+- `jxl-wasm` (ISC; libjxl 0.7).
+- jxl-oxide and its crates (MIT or Apache-2.0), moxcms (BSD-3-Clause or Apache-2.0),
+  brotli-decompressor (BSD-3-Clause/MIT).
+- sharp is an optional peer (Apache-2.0).
 
 Test images: [PngSuite](http://www.schaik.com/pngsuite/) by Willem van Schaik (see
 `test/fixtures/pngsuite/PngSuite.LICENSE`).

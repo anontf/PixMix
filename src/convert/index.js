@@ -8,6 +8,10 @@ import { detectFormat, toBytes } from '../formats/index.js';
 import { PixmixError } from '../core/params.js';
 import { readJpegMetadata } from '../meta/jpeg.js';
 import { readWebpMetadata } from '../meta/webp.js';
+import { readJxlMetadata } from '../meta/jxl.js';
+import { readJxl, writeJxl } from '../formats/jxl/container.js';
+import { sanitizeBoxes } from '../formats/jxl/index.js';
+import { loadJxlCodec } from '../formats/jxl/load.js';
 import { stripExifThumbnail } from '../meta/thumbnails.js';
 import { readChunks, writeChunks } from '../formats/png/chunks.js';
 import { sanitizeJpeg } from '../formats/jpeg/index.js';
@@ -15,12 +19,12 @@ import { buildPng } from './png-build.js';
 import { buildJpeg } from './jpeg-build.js';
 import { BUILTIN_DECODERS } from './decoders.js';
 
-const EXTRACTORS = { jpeg: readJpegMetadata, webp: readWebpMetadata };
-export const OUTPUT_FORMATS = ['png', 'jpeg'];
+const EXTRACTORS = { jpeg: readJpegMetadata, webp: readWebpMetadata, jxl: readJxlMetadata };
+export const OUTPUT_FORMATS = ['png', 'jpeg', 'jxl'];
 
 /**
  * @typedef {object} ConvertOptions
- * @property {'png'|'jpeg'} [format]    default: the input format when it can be written, else png
+ * @property {'png'|'jpeg'|'jxl'} [format]  default: the input format when it can be written, else png
  * @property {object[]} [decoders]      extra input decoders (plugins)
  * @property {boolean} [keepThumbnails] keep embedded previews (they show the unscrambled image)
  * @property {number} [quality=90]      JPEG output from non-JPEG input
@@ -49,6 +53,7 @@ export function convert(input, opts = {}) {
   const bytes = toBytes(input);
   const job = prepare(bytes, opts);
   if (job.done) return job.done;
+  if (job.target === 'jxl') throw new PixmixError('JPEG XL output needs encodeAsync/convertAsync', 'ASYNC_DECODER');
   const decoded = job.decoder.decode(bytes, job.from);
   if (decoded && typeof decoded.then === 'function') {
     throw new PixmixError(`Decoder "${job.decoder.name}" is async; use encodeAsync/convertAsync`, 'ASYNC_DECODER');
@@ -56,12 +61,55 @@ export function convert(input, opts = {}) {
   return finish(bytes, job, decoded, opts);
 }
 
-/** Accepts async decoder plugins (sharp, browser-native). @returns {Promise<ConvertResult>} */
+/** Accepts async decoder plugins (sharp, browser-native) and JPEG XL. @returns {Promise<ConvertResult>} */
 export async function convertAsync(input, opts = {}) {
   const bytes = toBytes(input);
   const job = prepare(bytes, opts);
   if (job.done) return job.done;
+  if (job.target === 'jxl') {
+    const { image, meta, from, decoder } = await decodeJob(bytes, job, opts);
+    const { boxes, transferred, dropped } = jxlBoxes(meta);
+    const codestream = await (await loadJxlCodec()).encode(image);
+    return { bytes: writeJxl(boxes, codestream), format: 'jxl', from, decoder, transferred, dropped };
+  }
   return finish(bytes, job, await job.decoder.decode(bytes, job.from), opts);
+}
+
+/**
+ * For JPEG XL output from another format: the decoded RGBA and the metadata as JXL boxes,
+ * so the encoder can scramble the pixels before the one and only (lossless) encode.
+ */
+export async function decodeForJxl(input, opts = {}) {
+  const bytes = toBytes(input);
+  const job = prepare(bytes, { ...opts, format: 'jxl' });
+  if (job.done) throw new Error('decodeForJxl is for non-JXL input');
+  const { image, meta, from, decoder } = await decodeJob(bytes, job, opts);
+  const { boxes, transferred, dropped } = jxlBoxes(meta);
+  return { image, boxes, report: { format: 'jxl', from, decoder, transferred, dropped } };
+}
+
+async function decodeJob(bytes, job, { keepThumbnails = false }) {
+  const decoded = await job.decoder.decode(bytes, job.from);
+  const image = { ...decoded, data: toBytes(decoded.data) };
+  const meta = mergedMeta(bytes, job.from, decoded, keepThumbnails);
+  return { image, meta, from: job.from, decoder: job.decoder.name };
+}
+
+// JPEG XL keeps EXIF and XMP in boxes; the colour profile would go in the codestream,
+// which the bundled encoder always writes as sRGB.
+function jxlBoxes(meta) {
+  const boxes = [], transferred = [], dropped = [...meta.dropped];
+  if (meta.exif?.length) {
+    const d = new Uint8Array(4 + meta.exif.length);
+    d.set(meta.exif, 4);
+    boxes.push({ type: 'Exif', data: d });
+    transferred.push('EXIF');
+  }
+  if (meta.xmp) { boxes.push({ type: 'xml ', data: new TextEncoder().encode(meta.xmp) }); transferred.push('XMP'); }
+  if (meta.icc) dropped.push('ICC profile (the bundled JPEG XL encoder writes sRGB only)');
+  if (meta.density) dropped.push('density (JPEG XL has no field for it)');
+  if (meta.comments?.length) dropped.push('comments (JPEG XL has no field for them)');
+  return { boxes, transferred, dropped: [...new Set(dropped)] };
 }
 
 function prepare(bytes, { format, decoders = [], keepThumbnails = false }) {
@@ -80,15 +128,24 @@ function prepare(bytes, { format, decoders = [], keepThumbnails = false }) {
   return { from, target, decoder };
 }
 
-function finish(bytes, { from, target, decoder }, decoded, { keepThumbnails = false, quality, subsampling, background }) {
-  decoded = { ...decoded, data: toBytes(decoded.data) }; // plugins may hand back Node Buffers
-  const extracted = EXTRACTORS[from]?.(bytes);
-  const meta = { ...(extracted ?? decoded.metadata ?? {}) };
-  meta.dropped = [...(meta.dropped ?? []), ...(extracted ? decoded.metadata?.dropped ?? [] : [])];
+// pixmix's own container reader wins; the decoder fills in what it cannot see (e.g. the
+// colour profile of a JPEG XL, which lives in the codestream).
+function mergedMeta(bytes, from, decoded, keepThumbnails) {
+  const extracted = EXTRACTORS[from]?.(bytes) ?? {};
+  const fromDecoder = decoded.metadata ?? {};
+  const meta = { ...fromDecoder, ...extracted };
+  for (const k of Object.keys(extracted)) if (extracted[k] === undefined) meta[k] = fromDecoder[k];
+  meta.dropped = [...(extracted.dropped ?? []), ...(fromDecoder.dropped ?? [])];
   if (meta.exif && !keepThumbnails) {
     const stripped = stripExifThumbnail(meta.exif);
     if (stripped) { meta.exif = stripped; meta.dropped.push('EXIF thumbnail'); }
   }
+  return meta;
+}
+
+function finish(bytes, { from, target, decoder }, decoded, { keepThumbnails = false, quality, subsampling, background }) {
+  decoded = { ...decoded, data: toBytes(decoded.data) }; // plugins may hand back Node Buffers
+  const meta = mergedMeta(bytes, from, decoded, keepThumbnails);
   const built = target === 'jpeg'
     ? (({ jpeg, ...r }) => ({ bytes: jpeg, ...r }))(buildJpeg(decoded, meta, { quality, subsampling, background }))
     : (({ png, ...r }) => ({ bytes: png, ...r }))(buildPng(decoded, meta));
@@ -97,6 +154,11 @@ function finish(bytes, { from, target, decoder }, decoded, { keepThumbnails = fa
 
 function sanitize(format, bytes) {
   if (format === 'jpeg') return sanitizeJpeg(bytes);
+  if (format === 'jxl') {
+    const { boxes, codestream } = readJxl(bytes);
+    const clean = sanitizeBoxes(boxes);
+    return { bytes: writeJxl(clean.boxes, codestream), dropped: clean.dropped };
+  }
   // PNG: only an EXIF thumbnail can leak; everything else stays byte for byte.
   const chunks = readChunks(bytes);
   const i = chunks.findIndex((c) => c.type === 'eXIf');

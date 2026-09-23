@@ -180,7 +180,7 @@ test('formats without a built-in decoder ask for a plugin', async () => {
   const webp = await sharp(Buffer.from(gradient()), { raw: { width: W, height: H, channels: 4 } }).webp({ lossless: true }).toBuffer();
   assert.throws(() => encode(webp, { key: 'k' }), /pass a decoder plugin/);
   assert.throws(() => encode(webp, { key: 'k', decoders: [sharpDecoder(sharp)] }), { code: 'ASYNC_DECODER' });
-  assert.throws(() => encode(jpegWithMetadata(), { key: 'k', format: 'jxl' }), /not supported yet/);
+  assert.throws(() => encode(jpegWithMetadata(), { key: 'k', format: 'avif' }), /not supported yet/);
 });
 
 test('sharp plugin: lossless WebP with ICC + EXIF + XMP', async () => {

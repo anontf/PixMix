@@ -8,7 +8,7 @@ import { readPng } from '../src/formats/png/index.js';
 import { toRGBA8 } from '../src/formats/png/rgba.js';
 import { resolveObjectURL } from 'node:buffer';
 import jpeg from 'jpeg-js';
-import { decode, detectFormat } from '../src/decoder.js';
+import { decode, detectFormat, inspect } from '../src/decoder.js';
 import { readJpegMetadata } from '../src/meta/jpeg.js';
 import { readOrientation } from '../src/meta/exif.js';
 import { orientationTransform, swapsAxes } from '../src/browser/orient.js';
@@ -196,3 +196,37 @@ test('JPEG reveal swaps the restored JPEG into the <img>', async () => {
   assert.equal(detectFormat(restored), 'jpeg');
 });
 
+
+test('JXL reveal animates to the exact pixels and shows a PNG', async () => {
+  const { encodeAsync } = await import('../src/encoder.js');
+  const { loadJxlCodec } = await import('../src/formats/jxl/load.js');
+  const codec = await loadJxlCodec();
+  const w = 23, h = 17;
+  const data = new Uint8Array(w * h * 4).map((_, i) => (i * 41) & 255);
+  const jxl = await codec.encode({ width: w, height: h, data });
+  for (const [mode, effect] of [['pixel', 'dissolve'], ['block', 'blocks']]) {
+    globalThis.fetch = async () => new Response(await encodeAsync(jxl, { key: 'k', mode, block: 4 }));
+    const out = await reveal(new FakeImg(), { key: 'k', effect, duration: 20, final: 'canvas' });
+    assert.deepEqual(out.pixels, new Uint8ClampedArray(data), `${mode}/${effect}`);
+  }
+  globalThis.fetch = async () => new Response(await encodeAsync(jxl, { key: 'k' }));
+  const img = new FakeImg();
+  await reveal(img, { key: 'k', effect: 'none' });
+  const shown = new Uint8Array(await resolveObjectURL(img.src).arrayBuffer());
+  assert.equal(detectFormat(shown), 'png');
+});
+
+test('JPEG-route JXL reveals as the original JPEG', async () => {
+  const { encodeAsync } = await import('../src/encoder.js');
+  const { unscrambleJxlDetailed } = await import('../src/formats/jxl/index.js');
+  const jxl = await encodeAsync(await jpegFixture(), { key: 'k', format: 'jxl' });
+  assert.equal(inspect(jxl).mode, 'mcu');
+  globalThis.fetch = async () => new Response(jxl);
+  const out = await reveal(new FakeImg(), { key: 'k', effect: 'blocks', duration: 20, final: 'canvas' });
+  const restored = (await unscrambleJxlDetailed(jxl, { key: 'k' })).jpeg.toJpeg();
+  assert.deepEqual(out.pixels, new Uint8ClampedArray(jpeg.decode(restored, { useTArray: true, formatAsRGBA: true }).data));
+  const img = new FakeImg();
+  globalThis.fetch = async () => new Response(jxl);
+  await reveal(img, { key: 'k', effect: 'none' });
+  assert.equal(detectFormat(new Uint8Array(await resolveObjectURL(img.src).arrayBuffer())), 'jpeg');
+});

@@ -86,3 +86,16 @@ test('JPEG stays JPEG: .scrambled.jpg and back, lossless', async () => {
   assert.equal(r.status, 1);
   assert.match(r.stderr.toString(), /only applies to PNG/);
 });
+
+test('JPEG XL: encode to .jxl, decode and rekey through the async paths', async () => {
+  const src = join(FIX, 'basn2c08.png');
+  let r = run(['encode', '-k', 'x', '--format', 'jxl', '--mode', 'block', '--block', '4', '-o', join(dir, 'x.jxl'), src]);
+  assert.equal(r.status, 0, r.stderr.toString());
+  r = run(['rekey', '-k', 'x', '--to', 'y', '--in-place', join(dir, 'x.jxl')]);
+  assert.equal(r.status, 0, r.stderr.toString());
+  r = run(['decode', '-k', 'y', join(dir, 'x.jxl')]);
+  assert.equal(r.status, 0, r.stderr.toString());
+  assert.ok(existsSync(join(dir, 'x.restored.jxl')));
+  r = run(['inspect', '--json', join(dir, 'x.restored.jxl')]);
+  assert.equal(JSON.parse(r.stdout).format, 'jxl');
+});

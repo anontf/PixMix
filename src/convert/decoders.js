@@ -14,6 +14,9 @@ import { PixmixError } from '../core/params.js';
 import { readPng } from '../formats/png/index.js';
 import { toRGBA8 } from '../formats/png/rgba.js';
 import { readPngMetadata } from '../meta/png.js';
+import { loadJxlCodec } from '../formats/jxl/load.js';
+import { readJxlHeader, readJxl } from '../formats/jxl/container.js';
+import { reencodeNotes } from '../formats/jxl/index.js';
 
 // Used when PNG has to become another format.
 export const pngDecoder = {
@@ -63,4 +66,19 @@ export const gifDecoder = {
   },
 };
 
-export const BUILTIN_DECODERS = [pngDecoder, jpegDecoder, gifDecoder];
+// jxl-oxide WASM, loaded on first use (so it is async: encodeAsync/convertAsync only).
+// Non-sRGB images keep their stored colours and hand over the ICC profile, like the other
+// formats; sRGB ones decode as they are.
+export const jxlDecoder = {
+  name: 'jxl-oxide',
+  formats: ['jxl'],
+  async decode(bytes) {
+    const header = readJxlHeader(readJxl(bytes).codestream);
+    const keepColour = header.srgb === false;
+    const image = await (await loadJxlCodec()).decode(bytes, { srgb: !keepColour });
+    const dropped = reencodeNotes(header).filter((n) => !n.startsWith('lossy') && !(keepColour && n.startsWith('colour')));
+    return { ...image, metadata: { dropped, ...(image.icc ? { icc: image.icc } : {}) } };
+  },
+};
+
+export const BUILTIN_DECODERS = [pngDecoder, jpegDecoder, gifDecoder, jxlDecoder];

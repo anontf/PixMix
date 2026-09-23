@@ -3,29 +3,42 @@
 import { pick, toBytes, detectFormat } from './formats/index.js';
 import { scramblePng, rekeyPng, inspectPng } from './formats/png/index.js';
 import { scrambleJpeg, rekeyJpeg, inspectJpeg } from './formats/jpeg/index.js';
-import { convert, convertAsync, targetFormat, OUTPUT_FORMATS } from './convert/index.js';
+import {
+  scrambleJxl, scrambleJxlPixels, scrambleJpegToJxl, rekeyJxl, inspectJxl, reencodeNotes, hasJpegData, reconstructJpeg,
+} from './formats/jxl/index.js';
+import { loadJxlCodec } from './formats/jxl/load.js';
+import { readJxl, readJxlHeader } from './formats/jxl/container.js';
+import { convert, convertAsync, decodeForJxl, targetFormat, OUTPUT_FORMATS } from './convert/index.js';
 import { PixmixError } from './core/params.js';
 import { readWebpMetadata } from './meta/webp.js';
 import { readOrientation } from './meta/exif.js';
 
 export { detectFormat, convert, convertAsync, OUTPUT_FORMATS };
+export { configureJxl, loadJxlCodec } from './formats/jxl/load.js';
 // Decoder plugins; neither imports anything platform-specific at load time.
 export { sharpDecoder } from './plugins/sharp.js';
 export { browserDecoder } from './plugins/browser.js';
 export { PixmixError, WrongKeyError } from './core/params.js';
 
+// JPEG XL only has async operations (its codec is WASM, loaded on first use).
 const SCRAMBLERS = {
   png: { scramble: scramblePng, rekey: rekeyPng, inspect: inspectPng },
   jpeg: { scramble: scrambleJpeg, rekey: rekeyJpeg, inspect: inspectJpeg },
+  jxl: { scrambleAsync: scrambleJxl, rekeyAsync: rekeyJxl, inspect: inspectJxl },
 };
+
+const needsAsync = (what) => new PixmixError(`JPEG XL ${what} is async; use ${what}Async`, 'ASYNC_DECODER');
 
 /**
  * @typedef {object} EncodeOptions
  * @property {string|Uint8Array} key
- * @property {'png'|'jpeg'} [format]   output format; default: the input's own format when
- *           pixmix can write it (PNG, JPEG), otherwise PNG
- * @property {'pixel'|'block'} [mode='pixel']  PNG only; JPEG is always scrambled per MCU
- * @property {number} [block=8]        PNG block mode tile size
+ * @property {'png'|'jpeg'|'jxl'} [format]  output format; default: the input's own format
+ *           when pixmix can write it (PNG, JPEG, JPEG XL), otherwise PNG
+ * @property {'pixel'|'block'|'mcu'} [mode]  PNG: pixel (default) or block. JPEG: always mcu.
+ *           JPEG XL: pixel/block (lossless pixels), or mcu, the JPEG route, which is the
+ *           default when the source is a JPEG (or a JPEG XL holding one) and Node can run cjxl
+ * @property {number} [block=8]        block mode tile size
+ * @property {number} [effort]         JPEG XL encoder effort 1-9 (default 2 in pixel mode, else 7)
  * @property {boolean} [transforms=true]  JPEG: also flip/rotate each MCU (lossless)
  * @property {number} [level]          zlib level for PNG output
  * @property {number} [quality=90]     JPEG quality when the input is not already JPEG
@@ -43,16 +56,66 @@ const SCRAMBLERS = {
  * @param {Uint8Array|ArrayBuffer} input @param {EncodeOptions} opts @returns {Uint8Array}
  */
 export function encode(input, opts) {
-  const converted = convert(input, withTarget(input, opts));
+  const withFormat = withTarget(input, opts);
+  if (withFormat.format === 'jxl' || detectFormat(toBytes(input)) === 'jxl') throw needsAsync('encode');
+  const converted = convert(input, withFormat);
   opts.onConvert?.(converted);
   return SCRAMBLERS[converted.format].scramble(converted.bytes, opts);
 }
 
-/** Like encode, but accepts async decoder plugins (sharp, browser-native). */
+/** Like encode, but also accepts async decoder plugins (sharp, browser-native) and JPEG XL. */
 export async function encodeAsync(input, opts) {
-  const converted = await convertAsync(input, withTarget(input, opts));
+  const withFormat = withTarget(input, opts);
+  const bytes = toBytes(input);
+  const from = detectFormat(bytes);
+  if (withFormat.format === 'jxl') {
+    const viaJpeg = await jpegForJxl(bytes, from, opts);
+    if (viaJpeg) {
+      // JPEG route: sanitise the JPEG, scramble it in the DCT domain, recompress to JXL.
+      const converted = convert(viaJpeg.jpeg, { ...opts, format: 'jpeg' });
+      opts.onConvert?.({ ...converted, bytes: undefined, format: 'jxl', from, decoder: viaJpeg.decoder, dropped: [...viaJpeg.notes, ...converted.dropped] });
+      return scrambleJpegToJxl(converted.bytes, opts);
+    }
+  }
+  if (withFormat.format === 'jxl' && from !== 'jxl') {
+    // Decode once, scramble the pixels, encode once (no intermediate unscrambled JXL).
+    const { image, boxes, report } = await decodeForJxl(input, withFormat);
+    opts.onConvert?.(report);
+    return scrambleJxlPixels(image, boxes, { ...opts, mode: opts.mode ?? 'pixel' });
+  }
+  const converted = await convertAsync(input, withFormat);
+  if (converted.format === 'jxl') {
+    converted.dropped.push(...reencodeNotes(readJxlHeader(readJxl(converted.bytes).codestream)));
+  }
   opts.onConvert?.(converted);
-  return SCRAMBLERS[converted.format].scramble(converted.bytes, opts);
+  const s = SCRAMBLERS[converted.format];
+  return s.scramble ? s.scramble(converted.bytes, opts) : s.scrambleAsync(converted.bytes, { ...opts, mode: opts.mode ?? 'pixel' });
+}
+
+/**
+ * For JPEG XL output: the JPEG to take the JPEG route with, or null for the pixel route.
+ * The route is used when asked for (mode mcu), or by default when the source is a JPEG or a
+ * recompressed-JPEG JXL and this runtime can run cjxl.
+ */
+async function jpegForJxl(bytes, from, { mode }) {
+  if (mode && mode !== 'mcu') return null;
+  const isJpegSource = from === 'jpeg' || (from === 'jxl' && hasJpegData(bytes));
+  if (!isJpegSource) {
+    if (mode === 'mcu') throw new PixmixError('Mode "mcu" needs a JPEG source (a JPEG, or a JPEG XL made from one)', 'BAD_OPTION');
+    return null;
+  }
+  const codec = await loadJxlCodec();
+  if (!codec.canTranscode()) {
+    if (mode === 'mcu') throw new PixmixError('The JPEG route needs Node (to run libjxl cjxl); use mode "pixel" or "block" here', 'UNSUPPORTED');
+    return null;
+  }
+  if (from === 'jpeg') return { jpeg: bytes, decoder: 'none', notes: [] };
+  try {
+    return { jpeg: await reconstructJpeg(bytes), decoder: 'jpeg reconstruction', notes: [] };
+  } catch (err) {
+    if (mode === 'mcu') throw err;
+    return null; // e.g. a progressive JPEG jxl-oxide cannot rebuild: fall back to pixels
+  }
 }
 
 // Validates the output format and mode combination up front, before any decoding work.
@@ -61,7 +124,10 @@ function withTarget(input, opts) {
   if (!from) throw new PixmixError('Unrecognised image format', 'UNSUPPORTED');
   const format = targetFormat(from, opts?.format);
   if (format === 'jpeg' && opts.mode && opts.mode !== 'mcu') {
-    throw new PixmixError(`JPEG output is scrambled per MCU; mode "${opts.mode}" only applies to PNG`, 'BAD_OPTION');
+    throw new PixmixError(`JPEG output is scrambled per MCU; mode "${opts.mode}" only applies to PNG and JPEG XL`, 'BAD_OPTION');
+  }
+  if (format === 'png' && opts.mode === 'mcu') {
+    throw new PixmixError('Mode "mcu" only applies to JPEG and JPEG XL output', 'BAD_OPTION');
   }
   return { ...opts, format };
 }
@@ -74,7 +140,16 @@ function withTarget(input, opts) {
  */
 export function rekey(input, opts) {
   const bytes = toBytes(input);
-  return pick(SCRAMBLERS, bytes).rekey(bytes, opts);
+  const s = pick(SCRAMBLERS, bytes);
+  if (!s.rekey) throw needsAsync('rekey');
+  return s.rekey(bytes, opts);
+}
+
+/** rekey for every format, including JPEG XL. */
+export async function rekeyAsync(input, opts) {
+  const bytes = toBytes(input);
+  const s = pick(SCRAMBLERS, bytes);
+  return s.rekey ? s.rekey(bytes, opts) : s.rekeyAsync(bytes, opts);
 }
 
 /** Describes an image and whether it carries a pixmix marker. */

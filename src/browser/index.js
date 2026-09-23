@@ -1,37 +1,48 @@
 // Browser decoder: restores scrambled images on a page, with an optional animation.
 //
-//   <img data-pixmix src="/img/cat.scrambled.png">   (PNG or JPEG)
+//   <img data-pixmix src="/img/cat.scrambled.png">   (PNG, JPEG or JPEG XL)
 //   PixMix.revealAll({ key: 'site-key', effect: 'dissolve' })
 //
 // The animation runs on a canvas that temporarily replaces the <img>. At the end the
 // <img> gets the exactly restored file (as a blob: URL), so colour management, ICC
 // profiles, alt text, CSS and right-click "save image" all behave as usual.
 
-import { decode, inspect, detectFormat, PixmixError, WrongKeyError } from '../decoder.js';
+import { decode, decodeAsync as decodeAnyAsync, inspect, detectFormat, configureJxl, PixmixError, WrongKeyError } from '../decoder.js';
 import { unscramblePngDetailedAsync } from '../formats/png/index.js';
 import { unscrambleJpegDetailed } from '../formats/jpeg/index.js';
+import { unscrambleJxlDetailed, reconstructJpeg } from '../formats/jxl/index.js';
+import { writeChunks } from '../formats/png/chunks.js';
+import { encodeRasterAsync } from '../formats/png/raster.js';
 import { toRGBA8 } from '../formats/png/rgba.js';
 import { readOrientation } from '../meta/exif.js';
 import { orientationTransform, swapsAxes, browserHonoursPngOrientation } from './orient.js';
 
-export { decode, inspect, detectFormat, PixmixError, WrongKeyError };
+export { decode, inspect, detectFormat, configureJxl, PixmixError, WrongKeyError };
 
 export const EFFECTS = ['dissolve', 'scan', 'blocks', 'none'];
 const MAX_ANIMATED_TILES = 12000;
 const TYPES = { png: 'image/png', jpeg: 'image/jpeg' };
 
-/** Like decode(), but uses the browser's native zlib streams for PNG; faster on big images. */
+/**
+ * Restores the original file, in its own format. Uses the browser's native zlib streams
+ * for PNG. JPEG XL comes back as lossless JPEG XL, which needs the JPEG XL encoder too;
+ * for display, decodeToURL (a PNG for JPEG XL) is cheaper.
+ */
 export async function decodeAsync(input, { key } = {}) {
   const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
   const format = detectFormat(bytes);
   if (format === 'png') return (await unscramblePngDetailedAsync(bytes, { key })).toPng();
-  return decode(bytes, { key });
+  return decodeAnyAsync(bytes, { key });
 }
 
-/** Fetches and decodes to a blob: URL. */
+/**
+ * Fetches and decodes to a blob: URL an <img> can show: the original PNG/JPEG, or for
+ * JPEG XL (which most browsers cannot display) a lossless PNG of its pixels.
+ */
 export async function decodeToURL(url, { key, fetchOptions } = {}) {
   const bytes = await fetchBytes(url, fetchOptions);
-  return URL.createObjectURL(new Blob([await decodeAsync(bytes, { key })], { type: TYPES[detectFormat(bytes)] }));
+  const job = await prepare(bytes, key, 'ignore', false);
+  return URL.createObjectURL(new Blob([await job.restored()], { type: job.type }));
 }
 
 /**
@@ -154,7 +165,33 @@ async function prepare(bytes, key, orientation, animated) {
       animate: (work, opts) => animateJpeg(work, d.layout, toRaw(scr, width, height, o), toRaw(orig, width, height, o), opts),
     };
   }
+  if (format === 'jxl') {
+    // JPEG route: rebuild the scrambled JPEG (WASM) and reveal that; visitors get the JPEG.
+    if (inspect(bytes).mode === 'mcu') {
+      return prepare(await reconstructJpeg(bytes), key, orientation, animated);
+    }
+    // Pixel route: decoded in WASM, exact, so this animates like PNG. The <img> gets a PNG
+    // of the restored pixels, since most browsers cannot display JPEG XL.
+    const d = await unscrambleJxlDetailed(bytes, { key });
+    const { width, height } = d.layout;
+    return {
+      width, height, o: 1, type: TYPES.png,
+      restored: () => rgbaPng(width, height, d.pixels),
+      animate: (work, opts) => animate(work, d, new Uint8ClampedArray(d.scrambled.buffer, d.scrambled.byteOffset, d.scrambled.length), opts),
+    };
+  }
   throw new PixmixError(`${format ? format.toUpperCase() : 'This format'} cannot be revealed`, 'UNSUPPORTED');
+}
+
+async function rgbaPng(width, height, rgba) {
+  const ihdr = new Uint8Array(13);
+  const dv = new DataView(ihdr.buffer);
+  dv.setUint32(0, width);
+  dv.setUint32(4, height);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  const idat = await encodeRasterAsync({ width, height, depth: 8, colorType: 6, interlace: 0 }, rgba);
+  return writeChunks([{ type: 'IHDR', data: ihdr }, { type: 'IDAT', data: idat }, { type: 'IEND', data: new Uint8Array(0) }]);
 }
 
 /**

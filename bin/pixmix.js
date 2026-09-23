@@ -4,12 +4,12 @@
 import { parseArgs } from 'node:util';
 import { readFile, writeFile, rename, mkdir, stat } from 'node:fs/promises';
 import { basename, dirname, extname, join } from 'node:path';
-import { encodeAsync, decode, rekey, inspect, detectFormat, PixmixError } from '../src/index.js';
+import { encodeAsync, decodeAsync, rekeyAsync, inspect, detectFormat, PixmixError } from '../src/index.js';
 import { targetFormat } from '../src/convert/index.js';
 import { sharpDecoder } from '../src/plugins/sharp.js';
 
 const USAGE = `Usage:
-  pixmix encode  <file...> [options]   scramble images (any supported input -> PNG or JPEG)
+  pixmix encode  <file...> [options]   scramble images (any supported input -> PNG, JPEG or JPEG XL)
   pixmix decode  <file...> [options]   restore scrambled images
   pixmix rekey   <file...> [options]   change the key (and optionally the mode) losslessly
   pixmix inspect <file...> [--json]    show format, size, metadata and scramble info
@@ -21,9 +21,12 @@ Keys (prefer the file or environment forms; -k ends up in shell history):
 
 Options:
   -o, --out <path>         output file, directory, or "-" for stdout (single input)
-  --format <png|jpeg>      output format (default: same as the input when possible, else png)
-  --mode <pixel|block>     PNG scramble mode (default pixel); JPEG always shuffles MCUs
-  --block <n>              PNG tile size in block mode (default 8)
+  --format <png|jpeg|jxl>  output format (default: same as the input when possible, else png)
+  --mode <pixel|block|mcu> PNG: pixel (default) or block. JPEG: always mcu. JPEG XL: pixel/block
+                           (lossless pixels) or mcu (JPEG route: a DCT-scrambled JPEG inside
+                           the JXL; the default for JPEG sources)
+  --block <n>              tile size in block mode (default 8)
+  --effort <1-9>           JPEG XL encoder effort (default 2 in pixel mode, 7 in block mode)
   --no-transforms          JPEG: shuffle MCUs only, without flipping/rotating them
   --quality <1-100>        JPEG quality when converting to JPEG (default 90)
   --subsampling <s>        JPEG chroma subsampling when converting: 4:2:0 (default), 4:2:2, 4:4:4
@@ -52,6 +55,7 @@ const OPTIONS = {
   block: { type: 'string' },
   format: { type: 'string' },
   level: { type: 'string' },
+  effort: { type: 'string' },
   quality: { type: 'string' },
   subsampling: { type: 'string' },
   background: { type: 'string' },
@@ -113,7 +117,9 @@ async function commandOptions(command, o) {
   if (o.mode) opts.mode = o.mode;
   if (o.block) opts.block = int(o.block, '--block');
   if (o.level) opts.level = int(o.level, '--level');
+  if (o.effort) opts.effort = int(o.effort, '--effort');
   if (o.format) opts.format = o.format === 'jpg' ? 'jpeg' : o.format;
+  if (command !== 'encode') delete opts.format;
   if (o.quality) opts.quality = int(o.quality, '--quality');
   if (o.subsampling) opts.subsampling = o.subsampling;
   if (o.background) opts.background = o.background;
@@ -136,8 +142,8 @@ async function commandOptions(command, o) {
 }
 
 async function run(command, input, opts) {
-  if (command === 'decode') return { bytes: decode(input, opts) };
-  if (command === 'rekey') return { bytes: rekey(input, opts) };
+  if (command === 'decode') return { bytes: await decodeAsync(input, opts) };
+  if (command === 'rekey') return { bytes: await rekeyAsync(input, opts) };
   let report;
   const bytes = await encodeAsync(input, { ...opts, onConvert: (r) => { report = r; } });
   const bits = [];
@@ -159,7 +165,8 @@ async function runInspect(files, o) {
       const dims = info.width ? `${info.width}x${info.height}` : '';
       const scramble = info.scrambled ? `scrambled (${info.mode}${info.block ? ` ${info.block}px` : ''})` : 'not scrambled';
       console.log(`${file}: ${info.format} ${dims} ${scramble}`);
-      if (info.chunks) console.log(`  chunks: ${info.chunks.map((c) => c.type).join(' ')}`);
+      const parts = info.chunks ?? info.segments ?? info.boxes;
+      if (parts) console.log(`  ${info.chunks ? 'chunks' : info.segments ? 'segments' : 'boxes'}: ${parts.map((c) => c.type).join(' ')}`);
       if (info.metadata) console.log(`  metadata: ${info.metadata.join(', ') || 'none'}${info.orientation > 1 ? ` (orientation ${info.orientation})` : ''}`);
     } catch (err) {
       failed++;
@@ -170,7 +177,7 @@ async function runInspect(files, o) {
   return failed ? 1 : 0;
 }
 
-const EXT = { png: 'png', jpeg: 'jpg' };
+const EXT = { png: 'png', jpeg: 'jpg', jxl: 'jxl' };
 
 function outputFormat(command, input, opts) {
   const from = detectFormat(input);

@@ -24,7 +24,7 @@ browser use case the key ships to the visitor.
 ```sh
 npm install
 npm test            # PngSuite and JPEG round trips, conversion, CLI, browser reveal (fake DOM)
-npm run test:browser  # the same in real Chromium: decoder, worker, lab, demo site (see below)
+npm run test:browser  # the same in real Chromium and WebKit: decoder, worker, lab, demo site (see below)
 npm run serve       # builds dist/ and starts http://127.0.0.1:8080
 npm run serve:lan   # the same, reachable from other machines on the network (HOST=0.0.0.0)
 ```
@@ -32,7 +32,8 @@ npm run serve:lan   # the same, reachable from other machines on the network (HO
 The dev server has no authentication: anyone who can reach it can encode, decode and publish
 to the demo gallery. Only use `serve:lan` on a network you trust.
 
-- **Lab** (`/`): load an image in any format, or a generated PNG/JPEG/WebP sample.
+- **Lab** (`/`): load an image in any format, or a generated PNG/JPEG/WebP sample (a PNG
+  where the browser can't encode WebP, as in Safari).
   - Encode it on the server or in the browser, and see what metadata was kept or dropped.
   - Watch it decode with each animation, compare chunks, rekey, try a wrong key.
 - **Demo site** (`/site.html`): images published from the lab, served scrambled and
@@ -158,7 +159,9 @@ In browsers, `browserDecoder()` uses the browser's own decoders (WebP, AVIF, BMP
 - **Animated WebP and JPEG XL → PNG** give an APNG too, with every frame, delays and loop
   count:
   - WebP through `sharpDecoder`, or through `browserDecoder` in browsers with WebCodecs'
-    `ImageDecoder`.
+    `ImageDecoder`. Elsewhere `browserDecoder` keeps the first frame and reports the
+    animation as dropped. The loop count is read from the file, since engines disagree on
+    what `repetitionCount` means for WebP.
   - JPEG XL through the built-in decoder.
 - **Other formats:** converting an animation to JPEG or JPEG XL keeps the first frame, and
   the report says so (neither writer does animation).
@@ -326,7 +329,8 @@ The codec has three parts:
 
 In the browser, most engines can't display JPEG XL. So the pixel route decodes it in WASM,
 animates like PNG, and gives the `<img>` a lossless PNG of the restored pixels. The JPEG
-route shows the restored JPEG.
+route shows the restored JPEG. Safari could show JPEG XL itself, but gets the PNG too, so
+every engine shows the same exact pixels.
 
 #### Rebuilding the decoder WASM
 
@@ -410,22 +414,36 @@ The permutation stream is pinned by a test. Any change to it must bump the versi
 
 ## Browser tests
 
-`npm run test:browser` builds `dist/` and drives headless Chromium through Playwright
-(`npx playwright install chromium` once). It covers:
+`npm run test:browser` builds `dist/` and drives headless browsers through Playwright
+(`npx playwright install chromium webkit` once). It covers:
 - the `<script>` decoder: every format and effect, with the final bytes checked in Node and
   the rendering compared with the original's;
 - the Web Worker, and the main-thread fallback (`data-worker="false"`, CSP
   `worker-src 'none'`);
 - a decoder loaded from another origin, a wrong key, EXIF rotation;
-- animated WebP through `ImageDecoder`;
+- animated WebP through `ImageDecoder`, and the first-frame fallback without it;
 - the lab (every input/output/mode, encoded on the server and in the browser) and the demo
   site.
 
 Console errors fail a test.
 
-If Chromium can't start because the host lacks its shared libraries, either install them
-system-wide (`sudo npx playwright install-deps`), or unpack them somewhere and set:
-- `PIXMIX_BROWSER_LIBS` to that library directory (it's added to `LD_LIBRARY_PATH`);
+Every test runs once per engine, grouped under its name (`chromium`, `webkit`).
+- `PIXMIX_BROWSERS=chromium,webkit` picks the engines. The default is all of them,
+  Firefox included; an engine that can't start is skipped, with the browser's error.
+- WebKit is Playwright's WPE build, not Safari. It shares Safari's engine, but its image
+  decoding and WebCodecs go through GStreamer, and it encodes WebP (Safari doesn't).
+
+If a browser can't start because the host lacks its shared libraries, either install them
+system-wide (`sudo npx playwright install-deps`), or unpack them somewhere (`apt-get
+download` + `dpkg -x`) and set:
+- `PIXMIX_BROWSER_LIBS` to the library directories, colon-separated. They're added to
+  `LD_LIBRARY_PATH`, and Playwright's dependency check (which ignores them) is skipped.
+  For WebKit the harness also:
+  - runs a copy of Playwright's launcher that keeps them;
+  - points glvnd and GStreamer at the unpacked `share/glvnd/egl_vendor.d` and
+    `gstreamer-1.0` plugins next to them.
+  WebKit also needs Mesa's EGL (`libegl-mesa0`, `mesa-libgallium`) and GStreamer's base
+  plugins; without them its web process crashes on animated images.
 - `FONTCONFIG_FILE` if the host has no fonts.
 
 Firefox isn't covered yet: Playwright's Firefox needs a newer NSS than some distributions
@@ -445,7 +463,7 @@ ship.
   - Browser reveal, CLI, server and lab support.
 - [x] Phase 5: APNG in/out (per-frame permutations), animated GIF → APNG, decoding in a
   Web Worker with a main-thread fallback
-- [x] Phase 6: real-browser test suite (Chromium); animated WebP / JPEG XL → APNG; 16-bit
+- [x] Phase 6: real-browser test suite (Chromium, WebKit); animated WebP / JPEG XL → APNG; 16-bit
   input kept in PNG; progressive JPEGs stay progressive
 - [ ] Newer libjxl for recompression (the only prebuilt WASM `cjxl` is 0.7 and Node-only)
 - [ ] Firefox in the browser suite

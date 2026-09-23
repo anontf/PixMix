@@ -8,6 +8,10 @@
 // it is also the first animation frame); frames 1.. are the fdAT frames, each its own
 // width x height sub-image. Every frame gets its own permutation (the frame index is part
 // of the seed), so identical frames do not scramble identically.
+//
+// Watermarks (see watermark/embed.js): a `pmWm` chunk names the watermark the decoder draws
+// on the restored image; a `pmWs` chunk holds the scrambled pixels under a watermark drawn
+// on the scrambled image itself. Neither is copied into the restored file.
 
 import { readChunks, writeChunks, isPng } from './chunks.js';
 import {
@@ -15,8 +19,11 @@ import {
 } from './raster.js';
 import { computeLayout, applyMap } from '../../core/layout.js';
 import {
-  makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError,
+  makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError, FLAG_STASH,
 } from '../../core/params.js';
+import { readOrientation } from '../../meta/exif.js';
+import { WATERMARK_TAG, STASH_TAG, encodeWatermark, decodeWatermark, restorePixelStash } from '../../watermark/embed.js';
+import { stashPng } from '../../watermark/paint.js';
 
 export const MARKER_CHUNK = 'pmIx';
 export { isPng };
@@ -58,14 +65,14 @@ function parseFrames(chunks, ihdr) {
       }
       current = null;
     } else if (c.type === 'IDAT') {
-      if (!frames.length) frames.push({ width: ihdr.width, height: ihdr.height, chunkIndexes: [], parts: [] });
+      if (!frames.length) frames.push({ width: ihdr.width, height: ihdr.height, x: 0, y: 0, chunkIndexes: [], parts: [] });
       frames[0].chunkIndexes.push(i);
       frames[0].parts.push(c.data);
       pending = null;
     } else if (c.type === 'fdAT') {
       if (c.data.length < 4) throw new PixmixError('Bad APNG fdAT chunk', 'BAD_PNG');
       if (pending) {
-        current = { width: pending.width, height: pending.height, chunkIndexes: [], parts: [] };
+        current = { width: pending.width, height: pending.height, x: pending.x, y: pending.y, chunkIndexes: [], parts: [] };
         frames.push(current);
         pending = null;
       }
@@ -100,23 +107,26 @@ function withFrames(img, frames, pixels) {
     ...img,
     pixels: pixels[0],
     frames: pixels,
-    frameSizes: frames.map(({ width, height }) => ({ width, height })),
+    frameSizes: frames.map(({ width, height, x, y }) => ({ width, height, x, y })),
     frameChunks: frames.map((f) => f.chunkIndexes),
   };
 }
 
-/** Rebuilds the file: original chunks in order, frame data swapped, marker set or removed. */
-function writePng(img, frames, marker, raster) {
-  return assemble(img, frames.map((px, i) => encodeRaster(frameIhdr(img.ihdr, img.frameSizes[i]), px, raster)), marker);
+/**
+ * Rebuilds the file: original chunks in order, frame data swapped, marker set or removed.
+ * `extra` holds the watermark chunks to write (pmWm, pmWs); existing ones are dropped.
+ */
+function writePng(img, frames, marker, raster, extra) {
+  return assemble(img, frames.map((px, i) => encodeRaster(frameIhdr(img.ihdr, img.frameSizes[i]), px, raster)), marker, extra);
 }
 
-async function writePngAsync(img, frames, marker, raster) {
+async function writePngAsync(img, frames, marker, raster, extra) {
   const data = [];
   for (let i = 0; i < frames.length; i++) data.push(await encodeRasterAsync(frameIhdr(img.ihdr, img.frameSizes[i]), frames[i], raster));
-  return assemble(img, data, marker);
+  return assemble(img, data, marker, extra);
 }
 
-function assemble(img, frameData, marker) {
+function assemble(img, frameData, marker, { watermark, stash } = {}) {
   const firstChunkOf = new Map(img.frameChunks.map((idx, f) => [idx[0], f]));
   const dataChunks = new Set(img.frameChunks.flat());
   // The marker goes right before the image data, or before frame 0's fcTL when the IDAT
@@ -125,8 +135,10 @@ function assemble(img, frameData, marker) {
   const before = img.chunks[idat0 - 1]?.type === 'fcTL' ? idat0 - 1 : idat0;
   const out = [];
   img.chunks.forEach((c, i) => {
-    if (c.type === MARKER_CHUNK) return;
+    if (c.type === MARKER_CHUNK || c.type === WATERMARK_TAG || c.type === STASH_TAG) return;
     if (i === before && marker) out.push({ type: MARKER_CHUNK, data: marker });
+    if (i === before && watermark) out.push({ type: WATERMARK_TAG, data: watermark });
+    if (c.type === 'IEND' && stash) out.push({ type: STASH_TAG, data: stash });
     if (!dataChunks.has(i)) { out.push(c); return; }
     if (!firstChunkOf.has(i)) return; // continuation chunk: merged into the first one
     const f = firstChunkOf.get(i);
@@ -174,7 +186,7 @@ const mapFrames = (img, layouts, direction) => img.frames.map((px, i) => applyMa
  * @param {Uint8Array} bytes PNG or APNG
  * @param {{key: string|Uint8Array, mode?: 'pixel'|'block', block?: number, level?: number, salt?: Uint8Array}} opts
  */
-export function scramblePng(bytes, { key, mode, block, level, salt } = {}) {
+export function scramblePng(bytes, { key, mode, block, level, salt, watermark, visibleWatermark } = {}) {
   const img = readPng(bytes);
   if (readPngMarker(img.chunks)) {
     throw new PixmixError('Image is already scrambled (decode it first, or use rekey)', 'ALREADY_SCRAMBLED');
@@ -182,8 +194,30 @@ export function scramblePng(bytes, { key, mode, block, level, salt } = {}) {
   if (mode === 'mcu') throw new PixmixError('Mode "mcu" only applies to JPEG and JPEG XL output', 'BAD_OPTION');
   const params = makeParams({ mode, block, salt });
   const layouts = layoutsFor(key, params, img);
-  return writePng(img, mapFrames(img, layouts, 'scramble'), writeMarker(params, layouts[0].check), scrambledRaster(params, level));
+  return finishScramble(img, mapFrames(img, layouts, 'scramble'), params, layouts[0].check, { key, level, watermark, visibleWatermark });
 }
+
+/**
+ * Writes scrambled frames with the marker and the watermark chunks: `watermark` (compiled,
+ * or {id}) is carried for the decoder; `visibleWatermark` (compiled) is drawn onto the
+ * scrambled frames, whose covered pixels go into the stash.
+ */
+function finishScramble(img, frames, params, check, { key, level, watermark, visibleWatermark }) {
+  let stash = null;
+  if (visibleWatermark) {
+    stash = stashPng(img, frames, visibleWatermark, pngOrientation(img.chunks), key, params.salt);
+    if (stash) params = { ...params, flags: FLAG_STASH };
+  }
+  return writePng(img, frames, writeMarker(params, check), scrambledRaster(params, level), {
+    watermark: watermark ? encodeWatermark(watermark) : null,
+    stash,
+  });
+}
+
+const pngOrientation = (chunks) => {
+  const exif = chunks.find((c) => c.type === 'eXIf');
+  return exif ? readOrientation(exif.data) : 1;
+};
 
 // Pixel-scrambled data is noise: prediction filters and slow deflate levels only cost time.
 function scrambledRaster(params, level) {
@@ -194,8 +228,32 @@ function unscrambled(img, key) {
   const marker = readPngMarker(img.chunks);
   if (!marker) throw new PixmixError('Image carries no pixmix marker', 'NOT_SCRAMBLED');
   const layouts = layoutsFor(key, marker.params, img, marker.check);
+  // A visible watermark: put the scrambled pixels it covers back first.
+  let visible = null;
+  if (marker.params.flags & FLAG_STASH) {
+    const chunk = img.chunks.find((c) => c.type === STASH_TAG);
+    if (!chunk) throw new PixmixError('Image lost the pixels under its visible watermark (pmWs chunk)', 'BAD_PNG');
+    const frames = img.frames.map((pixels, i) => ({ pixels, width: img.frameSizes[i].width, height: img.frameSizes[i].height, bpp: img.pixelBytes }));
+    visible = restorePixelStash(frames, chunk.data, key, marker.params.salt);
+  }
   const frames = mapFrames(img, layouts, 'unscramble');
-  return { marker, layouts, frames };
+  return { marker, layouts, frames, visible };
+}
+
+/** The watermark a PNG carries for its restored image ({id, name, compiled}), or null. */
+export function pngWatermark(chunks) {
+  const c = chunks.find((ch) => ch.type === WATERMARK_TAG);
+  return c ? decodeWatermark(c.data) : null;
+}
+
+/**
+ * The restored frames with a watermark drawn on them. `paint` is {painter, watermark}:
+ * painter is watermark/paint.js (loaded by the caller, so decoders only fetch it when
+ * needed), watermark a compiled watermark.
+ */
+function painted(img, frames, paint) {
+  if (!paint?.watermark) return { img, frames };
+  return paint.painter.paintPng(img, frames, paint.watermark, pngOrientation(img.chunks)) ?? { img, frames };
 }
 
 /**
@@ -211,8 +269,9 @@ export function unscramblePngDetailed(bytes, { key, level } = {}) {
     layout: layouts[0],
     params: marker.params,
     pixels: frames[0],
-    /** Lazily encode, the deflate step is the slow part. */
-    toPng: () => writePng(img, frames, null, { level }),
+    watermark: pngWatermark(img.chunks),
+    /** Lazily encode, the deflate step is the slow part. `paint`: see painted(). */
+    toPng: (paint) => { const p = painted(img, frames, paint); return writePng(p.img, p.frames, null, { level }); },
   };
 }
 
@@ -228,7 +287,8 @@ export async function unscramblePngDetailedAsync(bytes, { key, level } = {}) {
     layout: layouts[0],
     params: marker.params,
     pixels: frames[0],
-    toPng: () => writePngAsync(img, frames, null, { level }),
+    watermark: pngWatermark(img.chunks),
+    toPng: (paint) => { const p = painted(img, frames, paint); return writePngAsync(p.img, p.frames, null, { level }); },
   };
 }
 
@@ -236,10 +296,13 @@ export function unscramblePng(bytes, opts) {
   return unscramblePngDetailed(bytes, opts).toPng();
 }
 
-/** Re-scrambles with a new key (and optionally new mode/block) in one pass. */
-export function rekeyPng(bytes, { from, to, mode, block, level, salt } = {}) {
+/**
+ * Re-scrambles with a new key (and optionally new mode/block) in one pass. Watermarks stay
+ * as they are unless `watermark` / `visibleWatermark` are given (null removes them).
+ */
+export function rekeyPng(bytes, { from, to, mode, block, level, salt, watermark, visibleWatermark } = {}) {
   const img = readPng(bytes);
-  const { marker, frames } = unscrambled(img, from);
+  const { marker, frames, visible } = unscrambled(img, from);
   const params = makeParams({
     mode: mode ?? marker.params.mode,
     block: block ?? (marker.params.block || undefined),
@@ -247,8 +310,15 @@ export function rekeyPng(bytes, { from, to, mode, block, level, salt } = {}) {
   });
   const layouts = layoutsFor(to, params, img);
   const plain = { ...img, frames };
-  return writePng(img, mapFrames(plain, layouts, 'scramble'), writeMarker(params, layouts[0].check), scrambledRaster(params, level));
+  return finishScramble(img, mapFrames(plain, layouts, 'scramble'), params, layouts[0].check, {
+    key: to, level,
+    watermark: watermark === undefined ? carried(pngWatermark(img.chunks)) : watermark,
+    visibleWatermark: visibleWatermark === undefined ? visible : visibleWatermark,
+  });
 }
+
+/** What rekey carries over: the compiled watermark, or just its id. */
+export const carried = (w) => (w ? w.compiled ?? { id: w.id } : null);
 
 /** Cheap: parses chunks only, no inflate. */
 export function inspectPng(bytes) {
@@ -269,6 +339,7 @@ export function inspectPng(bytes) {
     scrambled: !!marker,
     mode: marker?.params.mode ?? null,
     block: marker?.params.block || null,
+    ...watermarkInfo(pngWatermark(chunks), marker),
     chunks: chunks.map((c) => ({ type: c.type, length: c.data.length })),
   };
 }
@@ -280,4 +351,12 @@ function concat(parts) {
   let o = 0;
   for (const p of parts) { out.set(p, o); o += p.length; }
   return out;
+}
+
+/** For inspect(): which watermarks a scrambled file carries. */
+export function watermarkInfo(wm, marker) {
+  return {
+    watermark: wm ? { id: wm.id, ...(wm.name ? { name: wm.name } : {}), embedded: !!wm.compiled } : null,
+    visibleWatermark: !!(marker && marker.params.flags & FLAG_STASH),
+  };
 }

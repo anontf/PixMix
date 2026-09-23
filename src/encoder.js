@@ -11,9 +11,11 @@ import { convert, convertAsync, decodeForJxl, targetFormat, OUTPUT_FORMATS } fro
 import { PixmixError } from './core/params.js';
 import { readWebpMetadata } from './meta/webp.js';
 import { readOrientation } from './meta/exif.js';
+import { validateCompiled, ID_PATTERN } from './watermark/schema.js';
 
 export { detectFormat, convert, convertAsync, OUTPUT_FORMATS };
 export { configureJxl, loadJxlCodec } from './formats/jxl/load.js';
+export { configureWatermarks } from './watermark/load.js';
 // Decoder plugins; neither imports anything platform-specific at load time.
 export { sharpDecoder } from './plugins/sharp.js';
 export { browserDecoder } from './plugins/browser.js';
@@ -49,7 +51,31 @@ const needsAsync = (what) => new PixmixError(`JPEG XL ${what} is async; use ${wh
  * @property {object[]} [decoders]     extra input decoders (see plugins/)
  * @property {(r: import('./convert/index.js').ConvertResult) => void} [onConvert]
  *           called with what happened to the input (decoder, metadata transferred/dropped)
+ * @property {object} [watermark]      a compiled watermark (or {id}) the file carries for the
+ *           decoder, which draws it on the restored image
+ * @property {object} [visibleWatermark]  a compiled watermark drawn on the scrambled image
+ *           itself; the pixels under it are kept in the file (encrypted with the key), so
+ *           restoring stays exact
  */
+
+/**
+ * Validates the watermark options (they end up inside the file) and returns the options
+ * with them normalised. For rekey, undefined keeps what the file has and null removes it.
+ */
+function checkWatermarks(opts) {
+  if (!opts) return opts;
+  const out = { ...opts };
+  if (opts.watermark) {
+    const w = opts.watermark;
+    if (typeof w === 'string' || (!w.format && typeof w.id === 'string' && Object.keys(w).length === 1)) {
+      const id = typeof w === 'string' ? w : w.id;
+      if (!ID_PATTERN.test(id)) throw new PixmixError(`Invalid watermark id "${id}"`, 'BAD_WATERMARK');
+      out.watermark = { id };
+    } else out.watermark = validateCompiled(w);
+  }
+  if (opts.visibleWatermark) out.visibleWatermark = validateCompiled(opts.visibleWatermark);
+  return out;
+}
 
 /**
  * Scrambles an image. PNG, JPEG and GIF input work out of the box; synchronous, so
@@ -57,6 +83,7 @@ const needsAsync = (what) => new PixmixError(`JPEG XL ${what} is async; use ${wh
  * @param {Uint8Array|ArrayBuffer} input @param {EncodeOptions} opts @returns {Uint8Array}
  */
 export function encode(input, opts) {
+  opts = checkWatermarks(opts);
   const withFormat = withTarget(input, opts);
   if (withFormat.format === 'jxl' || detectFormat(toBytes(input)) === 'jxl') throw needsAsync('encode');
   const converted = convert(input, withFormat);
@@ -66,6 +93,7 @@ export function encode(input, opts) {
 
 /** Like encode, but also accepts async decoder plugins (sharp, browser-native) and JPEG XL. */
 export async function encodeAsync(input, opts) {
+  opts = checkWatermarks(opts);
   const withFormat = withTarget(input, opts);
   const bytes = toBytes(input);
   const from = detectFormat(bytes);
@@ -132,9 +160,12 @@ function withTarget(input, opts) {
  * Swaps the key (and optionally the mode) of a scrambled image without an
  * intermediate unscrambled file.
  * @param {Uint8Array|ArrayBuffer} input
- * @param {{from: string|Uint8Array, to: string|Uint8Array, mode?: 'pixel'|'block', block?: number, level?: number}} opts
+ * @param {{from: string|Uint8Array, to: string|Uint8Array, mode?: 'pixel'|'block', block?: number, level?: number,
+ *   watermark?: object|null, visibleWatermark?: object|null}} opts  watermarks are kept unless
+ *   given (null removes them)
  */
 export function rekey(input, opts) {
+  opts = checkWatermarks(opts);
   const bytes = toBytes(input);
   const s = pick(SCRAMBLERS, bytes);
   if (!s.rekey) throw needsAsync('rekey');
@@ -143,6 +174,7 @@ export function rekey(input, opts) {
 
 /** rekey for every format, including JPEG XL. */
 export async function rekeyAsync(input, opts) {
+  opts = checkWatermarks(opts);
   const bytes = toBytes(input);
   const s = pick(SCRAMBLERS, bytes);
   return s.rekey ? s.rekey(bytes, opts) : s.rekeyAsync(bytes, opts);

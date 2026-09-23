@@ -9,6 +9,11 @@
 //   u8  salt length    (0..255)
 //   ..  salt
 //   u8[4] key check    (lets the decoder reject a wrong key instead of producing noise)
+//
+// Marker v2 is v1 followed by one byte of flags (bit 0: a visible watermark covers part of
+// the scrambled image and the pixels under it are stored in the file). It is only written
+// when a flag is set, so that pixmix versions which cannot put those pixels back refuse the
+// file instead of restoring it wrongly. The permutation is the same as v1's.
 
 import { hkdf } from './sha256.js';
 
@@ -16,6 +21,7 @@ export const VERSION = 1;
 export const MODES = /** @type {const} */ (['pixel', 'block', 'mcu']);
 export const MCU_TRANSFORMS = 1;
 export const MCU_PROGRESSIVE = 2;
+export const FLAG_STASH = 1;
 const SALT_BYTES = 16;
 const CHECK_BYTES = 4;
 
@@ -27,6 +33,7 @@ const utf8 = new TextEncoder();
  * @property {'pixel'|'block'|'mcu'} mode   mcu: JPEG DCT-domain shuffle of whole MCUs
  * @property {number} block   block mode: tile edge in pixels; mcu mode: flags
  * @property {Uint8Array} salt
+ * @property {number} [flags]  marker v2 flags (FLAG_STASH)
  */
 
 /** @returns {ScrambleParams} */
@@ -77,14 +84,16 @@ export function deriveSeed(key, params, width, height, index = 0) {
 
 /** @param {ScrambleParams} params @param {Uint8Array} check */
 export function writeMarker(params, check) {
-  const out = new Uint8Array(5 + params.salt.length + CHECK_BYTES);
+  const flags = params.flags ?? 0;
+  const out = new Uint8Array(5 + params.salt.length + CHECK_BYTES + (flags ? 1 : 0));
   const dv = new DataView(out.buffer);
-  dv.setUint8(0, params.version);
+  dv.setUint8(0, flags ? 2 : params.version);
   dv.setUint8(1, MODES.indexOf(params.mode));
   dv.setUint16(2, params.block);
   dv.setUint8(4, params.salt.length);
   out.set(params.salt, 5);
   out.set(check, 5 + params.salt.length);
+  if (flags) out[out.length - 1] = flags;
   return out;
 }
 
@@ -93,14 +102,17 @@ export function readMarker(data) {
   if (data.length < 5) throw new PixmixError('Corrupt pixmix marker');
   const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const version = dv.getUint8(0);
-  if (version !== VERSION) throw new PixmixError(`Unsupported pixmix marker version ${version}`);
+  if (version !== VERSION && version !== 2) throw new PixmixError(`Unsupported pixmix marker version ${version}`);
   const mode = MODES[dv.getUint8(1)];
   if (!mode) throw new PixmixError('Corrupt pixmix marker (mode)');
   const saltLen = dv.getUint8(4);
-  if (data.length !== 5 + saltLen + CHECK_BYTES) throw new PixmixError('Corrupt pixmix marker (length)');
+  const extra = version === 2 ? 1 : 0;
+  if (data.length !== 5 + saltLen + CHECK_BYTES + extra) throw new PixmixError('Corrupt pixmix marker (length)');
+  const flags = extra ? data[data.length - 1] : 0;
+  if (flags & ~FLAG_STASH) throw new PixmixError(`Unsupported pixmix marker flags ${flags}`);
   return {
-    params: { version, mode, block: dv.getUint16(2), salt: data.slice(5, 5 + saltLen) },
-    check: data.slice(5 + saltLen),
+    params: { version: VERSION, mode, block: dv.getUint16(2), salt: data.slice(5, 5 + saltLen), flags },
+    check: data.slice(5 + saltLen, 5 + saltLen + CHECK_BYTES),
   };
 }
 

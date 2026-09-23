@@ -119,13 +119,13 @@ function downsample(plane, w, h, fx, fy) {
 }
 
 // 1 / (quantizer * AAN row scale * AAN column scale * 8), in natural order.
-function divisors(table) {
+export function divisors(table) {
   const d = new Float32Array(64);
   for (let v = 0; v < 8; v++) for (let u = 0; u < 8; u++) d[v * 8 + u] = 1 / (table[v * 8 + u] * AAN[v] * AAN[u] * 8);
   return d;
 }
 
-function fdct(d) {
+export function fdct(d) {
   for (let pass = 0; pass < 2; pass++) {
     const step = pass ? 8 : 1, stride = pass ? 1 : 8;
     for (let i = 0; i < 8; i++) {

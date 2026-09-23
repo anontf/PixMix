@@ -232,15 +232,16 @@ export function encodeProgressive(frame) {
  * Builds a complete JPEG from metadata/table segments (kept verbatim) and a frame.
  * @param {import('./markers.js').Segment[]} header  APPn, COM, DQT … in output order
  * @param {import('./decode.js').Frame} frame
- * @param {{marker?: Uint8Array, restartInterval?: number, progressive?: boolean}} [opts]
- *        marker: APP15 payload; progressive: write SOF2 with progressive scans
+ * @param {{marker?: Uint8Array, extra?: Uint8Array[], restartInterval?: number, progressive?: boolean}} [opts]
+ *        marker: APP15 payload; extra: more APP15 payloads after it; progressive: write SOF2
+ *        with progressive scans
  */
-export function assembleJpeg(header, frame, { marker, restartInterval, progressive = false } = {}) {
+export function assembleJpeg(header, frame, { marker, extra = [], restartInterval, progressive = false } = {}) {
   const out = [...header];
-  if (marker) {
+  if (marker || extra.length) {
     let at = 0;
     while (at < out.length && out[at].marker >= 0xe0 && out[at].marker <= 0xef) at++;
-    out.splice(at, 0, { marker: M.APP15, data: marker });
+    out.splice(at, 0, ...[...(marker ? [marker] : []), ...extra].map((data) => ({ marker: M.APP15, data })));
   }
   if (progressive) {
     out.push({ marker: M.SOF2, data: frame.sof });

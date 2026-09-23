@@ -115,84 +115,132 @@ const text = (v, p) => {
   return v;
 };
 
-// Placement and style are shared by definitions and compiled watermarks.
-const PLACEMENT = {
-  size: object({
-    px: optNum(1, 2000), // absolute em size; wins over relative
-    relative: num(0.001, 1, 0.03), // fraction of the reference length below
-    of: oneOf(['short', 'long', 'width', 'height', 'diagonal'], 'short'),
-    min: num(1, 2000, 10),
-    max: num(1, 2000, 48),
-    snap: num(0, 256, 0), // round the size down to a multiple (crisp pixel fonts)
-  }),
-  fit: object({
-    maxWidth: num(0.05, 1, 0.5), // of the image width
-    maxHeight: num(0.05, 1, 0.25),
-    minSize: num(0, 200, 6), // px of em below which the watermark is left out
-  }),
-  anchor: oneOf(ANCHORS, 'bottom-right'),
-  margin: object({ relative: num(0, 0.5, 0.02), min: num(0, 2000, 4), max: num(0, 2000, 32) }),
-  offset: object({ x: num(-20, 20, 0), y: num(-20, 20, 0) }),
-};
+// The specs are built on first use, so bundles that only import a constant from this
+// module (decoders) do not keep them. Placement and style are shared by definitions and
+// compiled watermarks.
+let SPECS = null;
+const specs = () => (SPECS ??= buildSpecs());
 
-const style = (paintSpec) => ({
-  opacity: num(0, 1, 1),
-  crisp: bool(false), // hard pixel edges (no anti-aliasing), for pixel fonts
-  stroke: object({
-    color: color('#000000'),
-    width: num(0.001, 1, 0.1),
-    join: oneOf(['round', 'square'], 'round'),
+function buildSpecs() {
+  const PLACEMENT = {
+    size: object({
+      px: optNum(1, 2000), // absolute em size; wins over relative
+      relative: num(0.001, 1, 0.03), // fraction of the reference length below
+      of: oneOf(['short', 'long', 'width', 'height', 'diagonal'], 'short'),
+      min: num(1, 2000, 10),
+      max: num(1, 2000, 48),
+      snap: num(0, 256, 0), // round the size down to a multiple (crisp pixel fonts)
+    }),
+    fit: object({
+      maxWidth: num(0.05, 1, 0.5), // of the image width
+      maxHeight: num(0.05, 1, 0.25),
+      minSize: num(0, 200, 6), // px of em below which the watermark is left out
+    }),
+    anchor: oneOf(ANCHORS, 'bottom-right'),
+    margin: object({ relative: num(0, 0.5, 0.02), min: num(0, 2000, 4), max: num(0, 2000, 32) }),
+    offset: object({ x: num(-20, 20, 0), y: num(-20, 20, 0) }),
+  };
+
+  const style = (paintSpec) => ({
     opacity: num(0, 1, 1),
-  }, { nullable: true, dflt: null }),
-  shadow: object({
-    color: color('#000000'),
-    opacity: num(0, 1, 0.5),
-    x: num(-2, 2, 0.08),
-    y: num(-2, 2, 0.08),
-    blur: num(0, 2, 0),
-  }, { nullable: true, dflt: null }),
-  background: object({
-    shape: oneOf(['box', 'pill', 'strip'], 'box'),
-    fill: paintSpec('#000000'),
-    opacity: num(0, 1, 0.6),
-    radius: num(0, 5, 0.25),
-    padding: object({ x: num(0, 5, 0.5), y: num(0, 5, 0.3) }),
-    border: object({ fill: paintSpec('#ffffff'), width: num(0.001, 1, 0.08) }, { nullable: true, dflt: null }),
-  }, { nullable: true, dflt: null }),
-});
+    crisp: bool(false), // hard pixel edges (no anti-aliasing), for pixel fonts
+    stroke: object({
+      color: color('#000000'),
+      width: num(0.001, 1, 0.1),
+      join: oneOf(['round', 'square'], 'round'),
+      opacity: num(0, 1, 1),
+    }, { nullable: true, dflt: null }),
+    shadow: object({
+      color: color('#000000'),
+      opacity: num(0, 1, 0.5),
+      x: num(-2, 2, 0.08),
+      y: num(-2, 2, 0.08),
+      blur: num(0, 2, 0),
+    }, { nullable: true, dflt: null }),
+    background: object({
+      shape: oneOf(['box', 'pill', 'strip'], 'box'),
+      fill: paintSpec('#000000'),
+      opacity: num(0, 1, 0.6),
+      radius: num(0, 5, 0.25),
+      padding: object({ x: num(0, 5, 0.5), y: num(0, 5, 0.3) }),
+      border: object({ fill: paintSpec('#ffffff'), width: num(0.001, 1, 0.08) }, { nullable: true, dflt: null }),
+    }, { nullable: true, dflt: null }),
+  });
 
-const ORNAMENT = object({
-  shape: oneOf(SHAPES, 'sparkle'),
-  position: oneOf(POSITIONS, 'after'),
-  size: num(0.05, 4, 0.5), // em; for a line above/below: its length as a fraction of the text width
-  thickness: num(0.01, 1, 0.06), // lines only
-  gap: num(-2, 4, 0.15),
-  offset: object({ x: num(-4, 4, 0), y: num(-4, 4, 0) }),
-  fill: (v, p) => (v === undefined || v === null ? null : paint()(v, p)), // null: the text fill
-  outline: bool(true), // gets the stroke, like the text
-  src: (v, p) => (v === undefined || v === null ? null : str(ASSET_PATTERN, 68, undefined, 'asset name (name.png)')(v, p)),
-});
+  const ORNAMENT = object({
+    shape: oneOf(SHAPES, 'sparkle'),
+    position: oneOf(POSITIONS, 'after'),
+    size: num(0.05, 4, 0.5), // em; for a line above/below: its length as a fraction of the text width
+    thickness: num(0.01, 1, 0.06), // lines only
+    gap: num(-2, 4, 0.15),
+    offset: object({ x: num(-4, 4, 0), y: num(-4, 4, 0) }),
+    fill: (v, p) => (v === undefined || v === null ? null : paint()(v, p)), // null: the text fill
+    outline: bool(true), // gets the stroke, like the text
+    src: (v, p) => (v === undefined || v === null ? null : str(ASSET_PATTERN, 68, undefined, 'asset name (name.png)')(v, p)),
+  });
 
-const DEFINITION = object({
-  id: str(ID_PATTERN, 48, undefined, 'id (lowercase letters, digits and dashes)'),
-  name: (v, p) => (v === undefined ? undefined : str(null, 80)(v, p)),
-  text,
-  font: str(FONT_PATTERN, 64, undefined, 'font name'),
-  letterSpacing: num(-1, 2, 0),
-  lineHeight: num(0.5, 4, 1.2),
-  align: oneOf(['left', 'center', 'right'], 'left'),
-  fill: paint('#ffffff'),
-  ...PLACEMENT,
-  ...style(paint),
-  ornaments: list(ORNAMENT, 0, 8),
-});
+  const DEFINITION = object({
+    id: str(ID_PATTERN, 48, undefined, 'id (lowercase letters, digits and dashes)'),
+    name: (v, p) => (v === undefined ? undefined : str(null, 80)(v, p)),
+    text,
+    font: str(FONT_PATTERN, 64, undefined, 'font name'),
+    letterSpacing: num(-1, 2, 0),
+    lineHeight: num(0.5, 4, 1.2),
+    align: oneOf(['left', 'center', 'right'], 'left'),
+    fill: paint('#ffffff'),
+    ...PLACEMENT,
+    ...style(paint),
+    ornaments: list(ORNAMENT, 0, 8),
+  });
+
+  const coord = num(-1e6, 1e6);
+
+  const compiledPaint = (dflt) => (v, p) => {
+    if (v === undefined) return missing(dflt, p);
+    if (typeof v === 'string') return color()(v, p);
+    return object({
+      type: oneOf(['linear']),
+      dir: list(num(-1, 1), 2, 2), // unit vector along the gradient (trigonometry stays at compile time)
+      stops: list(object({ at: num(0, 1), color: color() }), 2, 8),
+    })(v, p);
+  };
+
+  const SHAPE = object({
+    d: (v, p) => {
+      str(null, MAX_PATH)(v, p);
+      if (!PATH_CHARS.test(v)) fail(p, 'has characters outside M L Q C Z and numbers');
+      return v;
+    },
+    fill: compiledPaint(),
+    outline: bool(true),
+    image: object({
+      width: int(1, MAX_IMAGE),
+      height: int(1, MAX_IMAGE),
+      box: list(coord, 4, 4), // x0, y0, x1, y1 in units
+      rgba: str(/^[A-Za-z0-9+/]*={0,2}$/, Math.ceil((MAX_IMAGE * MAX_IMAGE * 4) / 3) + 4),
+    }, { nullable: true, dflt: null }),
+  });
+
+  const COMPILED = object({
+    format: oneOf([FORMAT]),
+    version: (v, p) => { if (v !== COMPILED_VERSION) fail(p, `unsupported version ${v}`); return v; },
+    id: str(ID_PATTERN, 48, undefined, 'id'),
+    name: str(null, 80),
+    box: list(coord, 4, 4), // ink bounds of everything but the background, in units, y down
+    ...PLACEMENT,
+    ...style(compiledPaint),
+    shapes: list(SHAPE, 1, MAX_SHAPES),
+  });
+  return { DEFINITION, COMPILED };
+}
+
 
 /**
  * Validates a definition and returns it normalised: every field present, in a fixed order.
  * @returns {object}
  */
 export function normalizeDefinition(def) {
-  const out = DEFINITION(def, '');
+  const out = specs().DEFINITION(def, '');
   out.name ??= out.id; // keeps its place in the key order
   for (const [i, o] of out.ornaments.entries()) {
     if (o.shape === 'image' && !o.src) fail(`ornaments[${i}].src`, 'is required for an image');
@@ -232,51 +280,13 @@ export function formatJson(value) {
 // --- compiled watermarks ---------------------------------------------------------------
 
 const PATH_CHARS = /^[MLQCZ0-9 .-]*$/;
-const coord = num(-1e6, 1e6);
-
-const compiledPaint = (dflt) => (v, p) => {
-  if (v === undefined) return missing(dflt, p);
-  if (typeof v === 'string') return color()(v, p);
-  return object({
-    type: oneOf(['linear']),
-    dir: list(num(-1, 1), 2, 2), // unit vector along the gradient (trigonometry stays at compile time)
-    stops: list(object({ at: num(0, 1), color: color() }), 2, 8),
-  })(v, p);
-};
-
-const SHAPE = object({
-  d: (v, p) => {
-    str(null, MAX_PATH)(v, p);
-    if (!PATH_CHARS.test(v)) fail(p, 'has characters outside M L Q C Z and numbers');
-    return v;
-  },
-  fill: compiledPaint(),
-  outline: bool(true),
-  image: object({
-    width: int(1, MAX_IMAGE),
-    height: int(1, MAX_IMAGE),
-    box: list(coord, 4, 4), // x0, y0, x1, y1 in units
-    rgba: str(/^[A-Za-z0-9+/]*={0,2}$/, Math.ceil((MAX_IMAGE * MAX_IMAGE * 4) / 3) + 4),
-  }, { nullable: true, dflt: null }),
-});
-
-const COMPILED = object({
-  format: oneOf([FORMAT]),
-  version: (v, p) => { if (v !== COMPILED_VERSION) fail(p, `unsupported version ${v}`); return v; },
-  id: str(ID_PATTERN, 48, undefined, 'id'),
-  name: str(null, 80),
-  box: list(coord, 4, 4), // ink bounds of everything but the background, in units, y down
-  ...PLACEMENT,
-  ...style(compiledPaint),
-  shapes: list(SHAPE, 1, MAX_SHAPES),
-});
 
 /**
  * Validates a compiled watermark (e.g. fetched, or read from a scrambled file). Throws
  * PixmixError('BAD_WATERMARK') on anything unexpected, including oversized data.
  */
 export function validateCompiled(obj) {
-  const c = COMPILED(obj, '');
+  const c = specs().COMPILED(obj, '');
   if (c.shapes.reduce((n, s) => n + s.d.length, 0) > MAX_PATH) fail('shapes', 'hold too much path data');
   for (const [i, s] of c.shapes.entries()) {
     if (s.image && s.image.rgba.length !== 4 * Math.ceil((s.image.width * s.image.height * 4) / 3)) {

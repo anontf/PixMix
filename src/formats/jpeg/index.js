@@ -11,6 +11,10 @@
 // only progressive when there is no such padding; the marker remembers that the original was
 // progressive, and restoring writes progressive again (exactly: the original could not hold
 // AC data in padding blocks either).
+//
+// Watermarks (see watermark/embed.js) travel in more APP15 segments: "pixmix-wm\0" names the
+// watermark for the restored image, "pixmix-ws\0" (split over as many segments as it needs)
+// holds the coefficients under a watermark drawn on the scrambled image.
 
 import { readSegments, writeSegments, isJpeg, isSof, isApp, startsWith, M } from './markers.js';
 import { decodeFrame } from './decode.js';
@@ -23,10 +27,18 @@ import {
 import { readJpegMetadata } from '../../meta/jpeg.js';
 import { readOrientation } from '../../meta/exif.js';
 import { stripExifThumbnail, stripIrbThumbnails, stripJfifThumbnail } from '../../meta/thumbnails.js';
+import { FLAG_STASH } from '../../core/params.js';
+import { encodeWatermark, decodeWatermark, restoreJpegStash } from '../../watermark/embed.js';
+import { stashJpeg } from '../../watermark/paint.js';
+import { watermarkInfo, carried } from '../png/index.js';
 
 export { isJpeg };
 
 const SIG = 'pixmix\0';
+const WM_SIG = 'pixmix-wm\0';
+const WS_SIG = 'pixmix-ws\0';
+const WS_CHUNK = 65533 - WS_SIG.length - 2;
+const ascii = (str) => Uint8Array.from(str, (c) => c.charCodeAt(0));
 const NAMES = { 0xc0: 'SOF0', 0xc1: 'SOF1', 0xc2: 'SOF2', 0xc4: 'DHT', 0xda: 'SOS', 0xdb: 'DQT', 0xdd: 'DRI', 0xfe: 'COM' };
 const segmentName = (m) => NAMES[m] ?? (isApp(m) ? `APP${m - 0xe0}` : `0x${m.toString(16)}`);
 const CODING = new Set([M.DHT, M.DRI, M.SOS, M.DNL]);
@@ -46,9 +58,74 @@ function readMarkerFrom(segments) {
   return seg ? readMarker(seg.data.subarray(SIG.length)) : null;
 }
 
-/** Everything that is kept verbatim, in order (drops coding segments and our marker). */
+const isOurs = (s) => s.marker === M.APP15 && (startsWith(s.data, SIG) || startsWith(s.data, WM_SIG) || startsWith(s.data, WS_SIG));
+
+/** Everything that is kept verbatim, in order (drops coding segments and our segments). */
 function headerSegments(segments) {
-  return segments.filter((s) => !CODING.has(s.marker) && !isSof(s.marker) && !(s.marker === M.APP15 && startsWith(s.data, SIG)));
+  return segments.filter((s) => !CODING.has(s.marker) && !isSof(s.marker) && !isOurs(s));
+}
+
+/** The watermark a JPEG carries for its restored image ({id, name, compiled}), or null. */
+export function jpegWatermark(segments) {
+  const seg = segments.find((s) => s.marker === M.APP15 && startsWith(s.data, WM_SIG));
+  return seg ? decodeWatermark(seg.data.subarray(WM_SIG.length)) : null;
+}
+
+function jpegOrientation(segments) {
+  const app1 = segments.find((s) => s.marker === M.APP1 && startsWith(s.data, 'Exif\0\0'));
+  return app1 ? readOrientation(app1.data.subarray(6)) : 1;
+}
+
+/** Our APP15 payloads for the watermark and the stash (numbered, 1-based, like ICC). */
+function watermarkSegments(watermark, stash) {
+  const out = [];
+  if (watermark) out.push(concat(ascii(WM_SIG), encodeWatermark(watermark)));
+  if (stash) {
+    const count = Math.ceil(stash.length / WS_CHUNK);
+    if (count > 255) throw new PixmixError('Visible watermark too large for a JPEG', 'BAD_WATERMARK');
+    for (let i = 0; i < count; i++) out.push(concat(ascii(WS_SIG), Uint8Array.of(i + 1, count), stash.subarray(i * WS_CHUNK, (i + 1) * WS_CHUNK)));
+  }
+  return out;
+}
+
+function stashOf(segments) {
+  const parts = segments.filter((s) => s.marker === M.APP15 && startsWith(s.data, WS_SIG)).map((s) => s.data.subarray(WS_SIG.length));
+  if (!parts.length || parts.some((p, i) => p[0] !== i + 1 || p[1] !== parts.length)) {
+    throw new PixmixError('Image lost the coefficients under its visible watermark (APP15 pixmix-ws)', 'BAD_JPEG');
+  }
+  return concat(...parts.map((p) => p.subarray(2)));
+}
+
+function concat(...parts) {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+
+/**
+ * Scrambled frame -> file: the marker, the watermark segments and, with a visible
+ * watermark, the frame painted and its covered coefficients stashed.
+ */
+function finishScramble(segments, frame, params, check, { key, watermark, visibleWatermark, progressive }) {
+  let stash = null;
+  if (visibleWatermark) {
+    stash = stashJpeg(frame, segments, visibleWatermark, jpegOrientation(segments), key, params.salt);
+    if (stash) params = { ...params, flags: FLAG_STASH };
+  }
+  return assembleJpeg(headerSegments(segments), frame, {
+    marker: markerPayload(params, check),
+    extra: watermarkSegments(watermark, stash),
+    progressive,
+  });
+}
+
+/** Checks the key, puts a visible watermark's stash back into the scrambled frame, unscrambles. */
+function restoreFrame(segments, frame, marker, key) {
+  const layout = layoutFor(key, marker.params, frame, marker.check);
+  let visible = null;
+  if (marker.params.flags & FLAG_STASH) visible = restoreJpegStash(frame, stashOf(segments), key, marker.params.salt);
+  return { layout, visible, restored: applyMcuLayout(frame, layout, 'unscramble') };
 }
 
 function parse(bytes) {
@@ -124,7 +201,7 @@ const hasPadding = (frame) => frame.components.some((c) => c.realW < c.blocksW |
  * @param {Uint8Array} bytes JPEG
  * @param {{key: string|Uint8Array, transforms?: boolean, salt?: Uint8Array, mode?: string, progressive?: boolean|'auto'}} opts
  */
-export function scrambleJpeg(bytes, { key, transforms = true, salt, mode, progressive } = {}) {
+export function scrambleJpeg(bytes, { key, transforms = true, salt, mode, progressive, watermark, visibleWatermark } = {}) {
   if (mode && mode !== 'mcu') {
     throw new PixmixError(`JPEG output is scrambled per MCU; mode "${mode}" does not apply (use mode "mcu" or omit it)`, 'BAD_OPTION');
   }
@@ -136,9 +213,8 @@ export function scrambleJpeg(bytes, { key, transforms = true, salt, mode, progre
   const params = makeParams({ mode: 'mcu', transforms, progressive: restoreProgressive, salt });
   const layout = layoutFor(key, params, frame);
   const scrambled = applyMcuLayout(frame, layout, 'scramble');
-  return assembleJpeg(headerSegments(segments), scrambled, {
-    marker: markerPayload(params, layout.check),
-    progressive: restoreProgressive && !hasPadding(frame),
+  return finishScramble(segments, scrambled, params, layout.check, {
+    key, watermark, visibleWatermark, progressive: restoreProgressive && !hasPadding(frame),
   });
 }
 
@@ -147,16 +223,24 @@ export function unscrambleJpegDetailed(bytes, { key, progressive } = {}) {
   const { segments, frame } = parse(bytes);
   const marker = readMarkerFrom(segments);
   if (!marker) throw new PixmixError('Image carries no pixmix marker', 'NOT_SCRAMBLED');
-  const layout = layoutFor(key, marker.params, frame, marker.check);
-  const restored = applyMcuLayout(frame, layout, 'unscramble');
+  const { layout, restored } = restoreFrame(segments, frame, marker, key);
   const header = headerSegments(segments);
   return {
     layout,
     params: marker.params,
     segments: header,
-    toJpeg: () => assembleJpeg(header, restored, {
-      progressive: progressive === undefined || progressive === 'auto' ? !!(marker.params.block & MCU_PROGRESSIVE) : !!progressive,
-    }),
+    watermark: jpegWatermark(segments),
+    /** `paint` ({painter, watermark}): draw a watermark on the restored image. */
+    toJpeg: (paint) => {
+      let out = restored;
+      if (paint?.watermark) {
+        out = { ...restored, components: restored.components.map((c) => ({ ...c, coefs: c.coefs.slice() })) };
+        paint.painter.paintJpegImage(out, header, paint.watermark, jpegOrientation(header));
+      }
+      return assembleJpeg(header, out, {
+        progressive: progressive === undefined || progressive === 'auto' ? !!(marker.params.block & MCU_PROGRESSIVE) : !!progressive,
+      });
+    },
   };
 }
 
@@ -164,19 +248,22 @@ export function unscrambleJpeg(bytes, opts) {
   return unscrambleJpegDetailed(bytes, opts).toJpeg();
 }
 
-export function rekeyJpeg(bytes, { from, to, transforms, salt, mode, progressive } = {}) {
+export function rekeyJpeg(bytes, { from, to, transforms, salt, mode, progressive, watermark, visibleWatermark } = {}) {
   if (mode && mode !== 'mcu') throw new PixmixError(`JPEG only supports mode "mcu"`, 'BAD_OPTION');
   const { segments, frame } = parse(bytes);
   const marker = readMarkerFrom(segments);
   if (!marker) throw new PixmixError('Image carries no pixmix marker', 'NOT_SCRAMBLED');
-  const plain = applyMcuLayout(frame, layoutFor(from, marker.params, frame, marker.check), 'unscramble');
+  const { restored: plain, visible } = restoreFrame(segments, frame, marker, from);
   const restoreProgressive = progressive === undefined || progressive === 'auto' ? !!(marker.params.block & MCU_PROGRESSIVE) : !!progressive;
   const params = makeParams({
     mode: 'mcu', transforms: transforms ?? !!(marker.params.block & MCU_TRANSFORMS), progressive: restoreProgressive, salt,
   });
   const layout = layoutFor(to, params, frame);
-  return assembleJpeg(headerSegments(segments), applyMcuLayout(plain, layout, 'scramble'), {
-    marker: markerPayload(params, layout.check), progressive: restoreProgressive && !hasPadding(frame),
+  return finishScramble(segments, applyMcuLayout(plain, layout, 'scramble'), params, layout.check, {
+    key: to,
+    watermark: watermark === undefined ? carried(jpegWatermark(segments)) : watermark,
+    visibleWatermark: visibleWatermark === undefined ? visible : visibleWatermark,
+    progressive: restoreProgressive && !hasPadding(frame),
   });
 }
 
@@ -201,6 +288,7 @@ export function inspectJpeg(bytes) {
     scrambled: !!marker,
     mode: marker ? 'mcu' : null,
     transforms: marker ? !!(marker.params.block & MCU_TRANSFORMS) : null,
+    ...watermarkInfo(jpegWatermark(segments), marker),
     metadata: ['exif', 'icc', 'xmp', 'density'].filter((k) => meta[k]),
     ...(meta.exif ? { orientation: readOrientation(meta.exif) } : {}),
     segments: segments.map((s) => ({ type: segmentName(s.marker), length: s.data.length + (s.ecs?.length ?? 0) })),

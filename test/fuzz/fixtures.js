@@ -16,6 +16,7 @@ import { readSegments, writeSegments, M, isSof } from '../../src/formats/jpeg/ma
 import { decodeFrame } from '../../src/formats/jpeg/decode.js';
 import { assembleJpeg } from '../../src/formats/jpeg/encode.js';
 import { brotliCompressSync, deflateSync } from 'node:zlib';
+import { compileWatermark } from '../../src/watermark/compile.js';
 
 export const KEY = 'fuzz-key';
 const SALT = new Uint8Array(16).fill(7);
@@ -200,12 +201,44 @@ export async function buildFixtures() {
   add('jxl:scrambled-jpeg-route', await encodeAsync(baseline, { key: KEY, salt: SALT, format: 'jxl' }), { scrambled: true, weight: 1 });
   add('jxl:scrambled-jpeg-route-444', await encodeAsync(p444, { key: KEY, salt: SALT, format: 'jxl' }), { scrambled: true, weight: 0.5 });
 
+  // Watermarks: carried (whole, and by id) and visible on the scrambled image, on every
+  // format and route. The fixtures are tiny, so the watermark is one that fits them.
+  const wm = fuzzWatermark();
+  const carried = { watermark: wm };
+  const visible = { watermark: { id: 'vivi-gold' }, visibleWatermark: wm };
+  scrambled('png:wm-carried', png, { ...carried, mode: 'block', block: 4 }, 1.5);
+  scrambled('png:wm-visible', png, visible, 1.5);
+  scrambled('png:wm-visible-palette', readFileSync(new URL('../fixtures/pngsuite/basi3p04.png', import.meta.url)), visible, 0.7);
+  scrambled('apng:wm-visible', anim, { ...visible, mode: 'block', block: 3 }, 1);
+  scrambled('jpeg:wm-carried-id', baseline, { watermark: { id: 'vivi-window' } }, 0.7);
+  scrambled('jpeg:wm-visible', baseline, visible, 1.5);
+  scrambled('jpeg:wm-visible-progressive', p444, { ...carried, visibleWatermark: wm }, 1.5);
+  add('jxl:wm-visible-pixel', await encodeAsync(jxl, { key: KEY, salt: SALT, mode: 'pixel', effort: 1, ...carried, visibleWatermark: wm }), { scrambled: true, weight: 1 });
+  add('jxl:wm-carried-id', await encodeAsync(jxl, { key: KEY, salt: SALT, mode: 'block', block: 4, effort: 1, watermark: { id: 'vivi-pixel' } }), { scrambled: true, weight: 0.5 });
+  add('jxl:wm-visible-jpeg-route', await encodeAsync(baseline, { key: KEY, salt: SALT, format: 'jxl', ...visible }), { scrambled: true, weight: 0.7 });
+
   // Formats only a plugin reads.
   add('webp:lossy', await raw(22, 14).webp({ quality: 70 }).toBuffer());
   add('webp:lossless-alpha', await raw(15, 9, { alpha: true }).webp({ lossless: true }).toBuffer());
   add('webp:animated', await sharp(Buffer.from(agif), { animated: true }).webp().toBuffer());
   add('tiff', await raw(12, 10).tiff().toBuffer(), { weight: 0.3 });
   return out;
+}
+
+let wmCache = null;
+/**
+ * A compiled watermark that shows on the fuzzer's tiny images and uses every drawing path:
+ * outline, blurred shadow, a bordered gradient box and ornaments.
+ */
+export function fuzzWatermark() {
+  wmCache ??= compileWatermark({
+    id: 'fuzz', text: 'Vi', font: 'PixelifySans', size: { px: 7 }, fit: { maxWidth: 1, maxHeight: 1, minSize: 1 },
+    margin: { relative: 0, min: 1, max: 1 }, fill: { type: 'linear', angle: 135, stops: [{ at: 0, color: '#ffe080' }, { at: 1, color: '#a06010c0' }] },
+    stroke: { color: '#101030', width: 0.1 }, shadow: { color: '#000000', opacity: 0.5, x: 0.1, y: 0.1, blur: 0.2 },
+    background: { shape: 'pill', fill: '#20308080', padding: { x: 0.3, y: 0.15 }, border: { fill: '#ffffff', width: 0.08 } },
+    ornaments: [{ shape: 'sparkle', position: 'top-right', size: 0.4 }, { shape: 'line', position: 'below', size: 1 }],
+  }, { font: (n) => readFileSync(new URL(`../../watermarks/fonts/${n}.ttf`, import.meta.url)) });
+  return wmCache;
 }
 
 /** Plugins the fuzzer hands to encodeAsync, so WebP/TIFF input reaches sharp. */

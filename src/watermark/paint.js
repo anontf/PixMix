@@ -205,7 +205,10 @@ export function paintJpeg(patch, frame, tables, colour) {
   const { hmax, vmax, mcusX, mcusY, width, height } = frame;
   const tw = 8 * hmax, th = 8 * vmax;
   const comps = frame.components;
-  for (const c of comps) if (hmax % c.h || vmax % c.v) throw new PixmixError('Unusual JPEG chroma subsampling; cannot paint a watermark', 'UNSUPPORTED');
+  for (const c of comps) {
+    if (hmax % c.h || vmax % c.v) throw new PixmixError('Unusual JPEG chroma subsampling; cannot paint a watermark', 'UNSUPPORTED');
+    if (!tables[c.tq]) throw new PixmixError(`JPEG has no quantisation table ${c.tq}`, 'BAD_JPEG');
+  }
   const divs = comps.map((c) => divisors(tables[c.tq]));
   const planes = comps.map(() => new Float64Array(tw * th)); // full resolution, per component
   const block = new Float64Array(64), fblock = new Float32Array(64);

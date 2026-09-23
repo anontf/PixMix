@@ -542,9 +542,13 @@ Considered and left out:
   converted 8-bit pixels, which the stash cannot match.
 - Signing the carried watermark with the key: in the browser use case the key is public.
 
-Limits on untrusted input: compiled watermarks are validated (sizes, counts, path syntax);
-carried JSON is at most 512 KB; stashed regions must lie inside the image and are inflated
-into a buffer of exactly their size.
+Limits on untrusted input (see "Untrusted input"): compiled watermarks are validated (sizes,
+counts, path syntax); carried watermark JSON counts against `maxMetadataBytes`; stashed
+regions must lie inside the image (so `maxPixels` bounds them) and are inflated into a
+buffer of exactly their size; the renderer refuses a watermark covering more than 4
+megapixels (or `maxPixels`) and caps outline and blur radii at 32 px. The fuzzer's seeds
+include files carrying watermarks (whole and by id) and visible watermarks on every format
+and route, and it mutates their payloads.
 
 ### Server and CLI
 

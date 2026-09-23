@@ -238,3 +238,39 @@ test('decode of a scrambled file is still fine after all that', () => {
   ]);
   assert.ok(decode(encode(png, { key: 'k' }), { key: 'k' }).length > 0);
 });
+
+// --- watermarks ----------------------------------------------------------------------
+
+const wmFixtures = await import('./fuzz/fixtures.js');
+
+test('watermark on a JPEG whose quantisation table went missing: a PixmixError, not a TypeError', async () => {
+  // Found by the fuzzer (a dropped DQT segment in a scrambled JPEG carrying a watermark).
+  const wm = wmFixtures.fuzzWatermark();
+  const { frame, dqt } = encodePixels({ width: 32, height: 24, data: new Uint8Array(32 * 24 * 4).fill(128) });
+  const jpeg = assembleJpeg([dqt], frame);
+  const s = encode(jpeg, { key: 'k', watermark: wm });
+  const noDqt = writeSegments(readSegments(s).segments.filter((x) => x.marker !== M.DQT));
+  await rejectsPixmix(() => decodeAsync(noDqt, { key: 'k', watermark: true }));
+  // The reveal leaves the watermark out and still shows the image (or refuses the file).
+  const r = await compute(noDqt, 'k', { watermark: 'embedded' }).catch((err) => err);
+  assert.ok(r instanceof Error ? r.name === 'PixmixError' : typeof r.watermarkError === 'string', String(r));
+});
+
+test('hostile compiled watermarks are bounded: huge outline, blur and coverage', async () => {
+  const wm = structuredClone(wmFixtures.fuzzWatermark());
+  const png = encodeRaster({ width: 600, height: 400, depth: 8, colorType: 2, interlace: 0 }, new Uint8Array(600 * 400 * 3).fill(90));
+  const file = writeChunks([
+    { type: 'IHDR', data: cat(u32(600, 400), Uint8Array.of(8, 2, 0, 0, 0)) }, { type: 'IDAT', data: png }, { type: 'IEND', data: new Uint8Array(0) },
+  ]);
+  // A big outline and blur on a big watermark: capped radii keep this quick.
+  const heavy = { ...wm, size: { ...wm.size, px: 150 }, stroke: { ...wm.stroke, width: 1 }, shadow: { ...wm.shadow, blur: 2 } };
+  const t0 = Date.now();
+  await decodeAsync(encode(file, { key: 'k' }), { key: 'k', watermark: heavy });
+  assert.ok(Date.now() - t0 < 10000, `${Date.now() - t0} ms`);
+  // One that would cover more than the renderer allows is refused.
+  const huge = { ...wm, size: { ...wm.size, px: 2000 }, fit: { maxWidth: 1, maxHeight: 1, minSize: 1 } };
+  await rejectsPixmix(() => decodeAsync(encode(file, { key: 'k' }), { key: 'k', watermark: huge, limits: { maxPixels: 100_000 } }), 'LIMIT');
+  // A carried watermark over maxMetadataBytes is a LIMIT error.
+  const s = encode(file, { key: 'k', watermark: wm });
+  await rejectsPixmix(() => decodeAsync(s, { key: 'k', watermark: true, limits: { maxMetadataBytes: 100 } }), 'LIMIT');
+});

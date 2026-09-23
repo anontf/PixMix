@@ -43,6 +43,66 @@ const setBe16 = (b, o, v) => { b[o] = (v >>> 8) & 255; b[o + 1] = v & 255; };
 const interesting16 = (r) => r.pick([0, 1, 2, 8, 16, 255, 256, 4096, 0x7fff, 0x8000, 0xfffe, 0xffff, r.below(65536)]);
 const randomBytes = (r, n) => Uint8Array.from({ length: n }, () => r.u32() & 255);
 
+// --- watermarks -----------------------------------------------------------------------
+// The payloads pixmix carries (see src/watermark/embed.js): a carried watermark (a compiled
+// watermark as JSON, or an id) and a visible watermark's stash (JSON, regions, encrypted
+// data). These mutate the JSON's values and the regions, so mutants get past JSON.parse.
+
+const utf8 = new TextEncoder(), fromUtf8 = new TextDecoder();
+const INTERESTING_NUMBERS = [0, -1, 1, 0.5, 1e-9, 7, 255, 256, 1000, 2000, 65535, 1e6, 1e9, -1e6, 2 ** 32, Number.MAX_SAFE_INTEGER];
+
+function mutateJson(value, r) {
+  const leaves = [];
+  const walk = (v, set) => {
+    if (v && typeof v === 'object') {
+      for (const k of Object.keys(v)) walk(v[k], (x) => { if (x === undefined) { if (Array.isArray(v)) v.splice(Number(k), 1); else delete v[k]; } else v[k] = x; });
+      leaves.push({ v, set, container: true });
+    } else leaves.push({ v, set });
+  };
+  walk(value, () => {});
+  const leaf = r.pick(leaves.slice(0, -1).length ? leaves.slice(0, -1) : leaves);
+  const k = r.below(6);
+  if (leaf.container && Array.isArray(leaf.v) && k < 2) {
+    if (leaf.v.length) leaf.v.push(...Array(r.pick([1, 3, 40])).fill(leaf.v[0])); // grow a list
+  } else if (k === 0) leaf.set(r.pick(INTERESTING_NUMBERS));
+  else if (k === 1) leaf.set(typeof leaf.v === 'number' ? leaf.v * r.pick([-1, 2, 10, 1000]) : r.pick(['', 'x', '#fff', 'M0 0L9 9Z', 'M'.repeat(50), null, true, [], {}]));
+  else if (k === 2) leaf.set(undefined);
+  else if (k === 3 && typeof leaf.v === 'string') leaf.set(leaf.v.replace(/-?\d+/g, (m) => (r.chance(0.2) ? String(r.pick(INTERESTING_NUMBERS)) : m)));
+  else leaf.set(r.pick(INTERESTING_NUMBERS));
+  return value;
+}
+
+/** Mutates a pmWm / pmWs payload (without its signature). */
+function watermarkPayload(d, r) {
+  if (d.length < 3) return null;
+  if (d[0] === 1 && d[1] <= 1 && d[1] === 1) { // carried: u8 1 | u8 1 | JSON
+    try {
+      return cat(d.subarray(0, 2), utf8.encode(JSON.stringify(mutateJson(JSON.parse(fromUtf8.decode(d.subarray(2))), r))));
+    } catch { return null; }
+  }
+  if (d[0] === 1 && d.length > 5) { // stash: u8 1 | u32 len | JSON | u8 n | regions | u32 len | data
+    const dv = new DataView(d.buffer, d.byteOffset, d.byteLength);
+    const jl = dv.getUint32(1);
+    if (5 + jl + 1 > d.length) return null;
+    if (r.chance(0.5)) {
+      try {
+        const json = utf8.encode(JSON.stringify(mutateJson(JSON.parse(fromUtf8.decode(d.subarray(5, 5 + jl))), r)));
+        const head = new Uint8Array(5);
+        head[0] = 1;
+        setBe32(head, 1, json.length);
+        return cat(head, json, d.subarray(5 + jl));
+      } catch { return null; }
+    }
+    const out = d.slice();
+    const regions = out[5 + jl];
+    const at = 5 + jl + 1 + 4 * r.below(regions * 5 + 1); // a region field, or the data length
+    if (at + 4 <= out.length) setBe32(out, at, r.chance(0.6) ? r.pick(INTERESTING32) : Math.max(0, be32(out, at) + r.below(9) - 4));
+    else out[5 + jl] = r.pick(INTERESTING8);
+    return out;
+  }
+  return null;
+}
+
 // --- generic -------------------------------------------------------------------------
 
 const GENERIC = {
@@ -150,6 +210,13 @@ const PNG = {
     chunks.splice(r.below(chunks.length), 1);
     return true;
   },
+  watermark(chunks, r) {
+    const c = chunks.find((x) => x.type === 'pmWm' || x.type === 'pmWs');
+    const d = c && watermarkPayload(c.data, r);
+    if (!d) return false;
+    c.data = d;
+    return true;
+  },
   /** Recompress image data so the bytes inside the zlib stream change, not just the stream. */
   splitData(chunks, r) {
     const i = chunks.findIndex((c) => c.type === 'IDAT' || c.type === 'fdAT');
@@ -193,6 +260,17 @@ function jpegWrite({ segs, tail }) {
 }
 
 const JPEG = {
+  watermark(j, r) {
+    const sig = (s) => s.marker === 0xef && s.data[6] === 0x2d && s.data[9] === 0; // "pixmix-w?\0"
+    const s = j.segs.find(sig);
+    if (!s) return false;
+    const stash = s.data[8] === 0x73;
+    const body = s.data.subarray(10 + (stash ? 2 : 0));
+    const d = watermarkPayload(body, r);
+    if (!d || d.length > 65000) return false;
+    s.data = cat(s.data.subarray(0, 10 + (stash ? 2 : 0)), d);
+    return true;
+  },
   sof(j, r) {
     const s = j.segs.find((x) => x.marker >= 0xc0 && x.marker <= 0xcf && x.marker !== 0xc4 && x.marker !== 0xc8 && x.marker !== 0xcc);
     if (!s) return false;
@@ -318,6 +396,13 @@ function jxlWrite(boxes) {
 }
 
 const JXL = {
+  watermark(boxes, r) {
+    const x = boxes.find((b) => b.type === 'pmWm' || b.type === 'pmWs');
+    const d = x && watermarkPayload(x.data, r);
+    if (!d) return false;
+    x.data = d;
+    return true;
+  },
   size(boxes, r) {
     const x = r.pick(boxes);
     const k = r.below(4);
@@ -418,7 +503,8 @@ function structured(b, r, log) {
   if (fmt === 'png') {
     const chunks = pngChunks(b);
     if (!chunks.length) return null;
-    const name = r.pick(Object.keys(PNG));
+    const carries = chunks.some((c) => c.type === 'pmWm' || c.type === 'pmWs');
+    const name = carries && r.chance(0.35) ? 'watermark' : r.pick(Object.keys(PNG));
     if (!PNG[name](chunks, r)) return null;
     const fix = r.chance(0.85);
     log.push(`png.${name}${fix ? '' : ' (bad crc)'}`);
@@ -427,7 +513,8 @@ function structured(b, r, log) {
   if (fmt === 'jpeg') {
     const j = jpegSegments(b);
     if (!j.segs.length) return null;
-    const name = r.pick(Object.keys(JPEG));
+    const carries = j.segs.some((s) => s.marker === 0xef && s.data[6] === 0x2d);
+    const name = carries && r.chance(0.35) ? 'watermark' : r.pick(Object.keys(JPEG));
     if (!JPEG[name](j, r)) return null;
     log.push(`jpeg.${name}`);
     return jpegWrite(j);
@@ -435,7 +522,8 @@ function structured(b, r, log) {
   if (fmt === 'jxl') {
     const boxes = jxlBoxes(b);
     if (!boxes.length) return null;
-    const name = r.pick(Object.keys(JXL));
+    const carries = boxes.some((b) => b.type === 'pmWm' || b.type === 'pmWs');
+    const name = carries && r.chance(0.35) ? 'watermark' : r.pick(Object.keys(JXL));
     if (!JXL[name](boxes, r)) return null;
     log.push(`jxl.${name}`);
     return jxlWrite(boxes);

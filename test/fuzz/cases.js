@@ -2,6 +2,7 @@
 // would run on it. Shared by the worker and by in-process reproduction (PIXMIX_FUZZ_CASE).
 
 import { rng, caseSeed, mutate } from './mutate.js';
+import { fuzzWatermark } from './fixtures.js';
 
 // Small limits keep each case fast; the fuzzer is after crashes, not big images.
 export const FUZZ_LIMITS = {
@@ -66,6 +67,10 @@ export async function runCase(t, { fixture, bytes, r }, { key, onOp = () => {} }
     ['decode', () => t.decode(bytes, { key, limits })],
     ['decodeAsync', () => t.decodeAsync(bytes, { key, limits, effort: 1 })],
     ['compute', () => t.compute(bytes, key, { animated: true, limits })],
+    // Watermarks: the one the file carries (ids resolve to the fuzz watermark), drawn in Node
+    // and in the reveal, whose painting errors must be PixmixErrors too.
+    ['decodeAsync:watermark', () => t.decodeAsync(bytes, { key, limits, effort: 1, watermark: true, resolveWatermark: () => fuzzWatermark() })],
+    ['compute:watermark', () => t.compute(bytes, key, { animated: false, limits, watermark: r.chance(0.5) ? 'embedded' : fuzzWatermark() })],
   ];
   if (fixture.scrambled) ops.push(['rekeyAsync', () => t.rekeyAsync(bytes, { from: key, to: 'other', limits, salt, effort: 1 })]);
   // Converting to each output format covers the decoders and builders the defaults skip.
@@ -74,6 +79,10 @@ export async function runCase(t, { fixture, bytes, r }, { key, onOp = () => {} }
   // Whatever encode accepts must come back: decoding its output may not fail, and PNG pixels
   // and JPEG coefficients must be exactly the input's (pixmix promises lossless).
   if (!fixture.scrambled) ops.push(['roundtrip', () => roundtrip(t, bytes, { key, limits, salt })]);
+  // And with a visible watermark on the scrambled image, restoring must still be exact.
+  if (!fixture.scrambled && r.chance(0.5)) {
+    ops.push(['roundtrip:visible', () => roundtrip(t, bytes, { key, limits, salt, watermark: fuzzWatermark(), visibleWatermark: fuzzWatermark() })]);
+  }
   const failures = [];
   const record = (op, err) => failures.push({ op, name: err?.constructor?.name ?? typeof err, message: String(err?.message ?? err), stack: String(err?.stack ?? '') });
   for (const [op, run] of ops) {
@@ -91,10 +100,10 @@ export async function runCase(t, { fixture, bytes, r }, { key, onOp = () => {} }
 
 const PROGRAMMING_ERRORS = [TypeError, RangeError, ReferenceError, SyntaxError];
 
-async function roundtrip(t, bytes, { key, limits, salt }) {
+async function roundtrip(t, bytes, { key, limits, salt, ...extra }) {
   let scrambled;
   try {
-    scrambled = t.encode(bytes, { key, limits, salt });
+    scrambled = t.encode(bytes, { key, limits, salt, ...extra });
   } catch (err) {
     if (err instanceof t.PixmixError) return; // refusing is fine
     throw err;

@@ -100,6 +100,8 @@ async function painting(requested, embedded, { width, height }, exif, write, lim
     const restored = await write({ painter, watermark, limits });
     return { restored, overlay: painter.overlayFor(watermark, width, height, exif ? readOrientation(exif) : 1, limits) };
   } catch (err) {
+    // Only pixmix's own refusals (a bad or oversized watermark); anything else is a bug.
+    if (err?.name !== 'PixmixError' && !err?.message?.startsWith('Watermark support could not be loaded')) throw err;
     return { restored: await write(null), watermarkError: err.message };
   }
 }

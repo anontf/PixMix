@@ -5,7 +5,13 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { encode } from '../src/encoder.js';
 import { readPng } from '../src/formats/png/index.js';
-import { toRGBA8 } from '../src/browser/rgba.js';
+import { toRGBA8 } from '../src/formats/png/rgba.js';
+import { resolveObjectURL } from 'node:buffer';
+import jpeg from 'jpeg-js';
+import { decode, detectFormat } from '../src/decoder.js';
+import { readJpegMetadata } from '../src/meta/jpeg.js';
+import { readOrientation } from '../src/meta/exif.js';
+import { orientationTransform, swapsAxes } from '../src/browser/orient.js';
 
 class FakeImageData {
   constructor(a, b, c) {
@@ -31,6 +37,11 @@ class FakeCanvas extends FakeElement {
     return {
       setTransform(...t) { m = t; },
       clearRect() { c.pixels.fill(0); },
+      getImageData(x, y, w, h) {
+        const out = new Uint8ClampedArray(w * h * 4);
+        for (let r = 0; r < h; r++) out.set(c.pixels.subarray(((y + r) * c.width + x) * 4, ((y + r) * c.width + x + w) * 4), r * w * 4);
+        return new FakeImageData(out, w, h);
+      },
       putImageData(img, x, y) {
         for (let r = 0; r < img.height; r++) {
           c.pixels.set(img.data.subarray(r * img.width * 4, (r + 1) * img.width * 4), ((y + r) * c.width + x) * 4);
@@ -58,10 +69,27 @@ class FakeCanvas extends FakeElement {
 class FakeImg extends FakeElement {
   set src(v) { this._src = v; queueMicrotask(() => this.listeners.load?.forEach((f) => f())); }
   get src() { return this._src; }
+  // Like a browser: decodes the JPEG and applies its EXIF orientation.
+  async decode() {
+    const bytes = new Uint8Array(await resolveObjectURL(this._src).arrayBuffer());
+    const raw = jpeg.decode(bytes, { useTArray: true, formatAsRGBA: true });
+    const exif = readJpegMetadata(bytes).exif;
+    const o = exif ? readOrientation(exif) : 1;
+    const shown = new FakeCanvas();
+    shown.width = swapsAxes(o) ? raw.height : raw.width;
+    shown.height = swapsAxes(o) ? raw.width : raw.height;
+    const ctx = shown.getContext('2d');
+    ctx.setTransform(...orientationTransform(o, raw.width, raw.height));
+    ctx.drawImage({ width: raw.width, height: raw.height, pixels: raw.data }, 0, 0);
+    this.width = this.naturalWidth = shown.width;
+    this.height = this.naturalHeight = shown.height;
+    this.pixels = shown.pixels;
+  }
 }
 
 globalThis.ImageData = FakeImageData;
 globalThis.document = { createElement: () => new FakeCanvas() };
+globalThis.Image = FakeImg;
 globalThis.requestAnimationFrame = (cb) => setTimeout(() => cb(performance.now()), 4);
 
 const { reveal } = await import('../src/browser/index.js');
@@ -120,3 +148,51 @@ test('reveal applies EXIF orientation to the animation', async () => {
     assert.deepEqual([...out.pixels.subarray(d, d + 4)], [...data.subarray(s, s + 4)]);
   }
 });
+
+async function jpegFixture(orientation) {
+  const { encodePixels } = await import('../src/formats/jpeg/fdct.js');
+  const { assembleJpeg } = await import('../src/formats/jpeg/encode.js');
+  const w = 37, h = 21; // partial edge MCUs on both axes
+  const data = new Uint8Array(w * h * 4).map((_, i) => (i % 4 === 3 ? 255 : (i * 29) % 251));
+  const { frame, dqt } = encodePixels({ width: w, height: h, data });
+  const header = [dqt];
+  if (orientation) {
+    const tiff = [0x49, 0x49, 0x2a, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, orientation, 0, 0, 0, 0, 0, 0, 0];
+    header.unshift({ marker: 0xe1, data: Uint8Array.from([0x45, 0x78, 0x69, 0x66, 0, 0, ...tiff]) });
+  }
+  return assembleJpeg(header, frame);
+}
+
+for (const effect of ['blocks', 'dissolve', 'scan']) {
+  test(`JPEG reveal ${effect} ends on the restored image`, async () => {
+    const src = await jpegFixture();
+    const scrambled = encode(src, { key: 'k' });
+    globalThis.fetch = async () => new Response(scrambled);
+    const out = await reveal(new FakeImg(), { key: 'k', effect, duration: 30, final: 'canvas' });
+    const expected = jpeg.decode(decode(scrambled, { key: 'k' }), { useTArray: true, formatAsRGBA: true }).data;
+    assert.deepEqual(out.pixels, new Uint8ClampedArray(expected));
+  });
+}
+
+test('JPEG reveal with EXIF orientation 6 shows the image the way the browser will', async () => {
+  const src = await jpegFixture(6);
+  const scrambled = encode(src, { key: 'k' });
+  globalThis.fetch = async () => new Response(scrambled);
+  const out = await reveal(new FakeImg(), { key: 'k', effect: 'blocks', duration: 30, final: 'canvas' });
+  const shown = new FakeImg();
+  shown.src = URL.createObjectURL(new Blob([decode(scrambled, { key: 'k' })], { type: 'image/jpeg' }));
+  await shown.decode();
+  assert.equal(out.width, 21);
+  assert.equal(out.height, 37);
+  assert.deepEqual(out.pixels, shown.pixels);
+});
+
+test('JPEG reveal swaps the restored JPEG into the <img>', async () => {
+  globalThis.fetch = async () => new Response(encode(await jpegFixture(), { key: 'k' }));
+  const img = new FakeImg();
+  await reveal(img, { key: 'k', effect: 'none' });
+  assert.equal(img.dataset.pixmixState, 'done');
+  const restored = new Uint8Array(await resolveObjectURL(img.src).arrayBuffer());
+  assert.equal(detectFormat(restored), 'jpeg');
+});
+

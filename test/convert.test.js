@@ -82,37 +82,37 @@ test('JPEG -> PNG carries ICC, EXIF, XMP, density and comments', () => {
   const icc = fakeIcc('RGB ');
   const exif = tiffWithOrientation(6);
   const src = jpegWithMetadata({ icc, exif, xmp: XMP, comment: 'hello', dpi: 300 });
-  const r = convert(src);
+  const r = convert(src, { format: 'png' });
   assert.equal(r.from, 'jpeg');
   assert.equal(r.decoder, 'jpeg-js');
   assert.deepEqual(r.transferred.sort(), ['EXIF', 'ICC profile', 'XMP', 'comments', 'density']);
   assert.deepEqual(r.dropped, []);
 
-  const iccp = chunk(r.png, 'iCCP');
+  const iccp = chunk(r.bytes, 'iCCP');
   const nul = iccp.indexOf(0);
   assert.ok(Buffer.from(inflateSync(iccp.subarray(nul + 2))).equals(icc), 'ICC reassembled in order');
-  assert.ok(Buffer.from(chunk(r.png, 'eXIf')).equals(exif));
-  assert.equal(readOrientation(chunk(r.png, 'eXIf')), 6);
-  assert.ok(Buffer.from(chunk(r.png, 'iTXt')).toString('utf8').endsWith(XMP));
-  assert.equal(Buffer.from(chunk(r.png, 'pHYs')).readUInt32BE(0), Math.round(300 / 0.0254));
-  assert.equal(Buffer.from(chunk(r.png, 'tEXt')).toString('latin1'), 'Comment\0hello');
+  assert.ok(Buffer.from(chunk(r.bytes, 'eXIf')).equals(exif));
+  assert.equal(readOrientation(chunk(r.bytes, 'eXIf')), 6);
+  assert.ok(Buffer.from(chunk(r.bytes, 'iTXt')).toString('utf8').endsWith(XMP));
+  assert.equal(Buffer.from(chunk(r.bytes, 'pHYs')).readUInt32BE(0), Math.round(300 / 0.0254));
+  assert.equal(Buffer.from(chunk(r.bytes, 'tEXt')).toString('latin1'), 'Comment\0hello');
   // Chunk order rules: iCCP/eXIf before image data.
-  const types = chunkTypes(r.png);
+  const types = chunkTypes(r.bytes);
   assert.ok(types.indexOf('iCCP') < types.indexOf('IDAT') && types.indexOf('eXIf') < types.indexOf('IDAT'));
 
   // Pixels are exactly what the JPEG decodes to.
   const ref = jpeg.decode(src, { useTArray: true, formatAsRGBA: true });
-  assert.deepEqual(rgbaOf(r.png), new Uint8Array(ref.data));
+  assert.deepEqual(rgbaOf(r.bytes), new Uint8Array(ref.data));
 });
 
 test('JPEG input encodes to a scrambled PNG that restores exactly', () => {
   const src = jpegWithMetadata({ icc: fakeIcc('RGB '), exif: tiffWithOrientation(3), dpi: 72 });
   let report;
-  const scrambled = encode(src, { key: 'k', mode: 'block', block: 8, onConvert: (r) => { report = r; } });
+  const scrambled = encode(src, { key: 'k', format: 'png', mode: 'block', block: 8, onConvert: (r) => { report = r; } });
   assert.equal(report.from, 'jpeg');
   assert.equal(inspect(scrambled).scrambled, true);
   const restored = decode(scrambled, { key: 'k' });
-  const plain = convert(src).png;
+  const plain = convert(src, { format: 'png' }).bytes;
   assert.deepEqual(rgbaOf(restored), rgbaOf(plain));
   for (const t of ['iCCP', 'eXIf', 'pHYs']) assert.deepEqual(chunk(restored, t), chunk(plain, t));
   assert.ok(!chunkTypes(restored).includes('pmIx'));
@@ -120,12 +120,16 @@ test('JPEG input encodes to a scrambled PNG that restores exactly', () => {
 
 test('inspect reports JPEG metadata and orientation', () => {
   const info = inspect(jpegWithMetadata({ exif: tiffWithOrientation(8), xmp: XMP }));
-  assert.deepEqual(info, { format: 'jpeg', scrambled: false, width: W, height: H, metadata: ['exif', 'xmp'], orientation: 8 });
+  assert.equal(info.format, 'jpeg');
+  assert.equal(info.scrambled, false);
+  assert.deepEqual([info.width, info.height], [W, H]);
+  assert.deepEqual(info.metadata, ['exif', 'xmp']);
+  assert.equal(info.orientation, 8);
 });
 
 test('CMYK ICC profiles are dropped with a reason', () => {
-  const r = convert(jpegWithMetadata({ icc: fakeIcc('CMYK') }));
-  assert.ok(!chunk(r.png, 'iCCP'));
+  const r = convert(jpegWithMetadata({ icc: fakeIcc('CMYK') }), { format: 'png' });
+  assert.ok(!chunk(r.bytes, 'iCCP'));
   assert.deepEqual(r.dropped, ['ICC profile (CMYK colour space)']);
 });
 
@@ -167,8 +171,8 @@ test('animated GIF keeps the first frame as a palette PNG', () => {
   const r = convert(new Uint8Array(buf.subarray(0, gw.end())));
   assert.equal(r.from, 'gif');
   assert.deepEqual(r.dropped, ['animation (first frame kept)']);
-  assert.equal(chunk(r.png, 'IHDR')[9], 3);
-  const px = rgbaOf(r.png);
+  assert.equal(chunk(r.bytes, 'IHDR')[9], 3);
+  const px = rgbaOf(r.bytes);
   assert.deepEqual([...px.subarray(0, 8)], [255, 0, 0, 255, 0, 255, 0, 255]);
 });
 
@@ -176,7 +180,7 @@ test('formats without a built-in decoder ask for a plugin', async () => {
   const webp = await sharp(Buffer.from(gradient()), { raw: { width: W, height: H, channels: 4 } }).webp({ lossless: true }).toBuffer();
   assert.throws(() => encode(webp, { key: 'k' }), /pass a decoder plugin/);
   assert.throws(() => encode(webp, { key: 'k', decoders: [sharpDecoder(sharp)] }), { code: 'ASYNC_DECODER' });
-  assert.throws(() => encode(convert(jpegWithMetadata()).png, { key: 'k', format: 'jpeg' }), /not supported yet/);
+  assert.throws(() => encode(jpegWithMetadata(), { key: 'k', format: 'jxl' }), /not supported yet/);
 });
 
 test('sharp plugin: lossless WebP with ICC + EXIF + XMP', async () => {
@@ -207,7 +211,7 @@ test('sharp plugin: AVIF uses sharp-provided metadata', async () => {
   const r = await (await import('../src/index.js')).convertAsync(avif, { decoders: [sharpDecoder(sharp)] });
   assert.equal(r.from, 'avif');
   assert.ok(r.transferred.includes('ICC profile'));
-  const p = PNG.sync.read(Buffer.from(r.png));
+  const p = PNG.sync.read(Buffer.from(r.bytes));
   assert.equal(p.width, W);
   assert.equal(p.height, H);
 });

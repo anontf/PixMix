@@ -11,6 +11,21 @@
 import decodeJpeg from 'jpeg-js/lib/decoder.js';
 import { GifReader } from 'omggif';
 import { PixmixError } from '../core/params.js';
+import { readPng } from '../formats/png/index.js';
+import { toRGBA8 } from '../formats/png/rgba.js';
+import { readPngMetadata } from '../meta/png.js';
+
+// Used when PNG has to become another format.
+export const pngDecoder = {
+  name: 'pixmix',
+  formats: ['png'],
+  decode(bytes) {
+    const img = readPng(bytes);
+    const metadata = readPngMetadata(img.chunks);
+    if (img.ihdr.depth === 16) metadata.dropped.push('16-bit precision (reduced to 8-bit)');
+    return { width: img.ihdr.width, height: img.ihdr.height, data: new Uint8Array(toRGBA8(img, img.pixels).buffer), metadata };
+  },
+};
 
 export const jpegDecoder = {
   name: 'jpeg-js',
@@ -48,4 +63,4 @@ export const gifDecoder = {
   },
 };
 
-export const BUILTIN_DECODERS = [jpegDecoder, gifDecoder];
+export const BUILTIN_DECODERS = [pngDecoder, jpegDecoder, gifDecoder];

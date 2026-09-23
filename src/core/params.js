@@ -1,9 +1,10 @@
 // Scramble parameters, key derivation and the marker that travels inside the image.
 //
-// Marker layout (v1), stored in a format-specific container (PNG: `pmIx` chunk):
+// Marker layout (v1), stored in a format-specific container (PNG: `pmIx` chunk,
+// JPEG: APP15 segment "pixmix\0"):
 //   u8  version        (1)
-//   u8  mode           (0 = pixel, 1 = block)
-//   u16 block size     (big-endian, 0 in pixel mode)
+//   u8  mode           (0 = pixel, 1 = block, 2 = mcu)
+//   u16 block          (big-endian; block: tile size, pixel: 0, mcu: flags, bit 0 = transforms)
 //   u8  salt length    (0..255)
 //   ..  salt
 //   u8[4] key check    (lets the decoder reject a wrong key instead of producing noise)
@@ -11,7 +12,8 @@
 import { hkdf } from './sha256.js';
 
 export const VERSION = 1;
-export const MODES = /** @type {const} */ (['pixel', 'block']);
+export const MODES = /** @type {const} */ (['pixel', 'block', 'mcu']);
+export const MCU_TRANSFORMS = 1;
 const SALT_BYTES = 16;
 const CHECK_BYTES = 4;
 
@@ -20,14 +22,14 @@ const utf8 = new TextEncoder();
 /**
  * @typedef {object} ScrambleParams
  * @property {number} version
- * @property {'pixel'|'block'} mode
- * @property {number} block   tile edge in pixels (block mode only)
+ * @property {'pixel'|'block'|'mcu'} mode   mcu: JPEG DCT-domain shuffle of whole MCUs
+ * @property {number} block   block mode: tile edge in pixels; mcu mode: flags
  * @property {Uint8Array} salt
  */
 
 /** @returns {ScrambleParams} */
-export function makeParams({ mode = 'pixel', block = 8, salt } = {}) {
-  if (!MODES.includes(mode)) throw new PixmixError(`Unknown mode "${mode}" (expected pixel or block)`);
+export function makeParams({ mode = 'pixel', block = 8, transforms = true, salt } = {}) {
+  if (!MODES.includes(mode)) throw new PixmixError(`Unknown mode "${mode}" (expected pixel, block or mcu)`);
   if (mode === 'block' && !(Number.isInteger(block) && block >= 2 && block <= 4096)) {
     throw new PixmixError('Block size must be an integer between 2 and 4096');
   }
@@ -35,7 +37,8 @@ export function makeParams({ mode = 'pixel', block = 8, salt } = {}) {
     salt = new Uint8Array(SALT_BYTES);
     globalThis.crypto.getRandomValues(salt);
   }
-  return { version: VERSION, mode, block: mode === 'block' ? block : 0, salt };
+  const field = mode === 'block' ? block : mode === 'mcu' ? (transforms ? MCU_TRANSFORMS : 0) : 0;
+  return { version: VERSION, mode, block: field, salt };
 }
 
 /** @param {string|Uint8Array} key */

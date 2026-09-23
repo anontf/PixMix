@@ -58,7 +58,7 @@ test('batch into an output directory, WebP via sharp, partial failure', async ()
   const r = run(['encode', '-k', 'k', '-o', out, join(dir, 'w.webp'), join(FIX, 'basn0g08.png'), join(dir, 'junk.png')]);
   assert.equal(r.status, 1, 'one input failed');
   const err = r.stderr.toString();
-  assert.match(err, /w\.webp -> .*w\.scrambled\.png.*webp via sharp/);
+  assert.match(err, /w\.webp -> .*w\.scrambled\.png.*webp -> png via sharp/);
   assert.match(err, /junk\.png: Unrecognised image format/);
   assert.ok(existsSync(join(out, 'w.scrambled.png')) && existsSync(join(out, 'basn0g08.scrambled.png')));
 });
@@ -68,4 +68,21 @@ test('usage errors exit 2', () => {
   assert.equal(run(['frobnicate', 'x']).status, 2);
   assert.equal(run(['encode', '-k', 'a', '--key-file', 'f', 'x']).status, 2);
   assert.equal(run(['--help']).status, 0);
+});
+
+test('JPEG stays JPEG: .scrambled.jpg and back, lossless', async () => {
+  const src = await sharp({ create: { width: 40, height: 24, channels: 3, background: '#aa3355' } }).jpeg().toBuffer();
+  writeFileSync(join(dir, 'p.jpg'), src);
+  let r = run(['encode', '-k', 'j', join(dir, 'p.jpg')]);
+  assert.equal(r.status, 0, r.stderr.toString());
+  assert.ok(existsSync(join(dir, 'p.scrambled.jpg')));
+  r = run(['decode', '-k', 'j', '-o', join(dir, 'p.back.jpg'), join(dir, 'p.scrambled.jpg')]);
+  assert.equal(r.status, 0, r.stderr.toString());
+  const [a, b] = await Promise.all([join(dir, 'p.jpg'), join(dir, 'p.back.jpg')].map((f) => sharp(f).raw().toBuffer()));
+  assert.ok(a.equals(b));
+  r = run(['encode', '-k', 'j', '--format', 'png', '-o', join(dir, 'p.png'), join(dir, 'p.jpg')]);
+  assert.match(r.stderr.toString(), /jpeg -> png via jpeg-js/);
+  r = run(['encode', '-k', 'j', '--mode', 'block', join(dir, 'p.jpg'), '-o', join(dir, 'x.jpg')]);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr.toString(), /only applies to PNG/);
 });

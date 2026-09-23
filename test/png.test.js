@@ -22,7 +22,7 @@ for (const f of valid) {
   test(`round trip ${f}`, () => {
     const orig = readFileSync(new URL(f, DIR));
     for (const m of MODES) {
-      const scrambled = encode(orig, { key: 'secret', ...m });
+      const scrambled = encode(orig, { key: 'secret', keepThumbnails: true, ...m });
       // Any decoder must still accept the scrambled file, with the same geometry.
       const sPng = PNG.sync.read(Buffer.from(scrambled), { skipRescale: true });
       const oPng = PNG.sync.read(orig, { skipRescale: true });
@@ -78,4 +78,21 @@ test('async decode path matches sync', async () => {
   const scrambled = encode(orig, { key: 'k', mode: 'block', block: 4 });
   const d = await unscramblePngDetailedAsync(scrambled, { key: 'k' });
   assert.ok(pixels(await d.toPng()).equals(pixels(orig)));
+});
+
+test('EXIF thumbnails are removed by default (they would show the unscrambled image)', () => {
+  const orig = readFileSync(new URL('exif2c08.png', DIR));
+  let report;
+  const scrambled = encode(orig, { key: 'k', onConvert: (r) => { report = r; } });
+  assert.deepEqual(report.dropped, ['EXIF thumbnail']);
+  const before = readChunks(orig).find((c) => c.type === 'eXIf').data;
+  const after = readChunks(scrambled).find((c) => c.type === 'eXIf').data;
+  assert.equal(after.length, before.length, 'nothing moves, offsets stay valid');
+  assert.ok(!Buffer.from(after).equals(Buffer.from(before)));
+  // IFD0 (the main image's tags) is untouched: same bytes up to its next-IFD pointer.
+  const ifd0 = Buffer.from(before).readUInt32BE(4);
+  const count = Buffer.from(before).readUInt16BE(ifd0);
+  const end = ifd0 + 2 + count * 12;
+  assert.ok(Buffer.from(after.subarray(0, end)).equals(Buffer.from(before.subarray(0, end))));
+  assert.equal(Buffer.from(after).readUInt32BE(end), 0, 'IFD1 unlinked');
 });

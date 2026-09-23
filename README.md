@@ -1,13 +1,16 @@
 # pixmix
 
-Keyed, reversible pixel scrambling. A scrambled image is still a completely valid image
-(same dimensions, same bit depth and colour type, every metadata chunk copied byte for
-byte), so any viewer shows it, just shuffled. With the key, the original pixels come back
-exactly.
+Keyed, reversible pixel scrambling. A scrambled image is still a completely valid image,
+so any viewer shows it, just shuffled:
+- same dimensions;
+- PNG: same bit depth and colour type, every metadata chunk copied byte for byte;
+- JPEG: same quantisation tables and metadata segments.
 
-Input can be PNG, JPEG, GIF, and, with a decoder plugin, WebP, AVIF, HEIC or TIFF. EXIF,
-ICC, XMP, density and comments are carried over. Output is PNG for now; JPEG and JXL
-output are later phases.
+With the key, the original comes back exactly: the same pixels for PNG, the same DCT
+coefficients for JPEG.
+
+Output is PNG or JPEG. Input can be PNG, JPEG, GIF, and, with a decoder plugin, WebP, AVIF,
+HEIC or TIFF. EXIF, ICC, XMP, density and comments are carried over.
 
 This is obfuscation, not encryption: a permutation keeps the colour histogram, and in the
 browser use case the key ships to the visitor.
@@ -16,7 +19,7 @@ browser use case the key ships to the visitor.
 
 ```sh
 npm install
-npm test            # PngSuite round trips, conversion, CLI, browser reveal (fake DOM)
+npm test            # PngSuite and JPEG round trips, conversion, CLI, browser reveal (fake DOM)
 npm run serve       # builds dist/ and starts http://127.0.0.1:8080
 ```
 
@@ -30,11 +33,12 @@ npm run serve       # builds dist/ and starts http://127.0.0.1:8080
 
 ```sh
 export PIXMIX_KEY='site-key'                  # or -k / --key-file
-pixmix encode photos/*.jpg -o scrambled/      # photo.jpg -> scrambled/photo.scrambled.png
+pixmix encode photos/*.jpg -o scrambled/      # photo.jpg -> scrambled/photo.scrambled.jpg (lossless)
 pixmix encode logo.png --mode block --block 16
-pixmix decode scrambled/photo.scrambled.png   # -> scrambled/photo.png
-pixmix rekey --in-place --to-file new.key scrambled/*.png
-pixmix inspect photo.jpg scrambled/photo.scrambled.png
+pixmix encode shot.png --format jpeg --quality 85
+pixmix decode scrambled/photo.scrambled.jpg   # -> scrambled/photo.jpg
+pixmix rekey --in-place --to-file new.key scrambled/*
+pixmix inspect photo.jpg scrambled/photo.scrambled.jpg
 cat in.webp | pixmix encode -o - - > out.png  # stdin/stdout
 ```
 
@@ -62,21 +66,28 @@ The decoder bundle contains no encoding code; the encoder bundle has no DOM code
 ```js
 import { encode, rekey, inspect } from './dist/pixmix-encoder.mjs';
 
-const scrambled = encode(pngBytes, { key: 'site-key' });                     // pixel mode
-const tiles     = encode(jpegBytes, { key: 'site-key', mode: 'block', block: 16 });
-const rotated   = rekey(scrambled, { from: 'site-key', to: 'new-key' });      // lossless
-inspect(scrambled); // { width, height, scrambled: true, mode, block, chunks: [...] }
+const scrambled = encode(pngBytes, { key: 'site-key' });                      // PNG, pixel mode
+const tiles     = encode(pngBytes, { key: 'site-key', mode: 'block', block: 16 });
+const photo     = encode(jpegBytes, { key: 'site-key' });                      // JPEG, lossless
+const asJpeg    = encode(gifBytes, { key: 'site-key', format: 'jpeg', quality: 85 });
+const rotated   = rekey(scrambled, { from: 'site-key', to: 'new-key' });       // lossless
+inspect(scrambled); // { format, width, height, scrambled: true, mode, … }
 ```
 
 Options:
 - `key`: string or `Uint8Array`.
-- `mode`: `pixel` or `block`.
-- `block`: tile size, 2–4096.
-- `level`: zlib level.
-- `format`: output format, default `png`, currently the only one.
+- `format`: `png` or `jpeg`. The default is the input's own format when pixmix can write
+  it, otherwise PNG. So JPEG stays JPEG and GIF/WebP/AVIF become PNG.
+- `mode`, `block`: PNG only. `pixel`, or `block` with a tile size of 2–4096.
+- `level`: PNG only, the zlib level.
+- `transforms`: JPEG only, default `true`. Also flips and rotates each MCU, still lossless.
+- `quality`, `subsampling`, `background`: only when converting to JPEG from another format.
+  Defaults are 90, `4:2:0` (or `4:2:2` / `4:4:4`), and `#ffffff` as the colour transparency
+  is flattened onto.
+- `keepThumbnails`: default `false`. See "Embedded previews" below.
 - `decoders`: extra input decoders.
 - `onConvert(report)`: reports how the input was decoded and what metadata was kept or
-  dropped.
+  dropped: `{ format, from, decoder, transferred, dropped }`.
 
 `encode` is synchronous and handles PNG, JPEG and GIF on its own. Use `encodeAsync` with a
 decoder plugin for everything else:
@@ -93,41 +104,65 @@ const out = await encodeAsync(webpBytes, {
 ```
 
 In browsers, `browserDecoder()` uses the browser's own decoders (WebP, AVIF, BMP, …).
-`convert` / `convertAsync` turn any input into a plain, unscrambled PNG.
+`convert` / `convertAsync` produce the plain, unscrambled file the encoder would scramble.
+
+### Embedded previews
+
+Several places inside an image file can hold a small copy of the picture, and that copy
+would show the unscrambled image to anyone who looks:
+- EXIF IFD1 thumbnails (JPEG and PNG);
+- JFIF and JFXX thumbnails;
+- Photoshop thumbnail resources;
+- MPF secondary images, motion-photo video and anything else after the JPEG's end marker.
+
+The encoder removes all of these by default and lists them under `dropped`. EXIF
+thumbnails are zeroed in place so every other EXIF offset stays valid. Pass
+`keepThumbnails: true` to keep them (trailing data after the end marker can't be kept
+either way).
 
 ### Input formats and metadata
 
+When the input and output formats match (PNG → PNG, JPEG → JPEG) nothing is decoded or
+re-encoded: the scramble is lossless and the metadata is kept byte for byte. Otherwise the
+input is decoded to pixels and re-encoded:
+
 | Input | Decoder | Metadata source |
 | --- | --- | --- |
-| PNG | none (lossless path, every chunk kept byte for byte) | the PNG itself |
+| PNG | built-in | pixmix's PNG reader |
 | JPEG | built-in (jpeg-js) | pixmix's JPEG reader |
 | GIF | built-in (omggif), first frame | – |
 | WebP | `sharpDecoder` / `browserDecoder` | pixmix's WebP reader |
 | AVIF, HEIC, TIFF | `sharpDecoder` / `browserDecoder` | sharp |
 
-Where each kind of metadata ends up in the PNG:
-- EXIF → `eXIf`
-- ICC → `iCCP`
-- XMP → `iTXt XML:com.adobe.xmp`
-- JFIF density (or the density sharp reports) → `pHYs`
-- JPEG comments → `tEXt Comment`
+Where each kind of metadata ends up:
+
+| Metadata | PNG | JPEG |
+| --- | --- | --- |
+| EXIF | `eXIf` | APP1 `Exif` |
+| ICC profile | `iCCP` | APP2 `ICC_PROFILE`, split across segments |
+| XMP | `iTXt XML:com.adobe.xmp` | APP1 XMP |
+| Density | `pHYs` | JFIF APP0 |
+| Comments | `tEXt Comment` | COM |
 
 The pixels stay exactly as stored. They aren't rotated (the EXIF orientation travels with
 the EXIF) and aren't converted to sRGB (the ICC profile travels with the image).
 
 Some things are dropped, and the report says so:
 - animation frames after the first;
-- CMYK and other non-RGB/grey profiles (PNG can't hold them);
-- JPEG extended XMP;
-- precision above 8 bits from plugin decoders.
+- CMYK and other non-RGB/grey profiles;
+- extended XMP;
+- precision above 8 bits;
+- PNG text chunks other than comments, and gamma without an ICC profile, when writing JPEG;
+- transparency when writing JPEG (flattened onto `background`).
 
-The PNG gets the smallest colour type that loses nothing: grey, palette (1–8 bit), RGB or
-RGBA. Palette output also compresses far better once the pixels are scrambled.
+A PNG gets the smallest colour type that loses nothing: grey, palette (1–8 bit), RGB or
+RGBA. Palette output also compresses far better once the pixels are scrambled. A JPEG is
+written as a single component when the image is grey.
 
 ## Decoder (websites)
 
 ```html
-<img data-pixmix src="/img/photo.png" alt="…">
+<img data-pixmix src="/img/photo.jpg" alt="…">     <!-- PNG or JPEG -->
 <script src="pixmix-decoder.min.js" data-key="site-key" data-effect="dissolve"></script>
 ```
 
@@ -136,19 +171,25 @@ Or from code:
 ```js
 PixMix.revealAll({ key: 'site-key', effect: 'blocks', duration: 1500 });
 await PixMix.reveal(imgElement, { key, effect: 'scan', onProgress: (p) => … });
-const png = await PixMix.decodeAsync(bytes, { key });   // just the bytes
+const original = await PixMix.decodeAsync(bytes, { key });   // just the bytes
 ```
 
-- Effects: `dissolve`, `scan`, `blocks` (tiles fly home; block mode only, otherwise it falls
-  back to dissolve), `none`. `prefers-reduced-motion` forces `none`.
+- Effects:
+  - `dissolve`, `scan`.
+  - `blocks`: tiles fly home. For JPEG, flipped or rotated MCUs spin and turn back over
+    as they go. It works with PNG block mode and all JPEGs up to 12,000 tiles; otherwise
+    it falls back to `dissolve`.
+  - `none`.
+  - `prefers-reduced-motion` forces `none`.
 - Per-image overrides: `data-pixmix-key`, `data-pixmix-effect`, `data-pixmix-src` (fetch from
   here instead of `src`, e.g. to show a placeholder first).
 - EXIF orientation: the animation is drawn rotated or flipped the same way the browser will
   show the final `<img>`. Browsers differ on EXIF in PNGs, so this is detected once with a
   2×1 test image. Override it with `orientation: 'apply' | 'ignore'`.
 - `revealAll` is lazy by default: each image decodes when it scrolls into view.
-- The animation runs on a temporary canvas. Afterwards the `<img>` gets the exact restored PNG
-  as a `blob:` URL, so ICC/gamma handling, CSS, alt text and "save image" behave normally.
+- The animation runs on a temporary canvas. Afterwards the `<img>` gets the exact restored
+  file as a `blob:` URL, so ICC/gamma handling, CSS, alt text and "save image" behave
+  normally.
 - State goes in `data-pixmix-state`: `decoding` → `done` | `error`. On error the scrambled
   image stays and a warning is logged.
 - Cross-origin images need CORS, since the decoder `fetch`es the bytes.
@@ -163,13 +204,29 @@ const png = await PixMix.decodeAsync(bytes, { key });   // just the bytes
    - `pixel` mode shuffles all pixels.
    - `block` mode shuffles whole B×B tiles. The right/bottom leftover strips are shuffled
      pixel by pixel among themselves.
+   - `mcu` mode (JPEG) shuffles the grid of MCUs, then draws a transform per slot.
 3. **PNG.** Chunks are parsed and CRC-checked. The raster is inflated, unfiltered and
    de-interlaced into native samples; 16-bit, palette and 1/2/4-bit data are all kept as
    they are. Whole pixels are moved, then the raster is re-filtered, re-interlaced and
    deflated. Only `IDAT` changes. A `pmIx` chunk (ancillary, private, safe-to-copy) holding
    the version, mode, block size, salt and key check goes right before it.
+4. **JPEG.** The entropy-coded data is decoded to quantised DCT coefficients, with no IDCT.
+   Baseline, extended and progressive files are supported, along with restart markers and
+   truncated data.
+   - Whole MCUs (8×8 or 16×16, depending on chroma subsampling) are moved with all their
+     components, so colour stays attached to its brightness.
+   - The transforms are applied exactly on the coefficients: flipping negates the odd
+     frequencies, transposing swaps u and v. Square MCUs get 8 transforms; 4:2:2 (16×8)
+     gets the 4 flips.
+   - The coefficients are written back as one baseline scan with Huffman tables optimised
+     for the data, as `jpegtran -optimize` does.
+   - Nothing is requantised. APPn, COM and DQT segments and the SOF payload are copied
+     unchanged, and an APP15 `pixmix\0` segment holds the marker.
+   - Progressive input comes back as baseline with identical coefficients, so it decodes to
+     identical pixels. Restart markers are not kept.
 
-Marker v1: `u8 version | u8 mode | u16 block | u8 saltLen | salt | u8[4] check`.
+Marker v1: `u8 version | u8 mode | u16 block | u8 saltLen | salt | u8[4] check`. In `mcu`
+mode, `block` holds flags (bit 0 = transforms).
 The permutation stream is pinned by a test. Any change to it must bump the version.
 
 ### Size and speed
@@ -179,18 +236,26 @@ The permutation stream is pinned by a test. Any change to it must bump the versi
 - Block mode (8–32 px) stays close to the original size.
 - In Node, 12 MP takes about 3 s per encode or decode. Native zlib is used when available;
   browsers use `CompressionStream`/`DecompressionStream`.
-- Converting a 12 MP JPEG takes about 2.4 s with the built-in decoder and 1.2 s with sharp.
-  In both cases building the PNG is most of the time.
+- Converting a 12 MP JPEG to PNG takes about 2.4 s with the built-in decoder and 1.2 s with
+  sharp. In both cases building the PNG is most of the time.
+- JPEG → JPEG is fast and keeps the size: a 12 MP photo takes about 0.5 s to scramble and
+  0.4 s to restore, and grows about 3% (shuffled MCUs make the DC differences larger).
+  Progressive input comes out about the same size as before.
+- Converting 12 MP PNG → scrambled JPEG takes about 1.7 s (colour conversion, DCT and
+  entropy coding in JS).
 
 ## Roadmap
 
 - [x] Phase 1: PNG → PNG, keys and rekey, browser reveal with animations, bundles, dev server
 - [x] Phase 2: CLI; any input → PNG with EXIF/ICC/XMP/density carried over; decoder plugins
   (sharp, browser); EXIF orientation in the reveal
+- [x] Phase 3: JPEG output. JPEG → JPEG is scrambled losslessly in the DCT domain (MCU
+  shuffle and flips, metadata untouched); other formats → JPEG via a built-in encoder;
+  embedded previews stripped; JPEG reveal animations in the browser
+- [ ] JXL: lossless via libjxl WASM, then lossy via the JPEG-reconstruction path
 - [ ] Decode off the main thread (Web Worker) for very large images
 - [ ] 16-bit input through plugins (currently reduced to 8-bit)
-- [ ] JPEG → JPEG in the DCT domain: MCU-granular shuffle, lossless, markers untouched
-- [ ] JXL: lossless via libjxl WASM, then lossy via the JPEG-reconstruction path
+- [ ] Keep progressive JPEGs progressive (write progressive scans)
 - [ ] APNG / animated images
 
 Test images: [PngSuite](http://www.schaik.com/pngsuite/) by Willem van Schaik (see

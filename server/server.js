@@ -8,7 +8,7 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { encodeAsync, rekey, inspect, sharpDecoder, PixmixError } from '../dist/pixmix-encoder.mjs';
+import { encodeAsync, rekey, inspect, detectFormat, sharpDecoder, PixmixError } from '../dist/pixmix-encoder.mjs';
 import { decode } from '../src/decoder.js';
 
 const PORT = Number(process.env.PORT) || 8080;
@@ -16,6 +16,7 @@ const HOST = process.env.HOST || '127.0.0.1';
 const ROOT = new URL('..', import.meta.url).pathname;
 const MAX_BODY = 64 * 1024 * 1024;
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.map': 'application/json' };
+const IMAGE = { png: ['image/png', 'png'], jpeg: ['image/jpeg', 'jpg'] };
 
 // sharp is optional: with it the server also accepts WebP, AVIF, HEIC and TIFF uploads.
 const sharp = await import('sharp').then((m) => m.default, () => null);
@@ -28,24 +29,28 @@ const routes = {
   // Any supported input; the X-Pixmix-Convert header reports what happened to it.
   'POST /api/encode': async (req, q) => {
     let report;
+    const num = (k) => (q.has(k) ? Number(q.get(k)) : undefined);
     const out = await encodeAsync(await body(req), {
       key: q.get('key'),
-      mode: q.get('mode') || 'pixel',
-      block: q.has('block') ? Number(q.get('block')) : undefined,
-      level: q.has('level') ? Number(q.get('level')) : undefined,
+      mode: q.get('mode') || undefined,
+      block: num('block'),
+      level: num('level'),
       format: q.get('format') || undefined,
+      quality: num('quality'),
+      transforms: q.get('transforms') !== '0',
       decoders,
       onConvert: (r) => { report = r; },
     });
-    const { png: _, ...info } = report;
-    return { ...png(out), headers: { 'X-Pixmix-Convert': JSON.stringify(info) } };
+    const { bytes: _, ...info } = report;
+    return { ...image(out), headers: { 'X-Pixmix-Convert': JSON.stringify(info) } };
   },
-  'POST /api/decode': async (req, q) => png(decode(await body(req), { key: q.get('key') })),
-  'POST /api/rekey': async (req, q) => png(rekey(await body(req), {
+  'POST /api/decode': async (req, q) => image(decode(await body(req), { key: q.get('key') })),
+  'POST /api/rekey': async (req, q) => image(rekey(await body(req), {
     from: q.get('from'),
     to: q.get('to'),
     mode: q.get('mode') || undefined,
     block: q.has('block') ? Number(q.get('block')) : undefined,
+    transforms: q.has('transforms') ? q.get('transforms') !== '0' : undefined,
   })),
   'POST /api/inspect': async (req) => json(inspect(await body(req))),
 
@@ -56,15 +61,16 @@ const routes = {
     if (!info.scrambled) throw new PixmixError('Only scrambled images can be published', 'NOT_SCRAMBLED');
     const id = randomUUID().slice(0, 8);
     gallery.set(id, { bytes, key: q.get('key'), name: q.get('name') || id, effect: q.get('effect') || 'dissolve' });
-    return json({ id, url: `/images/${id}.png` }, 201);
+    return json({ id, url: urlFor(id, bytes) }, 201);
   },
   'GET /api/gallery': async () => json([...gallery].map(([id, g]) => ({
-    id, url: `/images/${id}.png`, key: g.key, name: g.name, effect: g.effect, ...pick(inspect(g.bytes)),
+    id, url: urlFor(id, g.bytes), key: g.key, name: g.name, effect: g.effect, ...pick(inspect(g.bytes)),
   }))),
   'DELETE /api/gallery': async () => { gallery.clear(); return json({ ok: true }); },
 };
 
-const pick = ({ width, height, mode, block }) => ({ width, height, mode, block });
+const pick = ({ format, width, height, mode, block }) => ({ format, width, height, mode, block });
+const urlFor = (id, bytes) => `/images/${id}.${IMAGE[detectFormat(bytes)][1]}`;
 
 createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
@@ -83,10 +89,10 @@ createServer(async (req, res) => {
 }).listen(PORT, HOST, () => console.log(`pixmix dev server on http://${HOST}:${PORT}${sharp ? ' (sharp: on)' : ''}`));
 
 async function staticFile(pathname) {
-  const img = pathname.match(/^\/images\/([\w-]+)\.png$/);
+  const img = pathname.match(/^\/images\/([\w-]+)\.(png|jpg)$/);
   if (img) {
     const g = gallery.get(img[1]);
-    return g ? png(g.bytes) : json({ error: 'Not found' }, 404);
+    return g ? image(g.bytes) : json({ error: 'Not found' }, 404);
   }
   if (pathname === '/') pathname = '/index.html';
   const base = pathname.startsWith('/dist/') ? ROOT : join(ROOT, 'server/public');
@@ -113,7 +119,7 @@ function body(req) {
   });
 }
 
-const png = (data) => ({ status: 200, type: 'image/png', data, cache: 'no-store' });
+const image = (data) => ({ status: 200, type: IMAGE[detectFormat(data)][0], data, cache: 'no-store' });
 const json = (obj, status = 200) => ({ status, type: 'application/json', data: JSON.stringify(obj) });
 
 function send(res, { status, type, data, cache = 'no-store', headers = {} }) {

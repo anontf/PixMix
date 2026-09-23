@@ -29,9 +29,14 @@ export function detectFormat(bytes) {
   return null;
 }
 
-/** Accepts Uint8Array (incl. Node Buffer), ArrayBuffer or any ArrayBufferView. */
+/**
+ * Accepts Uint8Array (incl. Node Buffer), ArrayBuffer or any ArrayBufferView. Always
+ * returns a plain Uint8Array: Buffer.prototype.slice returns a shared view instead of a
+ * copy, and code downstream relies on slice() copying (it must never touch the input).
+ */
 export function toBytes(input) {
-  if (input instanceof Uint8Array) return input;
+  if (input instanceof Uint8Array && Object.getPrototypeOf(input) === Uint8Array.prototype) return input;
+  if (input instanceof Uint8Array) return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
   if (input instanceof ArrayBuffer) return new Uint8Array(input);
   if (ArrayBuffer.isView(input)) return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
   throw new PixmixError('Expected image bytes (Uint8Array, Buffer or ArrayBuffer)');

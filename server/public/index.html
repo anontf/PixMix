@@ -19,10 +19,17 @@
         <select id="sampleType" aria-label="Sample format"><option value="image/png">PNG</option><option value="image/jpeg">JPEG</option><option value="image/webp">WebP</option></select></div>
     </label>
     <label>Key <input id="key" value="correct horse battery staple" size="26"></label>
-    <label>Mode
+    <label>Output
+      <select id="format"><option value="">same as input</option><option value="png">PNG</option><option value="jpeg">JPEG</option></select>
+    </label>
+    <label class="png-only">PNG mode
       <select id="mode"><option value="pixel">pixel</option><option value="block">block</option></select>
     </label>
-    <label>Block <input type="number" id="block" value="16" min="2" max="512"></label>
+    <label class="png-only">Block <input type="number" id="block" value="16" min="2" max="512"></label>
+    <label class="jpeg-only">JPEG MCUs
+      <select id="transforms"><option value="1">shuffle + flip/rotate</option><option value="0">shuffle only</option></select>
+    </label>
+    <label class="jpeg-only">Quality <input type="number" id="quality" value="90" min="1" max="100" title="only used when converting to JPEG"></label>
     <label>Encode on
       <select id="where"><option value="server">server (Node)</option><option value="browser">browser</option></select>
     </label>
@@ -63,7 +70,7 @@
 
   <div class="grid">
     <div class="card">
-      <h2>Chunks: original → scrambled</h2>
+      <h2>File structure: original → scrambled</h2>
       <div id="chunks" class="meta">–</div>
     </div>
   </div>
@@ -77,12 +84,15 @@ const $ = (id) => document.getElementById(id);
 const kib = (n) => n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KiB` : `${(n / 1048576).toFixed(2)} MiB`;
 const ms = (t) => `${t.toFixed(0)} ms`;
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => `&#${c.charCodeAt(0)};`);
-const blobUrl = (bytes, type = 'image/png') => URL.createObjectURL(new Blob([bytes], { type }));
+const TYPES = { png: 'image/png', jpeg: 'image/jpeg' };
+const EXT = { png: 'png', jpeg: 'jpg' };
+const typeOf = (bytes) => TYPES[Enc.detectFormat(bytes)] ?? '';
+const blobUrl = (bytes, type = typeOf(bytes)) => URL.createObjectURL(new Blob([bytes], { type }));
 const browserDecoders = [Enc.browserDecoder()];
 let original = null, originalName = 'sample', scrambled = null, activeKey = null;
 let reference = null; // original as PNG: the input itself, or its conversion
 
-function showImage(stageId, bytes, type) {
+function showImage(stageId, bytes, type = typeOf(bytes) || `image/${Enc.detectFormat(bytes)}`) {
   const img = new Image();
   img.src = blobUrl(bytes, type);
   $(stageId).replaceChildren(img);
@@ -94,8 +104,7 @@ async function loadOriginal(bytes, name, note = '') {
   originalName = name;
   scrambled = null;
   reference = null;
-  const format = Enc.detectFormat(bytes);
-  showImage('origStage', bytes, format ? `image/${format}` : '');
+  showImage('origStage', bytes);
   $('origSize').textContent = kib(bytes.length);
   let info;
   try {
@@ -109,8 +118,11 @@ async function loadOriginal(bytes, name, note = '') {
   if (info.width) parts.push(`${info.width}×${info.height}`);
   if (info.format === 'png') {
     parts.push(`depth ${info.bitDepth} · colour type ${info.colorType}${info.interlaced ? ' · interlaced' : ''}`);
-    if (info.scrambled) parts.push('<span class="bad">already scrambled</span>');
-  } else if (info.metadata) {
+  } else if (info.format === 'jpeg') {
+    parts.push(`${info.components} comp · MCU ${info.mcu}${info.progressive ? ' · progressive' : ''}`);
+  }
+  if (info.scrambled) parts.push('<span class="bad">already scrambled</span>');
+  if (info.format !== 'png' && info.metadata) {
     parts.push(`metadata: ${info.metadata.join(', ') || 'none'}${info.orientation > 1 ? ` · orientation ${info.orientation}` : ''}`);
   }
   $('origMeta').innerHTML = parts.join(' · ') + note;
@@ -118,7 +130,20 @@ async function loadOriginal(bytes, name, note = '') {
   for (const id of ['scrMeta', 'decMeta', 'scrSize', 'decTime', 'chunks', 'pubMeta']) $(id).textContent = '';
   $('encode').disabled = false;
   for (const id of ['replay', 'rekey', 'publish']) $(id).disabled = true;
+  syncOptions();
 }
+
+// The output format decides which options apply: PNG modes vs JPEG MCU options.
+function outputFormat() {
+  const from = original ? Enc.detectFormat(original) : 'png';
+  return $('format').value || (Enc.OUTPUT_FORMATS.includes(from) ? from : 'png');
+}
+function syncOptions() {
+  const jpeg = outputFormat() === 'jpeg';
+  for (const el of document.querySelectorAll('.png-only')) el.hidden = jpeg;
+  for (const el of document.querySelectorAll('.jpeg-only')) el.hidden = !jpeg;
+}
+$('format').addEventListener('change', syncOptions);
 
 $('file').addEventListener('change', async (e) => {
   const file = e.target.files[0];
@@ -154,10 +179,18 @@ async function serverCall(path, params, bytes) {
 }
 
 function encodeOpts() {
-  const o = { key: $('key').value, mode: $('mode').value };
-  if (o.mode === 'block') o.block = Number($('block').value);
+  const o = { key: $('key').value, format: outputFormat() };
+  if (o.format === 'png') {
+    o.mode = $('mode').value;
+    if (o.mode === 'block') o.block = Number($('block').value);
+  } else {
+    o.transforms = $('transforms').value === '1';
+    o.quality = Number($('quality').value);
+  }
   return o;
 }
+// Query-string form for the server (booleans as 0/1).
+const toQuery = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, typeof v === 'boolean' ? Number(v) : v]));
 
 $('encode').addEventListener('click', async () => {
   const opts = encodeOpts();
@@ -166,15 +199,13 @@ $('encode').addEventListener('click', async () => {
   let report;
   try {
     if (where === 'server') {
-      ({ bytes: scrambled, report } = await serverCall('/api/encode', opts, original));
+      ({ bytes: scrambled, report } = await serverCall('/api/encode', toQuery(opts), original));
     } else {
       scrambled = await Enc.encodeAsync(original, { ...opts, decoders: browserDecoders, onConvert: (r) => { report = r; } });
-      reference = report.png;
     }
-    // Reference for verification: the PNG input itself, or a browser-side conversion of it.
-    reference ??= Enc.detectFormat(original) === 'png'
-      ? original
-      : (await Enc.convertAsync(original, { decoders: browserDecoders })).png;
+    // Reference for verification: the input as the encoder saw it before scrambling
+    // (sanitised, or converted), recomputed in the browser.
+    reference = report?.bytes ?? (await Enc.convertAsync(original, { ...opts, decoders: browserDecoders })).bytes;
   } catch (err) {
     $('scrMeta').innerHTML = `<span class="bad">${esc(err.message)}</span>`;
     return;
@@ -185,20 +216,24 @@ $('encode').addEventListener('click', async () => {
 });
 
 function describe(report) {
-  if (!report || report.from === 'png') return '';
-  const bits = [`converted from <b>${report.from}</b> via ${report.decoder}`];
-  bits.push(`kept: ${report.transferred.length ? report.transferred.join(', ') : 'no metadata'}`);
+  if (!report) return '';
+  const bits = [];
+  if (report.decoder !== 'none') {
+    bits.push(`converted <b>${report.from} → ${report.format}</b> via ${report.decoder}`);
+    bits.push(`kept: ${report.transferred.length ? report.transferred.join(', ') : 'no metadata'}`);
+  }
   if (report.dropped.length) bits.push(`<span class="bad">dropped: ${esc(report.dropped.join(', '))}</span>`);
-  return `<br>${bits.join(' · ')}`;
+  return bits.length ? `<br>${bits.join(' · ')}` : '';
 }
 
 function showScrambled(note, report) {
   showImage('scrStage', scrambled);
   const info = Enc.inspect(scrambled);
   $('scrSize').textContent = `${kib(scrambled.length)} (${(scrambled.length / original.length).toFixed(2)}×)`;
-  $('scrMeta').innerHTML = `${note} · mode <b>${info.mode}${info.block ? ` ${info.block}px` : ''}</b> · ` +
-    `<a download="scrambled.png" href="${blobUrl(scrambled)}">download</a>${describe(report)}`;
-  renderChunks(Enc.inspect(reference).chunks, info.chunks, Enc.detectFormat(original) !== 'png');
+  const mode = info.format === 'jpeg' ? `mcu ${info.mcu}${info.transforms ? ' + flips' : ''}` : `${info.mode}${info.block ? ` ${info.block}px` : ''}`;
+  $('scrMeta').innerHTML = `${note} · <b>${info.format.toUpperCase()}</b> · mode <b>${mode}</b> · ` +
+    `<a download="scrambled.${EXT[info.format]}" href="${blobUrl(scrambled)}">download</a>${describe(report)}`;
+  renderChunks(structure(reference), structure(scrambled), Enc.detectFormat(original) !== info.format);
   for (const id of ['replay', 'rekey', 'publish']) $(id).disabled = false;
 }
 
@@ -228,7 +263,7 @@ async function runDecode() {
 }
 
 async function rgba(bytes) {
-  const bmp = await createImageBitmap(new Blob([bytes], { type: 'image/png' }), {
+  const bmp = await createImageBitmap(new Blob([bytes], { type: typeOf(bytes) }), {
     premultiplyAlpha: 'none', colorSpaceConversion: 'none', imageOrientation: 'none',
   });
   const c = new OffscreenCanvas(bmp.width, bmp.height);
@@ -246,22 +281,26 @@ async function verify() {
     const d = Math.abs(a[i] - b[i]);
     if (d) { diff++; if (d > maxDelta) maxDelta = d; }
   }
-  const meta = (png) => JSON.stringify(Enc.inspect(png).chunks.filter((c) => c.type !== 'IDAT' && c.type !== 'pmIx'));
+  const meta = (b) => JSON.stringify(structure(b).filter((c) => !CODING.has(c.type) && !/^SOF/.test(c.type)));
   const sameMeta = meta(reference) === meta(restored);
   const vs = Enc.detectFormat(original) === 'png' ? 'original' : 'browser-side conversion of the original';
   const pixelsLine = a.length !== b.length ? '<span class="bad">✗ size differs</span>'
     : diff === 0 ? `<span class="ok">✓ pixel-identical to the ${vs}</span>`
     : `<span class="bad">≈ ${diff} samples differ (max Δ ${maxDelta}) from the ${vs}: server and browser decoded the lossy source differently</span>`;
   return `${pixelsLine} · ${sameMeta ? '<span class="ok">✓ metadata chunks identical</span>' : '<span class="bad">✗ chunks differ</span>'}` +
-    ` · restored ${kib(restored.length)} · <a download="restored.png" href="${blobUrl(restored)}">download</a>`;
+    ` · restored ${kib(restored.length)} · <a download="restored.${EXT[Enc.detectFormat(restored)]}" href="${blobUrl(restored)}">download</a>`;
 }
+
+// PNG chunks or JPEG segments; image data and pixmix markers are the "coding" parts.
+const CODING = new Set(['IDAT', 'pmIx', 'DHT', 'SOS', 'DRI', 'APP15']);
+const structure = (b) => { const i = Enc.inspect(b); return i.chunks ?? i.segments; };
 
 function renderChunks(before, after, converted) {
   const fmt = (list) => {
     const out = [];
     for (const c of list) {
       const last = out.at(-1);
-      if (last && last.type === c.type && c.type === 'IDAT') { last.n++; last.length += c.length; }
+      if (last && last.type === c.type && (c.type === 'IDAT' || c.type === 'APP2')) { last.n++; last.length += c.length; }
       else out.push({ ...c, n: 1 });
     }
     return out;
@@ -269,14 +308,15 @@ function renderChunks(before, after, converted) {
   const a = fmt(before), b = fmt(after);
   const rows = [];
   for (let i = 0, j = 0; i < a.length || j < b.length;) {
-    if (b[j]?.type === 'pmIx') { rows.push([null, b[j], true]); j++; continue; }
+    if (b[j]?.type === 'pmIx' || (b[j]?.type === 'APP15' && a[i]?.type !== 'APP15')) { rows.push([null, b[j], true]); j++; continue; }
     rows.push([a[i], b[j], false]); i++; j++;
   }
   const cell = (c) => c ? `${c.type}${c.n > 1 ? ` ×${c.n}` : ''}</td><td>${c.length.toLocaleString()} B` : '</td><td>';
   $('chunks').innerHTML = `<table><tr><th>${converted ? 'converted' : 'original'}</th><th>size</th><th>scrambled</th><th>size</th></tr>` +
     rows.map(([x, y, added]) => `<tr class="${added ? 'added' : ''}"><td>${cell(x)}</td><td>${cell(y)}</td></tr>`).join('') +
-    `</table><p>Every chunk except IDAT is copied byte for byte; <b>pmIx</b> carries the version, mode and salt.` +
-    `${converted ? ' The left column is the input after conversion to PNG, with its metadata mapped to PNG chunks.' : ''}</p>`;
+    `</table><p>Everything except the image data (PNG <b>IDAT</b>; JPEG <b>DHT</b>/<b>SOS</b>, re-entropy-coded) is copied byte for byte. ` +
+    `The marker (<b>pmIx</b> / <b>APP15</b>) carries the version, mode and salt.` +
+    `${converted ? ' The left column is the input after conversion, with its metadata mapped to the new format.' : ''}</p>`;
 }
 
 $('replay').addEventListener('click', runDecode);
@@ -284,11 +324,14 @@ $('replay').addEventListener('click', runDecode);
 $('rekey').addEventListener('click', async () => {
   const to = $('newKey').value;
   if (!to) return $('newKey').focus();
-  const opts = { from: activeKey, to, mode: $('mode').value };
-  if (opts.mode === 'block') opts.block = Number($('block').value);
+  const opts = { from: activeKey, to };
+  if (Enc.detectFormat(scrambled) === 'png') {
+    opts.mode = $('mode').value;
+    if (opts.mode === 'block') opts.block = Number($('block').value);
+  } else opts.transforms = $('transforms').value === '1';
   const t0 = performance.now();
   try {
-    scrambled = $('where').value === 'server' ? (await serverCall('/api/rekey', opts, scrambled)).bytes : Enc.rekey(scrambled, opts);
+    scrambled = $('where').value === 'server' ? (await serverCall('/api/rekey', toQuery(opts), scrambled)).bytes : Enc.rekey(scrambled, opts);
   } catch (err) {
     $('scrMeta').innerHTML = `<span class="bad">${esc(err.message)}</span>`;
     return;

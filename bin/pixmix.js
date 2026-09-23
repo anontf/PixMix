@@ -4,11 +4,12 @@
 import { parseArgs } from 'node:util';
 import { readFile, writeFile, rename, mkdir, stat } from 'node:fs/promises';
 import { basename, dirname, extname, join } from 'node:path';
-import { encodeAsync, decode, rekey, inspect, PixmixError } from '../src/index.js';
+import { encodeAsync, decode, rekey, inspect, detectFormat, PixmixError } from '../src/index.js';
+import { targetFormat } from '../src/convert/index.js';
 import { sharpDecoder } from '../src/plugins/sharp.js';
 
 const USAGE = `Usage:
-  pixmix encode  <file...> [options]   scramble images (any supported input -> PNG)
+  pixmix encode  <file...> [options]   scramble images (any supported input -> PNG or JPEG)
   pixmix decode  <file...> [options]   restore scrambled images
   pixmix rekey   <file...> [options]   change the key (and optionally the mode) losslessly
   pixmix inspect <file...> [--json]    show format, size, metadata and scramble info
@@ -20,10 +21,15 @@ Keys (prefer the file or environment forms; -k ends up in shell history):
 
 Options:
   -o, --out <path>         output file, directory, or "-" for stdout (single input)
-  --mode <pixel|block>     scramble mode (default pixel)
-  --block <n>              tile size in block mode (default 8)
-  --format <png>           output format (default png)
-  --level <0-9>            zlib level
+  --format <png|jpeg>      output format (default: same as the input when possible, else png)
+  --mode <pixel|block>     PNG scramble mode (default pixel); JPEG always shuffles MCUs
+  --block <n>              PNG tile size in block mode (default 8)
+  --no-transforms          JPEG: shuffle MCUs only, without flipping/rotating them
+  --quality <1-100>        JPEG quality when converting to JPEG (default 90)
+  --subsampling <s>        JPEG chroma subsampling when converting: 4:2:0 (default), 4:2:2, 4:4:4
+  --background <#rrggbb>   JPEG: colour transparency is flattened onto (default #ffffff)
+  --keep-thumbnails        keep embedded previews (they show the UNSCRAMBLED image)
+  --level <0-9>            zlib level for PNG output
   --in-place               rekey: overwrite the input
   -f, --force              overwrite existing outputs
   --no-sharp               do not use sharp even if installed
@@ -32,9 +38,9 @@ Options:
   -h, --help
 
 Input "-" reads stdin. Without -o, outputs go next to the input:
-  photo.jpg -> photo.scrambled.png   (encode)
-  photo.scrambled.png -> photo.png   (decode)
-  photo.scrambled.png -> photo.scrambled.rekeyed.png (rekey, unless --in-place)`;
+  photo.jpg -> photo.scrambled.jpg   (encode; .png with --format png)
+  photo.scrambled.jpg -> photo.jpg   (decode)
+  photo.scrambled.jpg -> photo.scrambled.rekeyed.jpg (rekey, unless --in-place)`;
 
 const OPTIONS = {
   key: { type: 'string', short: 'k' },
@@ -46,6 +52,11 @@ const OPTIONS = {
   block: { type: 'string' },
   format: { type: 'string' },
   level: { type: 'string' },
+  quality: { type: 'string' },
+  subsampling: { type: 'string' },
+  background: { type: 'string' },
+  'no-transforms': { type: 'boolean' },
+  'keep-thumbnails': { type: 'boolean' },
   'in-place': { type: 'boolean' },
   force: { type: 'boolean', short: 'f' },
   'no-sharp': { type: 'boolean' },
@@ -82,7 +93,7 @@ async function main(argv) {
   for (const file of files) {
     try {
       const input = file === '-' ? await readStdin() : await readFile(file);
-      const target = outputPath(command, file, o, outDir);
+      const target = outputPath(command, file, o, outDir, outputFormat(command, input, opts));
       if (target !== '-' && !o.force && !(command === 'rekey' && o['in-place']) && (await exists(target))) {
         throw new PixmixError(`${target} exists (use --force to overwrite)`, 'EXISTS');
       }
@@ -102,7 +113,12 @@ async function commandOptions(command, o) {
   if (o.mode) opts.mode = o.mode;
   if (o.block) opts.block = int(o.block, '--block');
   if (o.level) opts.level = int(o.level, '--level');
-  if (o.format) opts.format = o.format;
+  if (o.format) opts.format = o.format === 'jpg' ? 'jpeg' : o.format;
+  if (o.quality) opts.quality = int(o.quality, '--quality');
+  if (o.subsampling) opts.subsampling = o.subsampling;
+  if (o.background) opts.background = o.background;
+  if (o['no-transforms']) opts.transforms = false;
+  if (o['keep-thumbnails']) opts.keepThumbnails = true;
   if (command === 'rekey') {
     opts.from = await keyFrom(o.key, o['key-file'], 'PIXMIX_KEY', 'old key (-k, --key-file or $PIXMIX_KEY)');
     opts.to = await keyFrom(o.to, o['to-file'], 'PIXMIX_NEW_KEY', 'new key (--to, --to-file or $PIXMIX_NEW_KEY)');
@@ -125,8 +141,10 @@ async function run(command, input, opts) {
   let report;
   const bytes = await encodeAsync(input, { ...opts, onConvert: (r) => { report = r; } });
   const bits = [];
-  if (report.from !== 'png') bits.push(`${report.from} via ${report.decoder}`);
-  if (report.from !== 'png' && report.transferred.length) bits.push(`kept ${report.transferred.join(', ')}`);
+  if (report.decoder !== 'none') {
+    bits.push(`${report.from} -> ${report.format} via ${report.decoder}`);
+    if (report.transferred.length) bits.push(`kept ${report.transferred.join(', ')}`);
+  }
   if (report.dropped.length) bits.push(`dropped ${report.dropped.join(', ')}`);
   return { bytes, note: bits.join('; ') };
 }
@@ -152,18 +170,27 @@ async function runInspect(files, o) {
   return failed ? 1 : 0;
 }
 
-function outputPath(command, file, o, outDir) {
+const EXT = { png: 'png', jpeg: 'jpg' };
+
+function outputFormat(command, input, opts) {
+  const from = detectFormat(input);
+  if (!from) throw new PixmixError('Unrecognised image format', 'UNSUPPORTED');
+  return command === 'encode' ? targetFormat(from, opts.format) : from;
+}
+
+function outputPath(command, file, o, outDir, format) {
   if (o.out === '-') return '-';
   if (command === 'rekey' && o['in-place']) {
     if (file === '-') throw new PixmixError('--in-place cannot be used with stdin');
     return file;
   }
   if (o.out && !outDir) return o.out;
-  const name = file === '-' ? 'stdin.png' : basename(file);
+  const name = file === '-' ? 'stdin' : basename(file);
   const stem = name.slice(0, name.length - extname(name).length);
-  const out = command === 'encode' ? `${stem}.scrambled.png`
-    : command === 'decode' ? `${stem.replace(/\.scrambled$/, '') || stem}${stem.endsWith('.scrambled') ? '' : '.restored'}.png`
-    : `${stem}.rekeyed.png`;
+  const ext = EXT[format] ?? format;
+  const out = command === 'encode' ? `${stem}.scrambled.${ext}`
+    : command === 'decode' ? `${stem.replace(/\.scrambled$/, '') || stem}${stem.endsWith('.scrambled') ? '' : '.restored'}.${ext}`
+    : `${stem}.rekeyed.${ext}`;
   return join(outDir ?? (file === '-' ? '.' : dirname(file)), out);
 }
 

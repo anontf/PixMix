@@ -2,9 +2,11 @@
 
 import { pick, toBytes, detectFormat } from './formats/index.js';
 import { unscramblePng, inspectPng } from './formats/png/index.js';
+import { unscrambleJpeg, inspectJpeg } from './formats/jpeg/index.js';
 
 const DECODERS = {
   png: { unscramble: unscramblePng, inspect: inspectPng },
+  jpeg: { unscramble: unscrambleJpeg, inspect: inspectJpeg },
 };
 
 export { detectFormat };

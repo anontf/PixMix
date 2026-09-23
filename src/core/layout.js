@@ -114,3 +114,30 @@ export function applyMap(src, map, bpp, direction) {
   }
   return dst;
 }
+
+/**
+ * Permutation of a grid of units (JPEG MCUs), plus an optional per-slot transform code
+ * drawn after the permutation: bit 0 = flip X, bit 1 = flip Y, bit 2 = transpose
+ * (applied first). `transformCount` is 1 (none), 4 (flips) or 8 (flips + transposes).
+ * @returns {{perm: Uint32Array, transforms: Uint8Array|null, check: Uint8Array}}
+ *          perm[slot] = original unit index shown in that slot
+ */
+export function computeGridLayout(key, params, cols, rows, transformCount = 1) {
+  const { rngKey, nonce, check } = deriveSeed(key, params, cols, rows);
+  const rng = new ChaChaRng(rngKey, nonce);
+  const perm = new Uint32Array(cols * rows);
+  for (let i = 0; i < perm.length; i++) perm[i] = i;
+  shuffle(perm, rng);
+  let transforms = null;
+  if (transformCount > 1) {
+    transforms = new Uint8Array(perm.length);
+    for (let i = 0; i < perm.length; i++) transforms[i] = rng.below(transformCount);
+  }
+  return { perm, transforms, check };
+}
+
+/** Inverse of a transform code (flip X/Y swap roles when a transpose is involved). */
+export function invertTransform(t) {
+  const fx = t & 1, fy = (t >> 1) & 1;
+  return t & 4 && fx !== fy ? 4 | (fy) | (fx << 1) : t;
+}

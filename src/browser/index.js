@@ -1,15 +1,16 @@
 // Browser decoder: restores scrambled images on a page, with an optional animation.
 //
-//   <img data-pixmix src="/img/cat.scrambled.png">
+//   <img data-pixmix src="/img/cat.scrambled.png">   (PNG or JPEG)
 //   PixMix.revealAll({ key: 'site-key', effect: 'dissolve' })
 //
 // The animation runs on a canvas that temporarily replaces the <img>. At the end the
-// <img> gets the exactly restored PNG (as a blob: URL), so colour management, ICC
+// <img> gets the exactly restored file (as a blob: URL), so colour management, ICC
 // profiles, alt text, CSS and right-click "save image" all behave as usual.
 
 import { decode, inspect, detectFormat, PixmixError, WrongKeyError } from '../decoder.js';
 import { unscramblePngDetailedAsync } from '../formats/png/index.js';
-import { toRGBA8 } from './rgba.js';
+import { unscrambleJpegDetailed } from '../formats/jpeg/index.js';
+import { toRGBA8 } from '../formats/png/rgba.js';
 import { readOrientation } from '../meta/exif.js';
 import { orientationTransform, swapsAxes, browserHonoursPngOrientation } from './orient.js';
 
@@ -17,18 +18,20 @@ export { decode, inspect, detectFormat, PixmixError, WrongKeyError };
 
 export const EFFECTS = ['dissolve', 'scan', 'blocks', 'none'];
 const MAX_ANIMATED_TILES = 12000;
+const TYPES = { png: 'image/png', jpeg: 'image/jpeg' };
 
-/** Like decode(), but uses the browser's native zlib streams; much faster on big images. */
+/** Like decode(), but uses the browser's native zlib streams for PNG; faster on big images. */
 export async function decodeAsync(input, { key } = {}) {
   const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
-  if (detectFormat(bytes) !== 'png') throw new PixmixError('Only PNG is supported so far', 'UNSUPPORTED');
-  return (await unscramblePngDetailedAsync(bytes, { key })).toPng();
+  const format = detectFormat(bytes);
+  if (format === 'png') return (await unscramblePngDetailedAsync(bytes, { key })).toPng();
+  return decode(bytes, { key });
 }
 
 /** Fetches and decodes to a blob: URL. */
 export async function decodeToURL(url, { key, fetchOptions } = {}) {
   const bytes = await fetchBytes(url, fetchOptions);
-  return URL.createObjectURL(new Blob([await decodeAsync(bytes, { key })], { type: 'image/png' }));
+  return URL.createObjectURL(new Blob([await decodeAsync(bytes, { key })], { type: TYPES[detectFormat(bytes)] }));
 }
 
 /**
@@ -38,7 +41,7 @@ export async function decodeToURL(url, { key, fetchOptions } = {}) {
  * @param {string|Uint8Array} opts.key
  * @param {'dissolve'|'scan'|'blocks'|'none'} [opts.effect='dissolve']
  * @param {number} [opts.duration=1200] ms
- * @param {'image'|'canvas'} [opts.final='image'] keep the <img> (exact PNG) or the canvas
+ * @param {'image'|'canvas'} [opts.final='image'] keep the <img> (exact file) or the canvas
  * @param {string} [opts.src] defaults to data-pixmix-src, then the image's own src
  * @param {(p: number) => void} [opts.onProgress]
  * @param {RequestInit} [opts.fetchOptions]
@@ -63,12 +66,10 @@ export async function reveal(img, opts = {}) {
   img.dataset.pixmixState = 'decoding';
   try {
     const bytes = await fetchBytes(url, fetchOptions);
-    if (detectFormat(bytes) !== 'png') throw new PixmixError('Only PNG is supported so far', 'UNSUPPORTED');
-    const d = await unscramblePngDetailedAsync(bytes, { key });
+    const job = await prepare(bytes, key, orientation, effect !== 'none');
 
     if (effect !== 'none') {
-      const { width, height } = d.layout;
-      const o = await effectiveOrientation(d.img, orientation);
+      const { width, height, o } = job;
       const canvas = document.createElement('canvas');
       canvas.width = swapsAxes(o) ? height : width;
       canvas.height = swapsAxes(o) ? width : height;
@@ -96,17 +97,17 @@ export async function reveal(img, opts = {}) {
       const prevDisplay = img.style.display;
       img.before(canvas);
       img.style.display = 'none';
-      await animate(work, d, toRGBA8(d.img, d.img.pixels), { effect, duration, onProgress, present });
+      await job.animate(work, { effect, duration, onProgress, present });
       if (final === 'canvas') {
         img.remove();
         canvas.dataset.pixmixState = 'done';
         return canvas;
       }
-      await setImageSource(img, await d.toPng());
+      await setImageSource(img, await job.restored(), job.type);
       img.style.display = prevDisplay;
       canvas.remove();
     } else {
-      await setImageSource(img, await d.toPng());
+      await setImageSource(img, await job.restored(), job.type);
       onProgress?.(1);
     }
     img.dataset.pixmixState = 'done';
@@ -115,6 +116,45 @@ export async function reveal(img, opts = {}) {
     img.dataset.pixmixState = 'error';
     throw err;
   }
+}
+
+/**
+ * Decodes and sets up the format-specific animation.
+ * @returns {Promise<{width: number, height: number, o: number, type: string,
+ *   restored: () => Promise<Uint8Array>|Uint8Array, animate: Function}>}
+ */
+async function prepare(bytes, key, orientation, animated) {
+  const format = detectFormat(bytes);
+  if (format === 'png') {
+    const d = await unscramblePngDetailedAsync(bytes, { key });
+    const exif = d.img.chunks.find((c) => c.type === 'eXIf');
+    const o = await effectiveOrientation(exif?.data, orientation, browserHonoursPngOrientation);
+    return {
+      width: d.layout.width,
+      height: d.layout.height,
+      o,
+      type: TYPES.png,
+      restored: d.toPng,
+      animate: (work, opts) => animate(work, d, toRGBA8(d.img, d.img.pixels), opts),
+    };
+  }
+  if (format === 'jpeg') {
+    const d = unscrambleJpegDetailed(bytes, { key });
+    const restored = d.toJpeg();
+    const { width, height } = d.layout;
+    const app1 = d.segments.find((s) => s.marker === 0xe1 && s.data[0] === 0x45 && s.data[4] === 0 && s.data[5] === 0);
+    let o = await effectiveOrientation(app1?.data.subarray(6), orientation, async () => true);
+    if (!animated) return { width, height, o, type: TYPES.jpeg, restored: () => restored };
+    // Browsers decode JPEGs already oriented; undo that to get the stored pixel grid.
+    const [orig, scr] = await Promise.all([loadImage(restored, TYPES.jpeg), loadImage(bytes, TYPES.jpeg)]);
+    if (swapsAxes(o) && orig.naturalWidth === width) o = 1; // this browser did not apply it
+    return {
+      width, height, o, type: TYPES.jpeg,
+      restored: () => restored,
+      animate: (work, opts) => animateJpeg(work, d.layout, toRaw(scr, width, height, o), toRaw(orig, width, height, o), opts),
+    };
+  }
+  throw new PixmixError(`${format ? format.toUpperCase() : 'This format'} cannot be revealed`, 'UNSUPPORTED');
 }
 
 /**
@@ -142,12 +182,11 @@ export function revealAll({ selector = 'img[data-pixmix]', root = document, lazy
   })));
 }
 
-async function effectiveOrientation(img, mode) {
+async function effectiveOrientation(exif, mode, browserHonours) {
   if (mode === 'ignore') return 1;
-  const exif = img.chunks.find((c) => c.type === 'eXIf');
-  const o = exif ? readOrientation(exif.data) : 1;
+  const o = exif ? readOrientation(exif) : 1;
   if (o === 1 || mode === 'apply') return o;
-  return (await browserHonoursPngOrientation()) ? o : 1;
+  return (await browserHonours()) ? o : 1;
 }
 
 async function fetchBytes(url, fetchOptions) {
@@ -156,14 +195,42 @@ async function fetchBytes(url, fetchOptions) {
   return new Uint8Array(await res.arrayBuffer());
 }
 
-function setImageSource(img, pngBytes) {
-  const url = URL.createObjectURL(new Blob([pngBytes], { type: 'image/png' }));
+function setImageSource(img, bytes, type) {
+  const url = URL.createObjectURL(new Blob([bytes], { type }));
   return new Promise((resolve, reject) => {
     img.addEventListener('load', () => resolve(), { once: true });
     img.addEventListener('error', () => reject(new PixmixError('Browser failed to display restored image')), { once: true });
     img.removeAttribute('srcset');
     img.src = url;
   });
+}
+
+async function loadImage(bytes, type) {
+  const url = URL.createObjectURL(new Blob([bytes], { type }));
+  const im = new Image();
+  im.src = url;
+  try {
+    await im.decode();
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+  return im;
+}
+
+/** Draws a (browser-oriented) image back onto the stored w x h pixel grid. */
+function toRaw(im, w, h, o) {
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  const ctx = c.getContext('2d');
+  if (o !== 1) ctx.setTransform(...invertAffine(orientationTransform(o, w, h)));
+  ctx.drawImage(im, 0, 0);
+  return c;
+}
+
+function invertAffine([a, b, c, d, e, f]) {
+  const det = a * d - b * c;
+  return [d / det, -b / det, -c / det, a / det, (c * f - d * e) / det, (b * e - a * f) / det];
 }
 
 // ---------------------------------------------------------------------------
@@ -277,5 +344,105 @@ function frames(duration, draw) {
       else resolve();
     };
     requestAnimationFrame(tick);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// JPEG animation. Pixels come from the browser's own decodes of the scrambled and restored
+// files (JPEG can't be re-derived exactly in JS without an IDCT), in the stored grid.
+
+function animateJpeg(work, layout, scrambled, original, { effect, duration, onProgress, present }) {
+  const { width, height, perm } = layout;
+  const ctx = work.getContext('2d');
+  if (effect === 'blocks' && perm.length <= MAX_ANIMATED_TILES) {
+    return animateMcus(ctx, layout, original, duration, onProgress, present);
+  }
+  const from = scrambled.getContext('2d').getImageData(0, 0, width, height);
+  const to = new Uint32Array(original.getContext('2d').getImageData(0, 0, width, height).data.buffer);
+  const frame32 = new Uint32Array(from.data.buffer);
+  const n = width * height;
+  let order = null;
+  if (effect !== 'scan') {
+    order = new Uint32Array(n);
+    for (let i = 0; i < n; i++) order[i] = i;
+    for (let i = n - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const t = order[i]; order[i] = order[j]; order[j] = t;
+    }
+  }
+  ctx.putImageData(from, 0, 0);
+  let done = 0;
+  return frames(duration, (t) => {
+    const target = t >= 1 ? n : Math.floor(easeInOut(t) * n);
+    if (order) for (let k = done; k < target; k++) frame32[order[k]] = to[order[k]];
+    else for (let k = done; k < target; k++) frame32[k] = to[k];
+    done = target;
+    ctx.putImageData(from, 0, 0);
+    present?.();
+    onProgress?.(t);
+  });
+}
+
+// Transform code (bit 0 flip X, bit 1 flip Y, bit 2 transpose first) as rotation * scaleX,
+// so a tile can spin and card-flip back to upright.
+function decompose(t) {
+  let m = [1, 0, 0, 1]; // [m00, m01, m10, m11]
+  const mul = (a, b) => [a[0] * b[0] + a[1] * b[2], a[0] * b[1] + a[1] * b[3], a[2] * b[0] + a[3] * b[2], a[2] * b[1] + a[3] * b[3]];
+  if (t & 4) m = mul([0, 1, 1, 0], m);
+  if (t & 1) m = mul([-1, 0, 0, 1], m);
+  if (t & 2) m = mul([1, 0, 0, -1], m);
+  for (const deg of [0, 90, 180, -90]) {
+    const c = Math.round(Math.cos((deg * Math.PI) / 180)), s = Math.round(Math.sin((deg * Math.PI) / 180));
+    for (const sx of [1, -1]) {
+      if (sx * c === m[0] && -s === m[1] && sx * s === m[2] && c === m[3]) return { angle: (deg * Math.PI) / 180, flip: sx };
+    }
+  }
+  return { angle: 0, flip: 1 };
+}
+
+function animateMcus(ctx, layout, original, duration, onProgress, present) {
+  const { width, height, perm, transforms, cols, tileW, tileH } = layout;
+  const count = perm.length;
+  const travel = 0.45;
+  const tiles = Array.from({ length: count }, (_, slot) => {
+    const t = perm[slot];
+    const hx = (t % cols) * tileW, hy = Math.floor(t / cols) * tileH;
+    return {
+      sx: (slot % cols) * tileW + tileW / 2, sy: Math.floor(slot / cols) * tileH + tileH / 2,
+      hx, hy,
+      w: Math.min(tileW, width - hx), h: Math.min(tileH, height - hy),
+      start: (t / count) * (1 - travel),
+      ...decompose(transforms ? transforms[slot] : 0),
+    };
+  });
+  return frames(duration, (t) => {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+    // Layering: waiting tiles, then settled ones on top, then the ones in flight.
+    for (let pass = 0; pass < 3; pass++) {
+      for (const k of tiles) {
+        const local = t >= 1 ? 1 : Math.min(1, Math.max(0, (t - k.start) / travel));
+        const layer = local <= 0 ? 0 : local >= 1 ? 1 : 2;
+        if (layer !== pass) continue;
+        if (layer === 1) {
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          ctx.drawImage(original, k.hx, k.hy, k.w, k.h, k.hx, k.hy, k.w, k.h);
+          continue;
+        }
+        const e = easeInOut(local);
+        const cx = k.sx + (k.hx + tileW / 2 - k.sx) * e;
+        const cy = k.sy + (k.hy + tileH / 2 - k.sy) * e;
+        // M = rotate(angle) * scaleX(flip), easing to identity; flip passes through 0,
+        // which reads as the tile turning over like a card.
+        const angle = k.angle * (1 - e);
+        const flip = k.flip + (1 - k.flip) * e;
+        const cos = Math.cos(angle), sin = Math.sin(angle);
+        ctx.setTransform(cos * flip, sin * flip, -sin, cos, cx, cy);
+        ctx.drawImage(original, k.hx, k.hy, k.w, k.h, -tileW / 2, -tileH / 2, k.w, k.h);
+      }
+    }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    present?.();
+    onProgress?.(t);
   });
 }

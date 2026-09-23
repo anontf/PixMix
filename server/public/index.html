@@ -183,9 +183,14 @@ $('sample').addEventListener('click', async () => {
   g.fillStyle = '#fff'; g.font = 'bold 96px system-ui'; g.fillText('pixmix', 48, 130);
   g.font = '28px system-ui'; g.fillText('scrambled, valid, reversible', 52, 176);
   const type = $('sampleType').value;
-  const png = new Uint8Array(await (await c.convertToBlob({ type: type === 'jxl' ? 'image/png' : type, quality: 0.9 })).arrayBuffer());
+  const want = type === 'jxl' ? 'image/png' : type;
+  const blob = await c.convertToBlob({ type: want, quality: 0.9 });
+  const png = new Uint8Array(await blob.arrayBuffer());
   const bytes = type === 'jxl' ? (await Enc.convertAsync(png, { format: 'jxl' })).bytes : png;
-  loadOriginal(bytes, `sample.${type === 'jxl' ? 'jxl' : type.split('/')[1]}`, ' · generated sample');
+  // Browsers that can't encode a type (Safari and WebP) hand back a PNG instead.
+  const got = Enc.detectFormat(bytes);
+  const note = blob.type && blob.type !== want ? ` · this browser can't encode ${want.split('/')[1].toUpperCase()}, so it's a PNG` : '';
+  loadOriginal(bytes, `sample.${EXT[got] ?? got}`, ` · generated sample${note}`);
 });
 
 async function serverCall(path, params, bytes) {

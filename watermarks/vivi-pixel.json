@@ -1,0 +1,21 @@
+{
+  "id": "vivi-pixel",
+  "name": "Vivi · pixel",
+  "text": "Vivi",
+  "font": "PressStart2P-Regular",
+  "letterSpacing": 0,
+  "lineHeight": 1.2,
+  "align": "left",
+  "fill": "#fff6e0",
+  "size": { "px": null, "relative": 0.02, "of": "short", "min": 8, "max": 24, "snap": 8 },
+  "fit": { "maxWidth": 0.5, "maxHeight": 0.25, "minSize": 6 },
+  "anchor": "bottom-right",
+  "margin": { "relative": 0.015, "min": 4, "max": 24 },
+  "offset": { "x": 0, "y": 0 },
+  "opacity": 0.95,
+  "crisp": true,
+  "stroke": { "color": "#1b1233", "width": 0.125, "join": "square", "opacity": 1 },
+  "shadow": { "color": "#000000", "opacity": 0.35, "x": 0.125, "y": 0.125, "blur": 0 },
+  "background": null,
+  "ornaments": []
+}

@@ -11,21 +11,24 @@
     "./decoder": "./src/decoder.js",
     "./browser": "./src/browser/index.js",
     "./plugins/sharp": "./src/plugins/sharp.js",
-    "./plugins/browser": "./src/plugins/browser.js"
+    "./plugins/browser": "./src/plugins/browser.js",
+    "./watermarks": "./src/watermark/index.js"
   },
   "files": [
     "src",
     "dist",
     "bin",
     "native/jxl/pkg",
-    "native/libjxl/pkg"
+    "native/libjxl/pkg",
+    "watermarks"
   ],
   "scripts": {
     "build": "node scripts/build.js",
     "test": "node --test test/*.test.js",
     "serve": "npm run build && node server/server.js",
     "test:browser": "npm run build && node --test --test-concurrency=1 test/e2e/*.test.js",
-    "serve:lan": "npm run build && HOST=0.0.0.0 node server/server.js"
+    "serve:lan": "npm run build && HOST=0.0.0.0 node server/server.js",
+    "watermarks": "node scripts/watermarks.js"
   },
   "engines": {
     "node": ">=18"
@@ -33,7 +36,8 @@
   "dependencies": {
     "fflate": "^0.8.2",
     "jpeg-js": "^0.4.4",
-    "omggif": "^1.0.10"
+    "omggif": "^1.0.10",
+    "opentype.js": "^2.0.0"
   },
   "devDependencies": {
     "esbuild": "^0.28.2",

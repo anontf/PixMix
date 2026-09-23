@@ -1,0 +1,61 @@
+{
+  "id": "vivi-gold",
+  "name": "Vivi · gold",
+  "text": "Vivi",
+  "font": "CinzelDecorative-Bold",
+  "letterSpacing": 0.03,
+  "lineHeight": 1.2,
+  "align": "left",
+  "fill": {
+    "type": "linear",
+    "angle": 180,
+    "stops": [
+      { "at": 0, "color": "#fff4b8" },
+      { "at": 0.42, "color": "#f2c14e" },
+      { "at": 0.58, "color": "#a8740f" },
+      { "at": 1, "color": "#ffdf7a" }
+    ]
+  },
+  "size": { "px": null, "relative": 0.03, "of": "short", "min": 12, "max": 40, "snap": 0 },
+  "fit": { "maxWidth": 0.5, "maxHeight": 0.25, "minSize": 6 },
+  "anchor": "bottom-right",
+  "margin": { "relative": 0.02, "min": 5, "max": 28 },
+  "offset": { "x": 0, "y": 0 },
+  "opacity": 1,
+  "crisp": false,
+  "stroke": { "color": "#2e1d02", "width": 0.04, "join": "round", "opacity": 0.75 },
+  "shadow": { "color": "#000000", "opacity": 0.4, "x": 0.03, "y": 0.05, "blur": 0.06 },
+  "background": null,
+  "ornaments": [
+    {
+      "shape": "sparkle",
+      "position": "top-right",
+      "size": 0.42,
+      "thickness": 0.06,
+      "gap": -0.02,
+      "offset": { "x": 0, "y": 0.02 },
+      "fill": "#fffbe8",
+      "outline": true,
+      "src": null
+    },
+    {
+      "shape": "line",
+      "position": "below",
+      "size": 1.1,
+      "thickness": 0.045,
+      "gap": 0.1,
+      "offset": { "x": 0, "y": 0 },
+      "fill": {
+        "type": "linear",
+        "angle": 90,
+        "stops": [
+          { "at": 0, "color": "#f2c14e00" },
+          { "at": 0.5, "color": "#f2c14e" },
+          { "at": 1, "color": "#f2c14e00" }
+        ]
+      },
+      "outline": true,
+      "src": null
+    }
+  ]
+}

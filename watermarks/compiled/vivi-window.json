@@ -1,0 +1,50 @@
+{
+  "format": "pixmix-watermark",
+  "version": 1,
+  "id": "vivi-window",
+  "name": "Vivi · dialogue window",
+  "box": [60, -631, 1645, 12],
+  "size": { "px": null, "relative": 0.022, "of": "short", "min": 10, "max": 26, "snap": 0 },
+  "fit": { "maxWidth": 0.5, "maxHeight": 0.25, "minSize": 6 },
+  "anchor": "bottom-right",
+  "margin": { "relative": 0.015, "min": 4, "max": 24 },
+  "offset": { "x": 0, "y": 0 },
+  "opacity": 1,
+  "crisp": false,
+  "stroke": { "color": "#0a1040", "width": 0.06, "join": "round", "opacity": 0.8 },
+  "shadow": { "color": "#000000", "opacity": 0.35, "x": 0.06, "y": 0.1, "blur": 0.12 },
+  "background": {
+    "shape": "box",
+    "fill": {
+      "type": "linear",
+      "dir": [0, 1],
+      "stops": [
+        { "at": 0, "color": "#3346b8" },
+        { "at": 1, "color": "#0c1654" }
+      ]
+    },
+    "opacity": 0.9,
+    "radius": 0.32,
+    "padding": { "x": 0.55, "y": 0.34 },
+    "border": {
+      "fill": {
+        "type": "linear",
+        "dir": [0, 1],
+        "stops": [
+          { "at": 0, "color": "#ffffff" },
+          { "at": 0.5, "color": "#d9deea" },
+          { "at": 1, "color": "#9aa3bb" }
+        ]
+      },
+      "width": 0.1
+    }
+  },
+  "shapes": [
+    {
+      "d": "M343 12L241 12L241 -78L151 -78L151 -260L60 -260L60 -631L161 -631L161 -270L251 -270L251 -88L333 -88L333 -270L423 -270L423 -631L525 -631L525 -260L433 -260L433 -78L343 -78L343 12ZM787 12L686 12L686 -450L787 -450L787 12ZM787 -530L686 -530L686 -631L787 -631L787 -530ZM1221 12L1120 12L1120 -78L1029 -78L1029 -260L938 -260L938 -450L1039 -450L1039 -270L1129 -270L1129 -88L1211 -88L1211 -270L1301 -270L1301 -450L1403 -450L1403 -260L1311 -260L1311 -78L1221 -78L1221 12ZM1645 12L1544 12L1544 -450L1645 -450L1645 12ZM1645 -530L1544 -530L1544 -631L1645 -631L1645 -530Z",
+      "fill": "#ffffff",
+      "outline": true,
+      "image": null
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "id": "vivi-window",
+  "name": "Vivi · dialogue window",
+  "text": "Vivi",
+  "font": "PixelifySans",
+  "letterSpacing": 0.04,
+  "lineHeight": 1.2,
+  "align": "left",
+  "fill": "#ffffff",
+  "size": { "px": null, "relative": 0.022, "of": "short", "min": 10, "max": 26, "snap": 0 },
+  "fit": { "maxWidth": 0.5, "maxHeight": 0.25, "minSize": 6 },
+  "anchor": "bottom-right",
+  "margin": { "relative": 0.015, "min": 4, "max": 24 },
+  "offset": { "x": 0, "y": 0 },
+  "opacity": 1,
+  "crisp": false,
+  "stroke": { "color": "#0a1040", "width": 0.06, "join": "round", "opacity": 0.8 },
+  "shadow": { "color": "#000000", "opacity": 0.35, "x": 0.06, "y": 0.1, "blur": 0.12 },
+  "background": {
+    "shape": "box",
+    "fill": {
+      "type": "linear",
+      "angle": 180,
+      "stops": [
+        { "at": 0, "color": "#3346b8" },
+        { "at": 1, "color": "#0c1654" }
+      ]
+    },
+    "opacity": 0.9,
+    "radius": 0.32,
+    "padding": { "x": 0.55, "y": 0.34 },
+    "border": {
+      "fill": {
+        "type": "linear",
+        "angle": 180,
+        "stops": [
+          { "at": 0, "color": "#ffffff" },
+          { "at": 0.5, "color": "#d9deea" },
+          { "at": 1, "color": "#9aa3bb" }
+        ]
+      },
+      "width": 0.1
+    }
+  },
+  "ornaments": []
+}

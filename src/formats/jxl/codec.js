@@ -15,7 +15,9 @@
 // which pixmix runs from the jxl-wasm package in a child process: servers only.
 
 import encoderFactory from '@jsquash/jxl/codec/enc/jxl_enc.js';
-import initDecoder, { decode as decodeRaw, reconstructJpeg as reconstructRaw, lastPanic } from '../../../native/jxl/pkg/pixmix_jxl.js';
+import initDecoder, {
+  decode as decodeRaw, decodeAnimation as decodeAnimationRaw, reconstructJpeg as reconstructRaw, lastPanic,
+} from '../../../native/jxl/pkg/pixmix_jxl.js';
 
 /* global __PIXMIX_JXL_WASM__ */
 const BUNDLED = typeof __PIXMIX_JXL_WASM__ !== 'undefined' ? __PIXMIX_JXL_WASM__ : null;
@@ -54,20 +56,44 @@ async function wasmBytes(which) {
 const ready = () => (decoder ??= wasmBytes('dec').then((wasm) => initDecoder({ module_or_path: wasm })));
 
 /**
- * First frame, orientation applied, as 8-bit RGBA. With `srgb` (default) the pixels are
- * converted to sRGB, matching what the encoder writes; without it they stay in the image's
- * own colour space and `icc` describes it.
- * @returns {Promise<{width: number, height: number, data: Uint8Array, icc: Uint8Array|null}>}
+ * First frame, orientation applied, as RGBA: 8-bit (`data` a Uint8Array), or with `high`
+ * 16-bit (`data` a Uint16Array, `depth` 16). With `srgb` (default) the pixels are converted
+ * to sRGB, matching what the encoder writes; without it they stay in the image's own colour
+ * space and `icc` describes it.
+ * @returns {Promise<{width: number, height: number, depth: 8|16, data: Uint8Array|Uint16Array, icc: Uint8Array|null}>}
  */
-export async function decode(bytes, { srgb = true } = {}) {
+export async function decode(bytes, { srgb = true, high = false } = {}) {
   await ready();
-  const d = guard(() => decodeRaw(bytes, srgb));
+  const d = guard(() => decodeRaw(bytes, srgb, high));
   try {
     const { width, height, channels } = d;
     const icc = d.icc;
-    return { width, height, data: toRgba(d.takePixels(), width * height, channels), icc: icc.length ? icc : null };
+    const px = high ? d.takePixels16() : d.takePixels();
+    return { width, height, depth: high ? 16 : 8, data: toRgba(px, width * height, channels, high ? 65535 : 255), icc: icc.length ? icc : null };
   } finally {
     d.free();
+  }
+}
+
+/**
+ * Every frame of an animated JPEG XL as full-canvas RGBA, with delays as [ms, 1000].
+ * @returns {Promise<{width: number, height: number, frames: {data: Uint8Array, delay: [number, number]}[], plays: number}>}
+ */
+export async function decodeAnimation(bytes, { srgb = true } = {}) {
+  await ready();
+  const a = guard(() => decodeAnimationRaw(bytes, srgb));
+  try {
+    const { width, height, channels, count, loops } = a;
+    const durations = a.durationsMs;
+    const all = a.takePixels();
+    const per = width * height * channels;
+    const frames = [];
+    for (let i = 0; i < count; i++) {
+      frames.push({ data: toRgba(all.subarray(i * per, (i + 1) * per), width * height, channels), delay: [durations[i], 1000] });
+    }
+    return { width, height, frames, plays: loops };
+  } finally {
+    a.free();
   }
 }
 
@@ -88,13 +114,13 @@ function guard(fn) {
   }
 }
 
-function toRgba(px, n, channels) {
-  if (channels === 4) return px;
-  const out = new Uint8Array(n * 4);
+function toRgba(px, n, channels, max = 255) {
+  if (channels === 4) return px.slice();
+  const out = new px.constructor(n * 4);
   for (let i = 0; i < n; i++) {
     const o = i * 4, s = i * channels;
-    if (channels >= 3) { out[o] = px[s]; out[o + 1] = px[s + 1]; out[o + 2] = px[s + 2]; out[o + 3] = 255; }
-    else { out[o] = out[o + 1] = out[o + 2] = px[s]; out[o + 3] = channels === 2 ? px[s + 1] : 255; }
+    if (channels >= 3) { out[o] = px[s]; out[o + 1] = px[s + 1]; out[o + 2] = px[s + 2]; out[o + 3] = max; }
+    else { out[o] = out[o + 1] = out[o + 2] = px[s]; out[o + 3] = channels === 2 ? px[s + 1] : max; }
   }
   return out;
 }
@@ -121,6 +147,14 @@ export const canTranscode = () => !!globalThis.process?.getBuiltinModule?.('node
  * @returns {Promise<Uint8Array>} JPEG XL container
  */
 export async function transcodeJpeg(jpeg) {
+  return runCjxl(jpeg, 'jpg');
+}
+
+/**
+ * Runs cjxl on any input it understands (JPEG, PNG/APNG, GIF). Used for JPEG recompression,
+ * and by the tests to make animated JPEG XL files.
+ */
+export async function runCjxl(input, ext, args = []) {
   if (!canTranscode()) throw new Error('JPEG to JPEG XL transcoding needs Node (it runs libjxl cjxl); use mode "pixel" or "block" here');
   const get = (m) => globalThis.process.getBuiltinModule(m);
   const { spawn } = get('node:child_process');
@@ -131,13 +165,13 @@ export async function transcodeJpeg(jpeg) {
   const cjxl = fileURLToPath(CJXL ? new URL(CJXL, import.meta.url) : import.meta.resolve('jxl-wasm/lib/cjxl.js'));
   const dir = fs.mkdtempSync(join(tmpdir(), 'pixmix-'));
   try {
-    const input = join(dir, 'in.jpg'), output = join(dir, 'out.jxl');
-    fs.writeFileSync(input, jpeg);
-    const runner = 'delete globalThis.fetch; const [c, i, o] = process.argv.slice(1);' +
-      // cjxl 0.7: JPEG input is transcoded losslessly by default (-j would make it lossy).
-      "process.argv = ['node', 'cjxl', i, o, '--container', '--num_threads=0', '--quiet']; require(c);";
+    const inFile = join(dir, `in.${ext}`), output = join(dir, 'out.jxl');
+    fs.writeFileSync(inFile, input);
+    // cjxl 0.7: JPEG input is transcoded losslessly by default (-j would make it lossy).
+    const argv = JSON.stringify(['node', 'cjxl', inFile, output, '--container', '--num_threads=0', '--quiet', ...args]);
+    const runner = `delete globalThis.fetch; const c = process.argv[1]; process.argv = ${argv}; require(c);`;
     const { code, stderr } = await new Promise((resolve, reject) => {
-      const child = spawn(globalThis.process.execPath, ['-e', runner, cjxl, input, output], { stdio: ['ignore', 'ignore', 'pipe'] });
+      const child = spawn(globalThis.process.execPath, ['-e', runner, cjxl], { stdio: ['ignore', 'ignore', 'pipe'] });
       let err = '';
       child.stderr.on('data', (d) => { err += d; });
       child.on('error', reject);

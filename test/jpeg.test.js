@@ -191,3 +191,32 @@ test('truncated JPEG data is zero-filled, not fatal', async () => {
   const s = encode(cut, { key: 'k' });
   assert.ok(sameCoefs(decode(s, { key: 'k' }), cut));
 });
+
+test('progressive JPEGs stay progressive through scramble and restore; option overrides', async () => {
+  const prog = new Uint8Array(await fromRaw(96, 64).jpeg({ progressive: true }).toBuffer());
+  const s = encode(prog, { key: 'k' });
+  assert.equal(inspect(s).progressive, true);
+  const r = decode(s, { key: 'k' });
+  assert.equal(inspect(r).progressive, true);
+  assert.ok(sameCoefs(r, prog));
+  assert.equal((await sharp(r).metadata()).isProgressive, true);
+  assert.ok((await pixels(r)).equals(await pixels(prog)));
+
+  const base = new Uint8Array(await fromRaw(96, 64).jpeg().toBuffer());
+  const forced = encode(base, { key: 'k', progressive: true });
+  assert.equal(inspect(forced).progressive, true);
+  assert.equal(inspect(decode(forced, { key: 'k' })).progressive, true, 'restored like the scrambled file');
+  assert.equal(inspect(encode(prog, { key: 'k', progressive: false })).progressive, false);
+  assert.equal(inspect(rekey(s, { from: 'k', to: 'j' })).progressive, true);
+  // With partial edge MCUs the scrambled file has to be baseline, but restores progressive.
+  const odd = new Uint8Array(await fromRaw(70, 45).jpeg({ progressive: true }).toBuffer());
+  const so = encode(odd, { key: 'k' });
+  assert.equal(inspect(so).progressive, false);
+  const ro = decode(so, { key: 'k' });
+  assert.equal(inspect(ro).progressive, true);
+  assert.ok(sameCoefs(ro, odd));
+  assert.equal(inspect(decode(rekey(so, { from: 'k', to: 'j' }), { key: 'j' })).progressive, true);
+  // Pixel sources can be written progressive too.
+  const png = convert(new Uint8Array(await fromRaw(40, 30).png().toBuffer()), { format: 'jpeg', progressive: true }).bytes;
+  assert.equal(inspect(png).progressive, true);
+});

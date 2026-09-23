@@ -15,7 +15,7 @@ const ICC_CHUNK = MAX_PAYLOAD - 14; // "ICC_PROFILE\0" + sequence + count
  * @param {{quality?: number, subsampling?: '4:2:0'|'4:2:2'|'4:4:4', background?: string}} [opts]
  * @returns {{jpeg: Uint8Array, transferred: string[], dropped: string[]}}
  */
-export function buildJpeg(image, meta = {}, { quality = 90, subsampling = '4:2:0', background = '#ffffff' } = {}) {
+export function buildJpeg(image, meta = {}, { quality = 90, subsampling = '4:2:0', background = '#ffffff', progressive = false } = {}) {
   const transferred = [];
   const dropped = [...(meta.dropped ?? [])];
   const { width, height } = image;
@@ -96,7 +96,7 @@ export function buildJpeg(image, meta = {}, { quality = 90, subsampling = '4:2:0
 
   const { frame, dqt } = encodePixels({ width, height, data }, { quality, subsampling, grey });
   header.push(dqt);
-  return { jpeg: assembleJpeg(header, frame), transferred, dropped };
+  return { jpeg: assembleJpeg(header, frame, { progressive: progressive === true }), transferred, dropped };
 }
 
 function parseColor(c) {

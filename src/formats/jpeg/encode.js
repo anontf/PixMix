@@ -1,7 +1,7 @@
-// Quantized DCT coefficients -> baseline Huffman JPEG: one interleaved scan, Huffman
-// tables optimised for the data (two passes, like jpegtran -optimize). Everything that
-// is not entropy coding (APPn, COM, DQT, the SOF payload) is supplied by the caller and
-// written back unchanged.
+// Quantized DCT coefficients -> Huffman JPEG, baseline (one interleaved scan) or progressive
+// (spectral selection), with Huffman tables optimised for the data (two passes, like
+// jpegtran -optimize). Everything that is not entropy coding (APPn, COM, DQT, the SOF
+// payload) is supplied by the caller and written back unchanged.
 
 import { M, writeSegments } from './markers.js';
 import { ZIGZAG } from './decode.js';
@@ -128,20 +128,128 @@ export function sofMarkerFor(dqtSegments) {
   return M.SOF0;
 }
 
+// --- progressive -------------------------------------------------------------------
+
+/**
+ * Scan script: DC of all components first (one interleaved scan), then AC bands per
+ * component, luma's low frequencies early. Spectral selection only (Ah = Al = 0), which
+ * every progressive decoder handles and keeps coefficients exact.
+ */
+function progressiveScript(n) {
+  if (n === 1) return [{ comps: [0], ss: 0, se: 0 }, { comps: [0], ss: 1, se: 5 }, { comps: [0], ss: 6, se: 63 }];
+  const script = [{ comps: [...Array(n).keys()], ss: 0, se: 0 }, { comps: [0], ss: 1, se: 5 }];
+  for (let c = 1; c < n; c++) script.push({ comps: [c], ss: 1, se: 63 });
+  script.push({ comps: [0], ss: 6, se: 63 });
+  return script;
+}
+
+/** Visits one scan's blocks in the order a decoder expects them. */
+function walkScan(frame, comps, visit) {
+  const cs = comps.map((i) => frame.components[i]);
+  if (cs.length === 1) {
+    const c = cs[0];
+    for (let by = 0; by < c.realH; by++) for (let bx = 0; bx < c.realW; bx++) visit(0, (by * c.blocksW + bx) * 64);
+    return;
+  }
+  for (let my = 0; my < frame.mcusY; my++) {
+    for (let mx = 0; mx < frame.mcusX; mx++) {
+      cs.forEach((c, ci) => {
+        for (let y = 0; y < c.v; y++) for (let x = 0; x < c.h; x++) visit(ci, ((my * c.v + y) * c.blocksW + mx * c.h + x) * 64);
+      });
+    }
+  }
+}
+
+/**
+ * Runs one scan through `put(tableSlot, symbol, extraBits, extraCount)`; slot = the index
+ * of the component within the scan. Called once to count symbols and once to write.
+ */
+function codeScan(frame, { comps, ss, se }, put) {
+  const cs = comps.map((i) => frame.components[i]);
+  if (ss === 0) {
+    const pred = new Int32Array(cs.length);
+    walkScan(frame, comps, (ci, blk) => {
+      const dc = cs[ci].coefs[blk];
+      const diff = dc - pred[ci];
+      pred[ci] = dc;
+      const s = category(diff);
+      put(ci, s, diff < 0 ? diff - 1 : diff, s);
+    });
+    return;
+  }
+  let eobrun = 0;
+  const flush = () => {
+    if (!eobrun) return;
+    const nbits = 31 - Math.clz32(eobrun);
+    put(0, nbits << 4, eobrun - (1 << nbits), nbits);
+    eobrun = 0;
+  };
+  const coefs = cs[0].coefs;
+  walkScan(frame, comps, (_ci, blk) => {
+    let run = 0;
+    for (let k = ss; k <= se; k++) {
+      const v = coefs[blk + ZIGZAG[k]];
+      if (!v) { run++; continue; }
+      flush();
+      while (run > 15) { put(0, 0xf0, 0, 0); run -= 16; }
+      const cat = category(v);
+      put(0, (run << 4) | cat, v < 0 ? v - 1 : v, cat);
+      run = 0;
+    }
+    if (run && ++eobrun === 0x7fff) flush();
+  });
+  flush();
+}
+
+/** Progressive scans: [{dht, sos, ecs}] with tables optimised per scan. */
+export function encodeProgressive(frame) {
+  const out = [];
+  for (const scan of progressiveScript(frame.components.length)) {
+    const dc = scan.ss === 0;
+    // DC scans: luma table 0, chroma table 1; an AC scan has one component, table 0.
+    const tableOf = (slot) => (dc && scan.comps[slot] !== 0 ? 1 : 0);
+    const freq = [0, 1].map(() => new Uint32Array(257));
+    codeScan(frame, scan, (slot, sym) => { freq[tableOf(slot)][sym]++; });
+    const used = [...new Set(scan.comps.map((_, slot) => tableOf(slot)))];
+    const specs = used.map((t) => ({ tableClass: dc ? 0 : 1, id: t, spec: buildOptimalSpec(freq[t]) }));
+    const enc = [];
+    for (const s of specs) enc[s.id] = buildEncodeTable(s.spec);
+    const w = new BitWriter();
+    codeScan(frame, scan, (slot, sym, bits, n) => {
+      const t = enc[tableOf(slot)];
+      w.put(t.code[sym], t.size[sym]);
+      if (n) w.put(bits, n);
+    });
+    const sos = [scan.comps.length];
+    scan.comps.forEach((c, slot) => sos.push(frame.components[c].id, dc ? tableOf(slot) << 4 : tableOf(slot)));
+    sos.push(scan.ss, scan.se, 0);
+    out.push({ dht: writeDht(specs), sos: Uint8Array.from(sos), ecs: w.result() });
+  }
+  return out;
+}
+
 /**
  * Builds a complete JPEG from metadata/table segments (kept verbatim) and a frame.
  * @param {import('./markers.js').Segment[]} header  APPn, COM, DQT … in output order
  * @param {import('./decode.js').Frame} frame
- * @param {{marker?: Uint8Array, restartInterval?: number}} [opts] marker: APP15 payload
+ * @param {{marker?: Uint8Array, restartInterval?: number, progressive?: boolean}} [opts]
+ *        marker: APP15 payload; progressive: write SOF2 with progressive scans
  */
-export function assembleJpeg(header, frame, { marker, restartInterval } = {}) {
-  const { dht, sos, ecs, dri } = encodeScan(frame, { restartInterval });
+export function assembleJpeg(header, frame, { marker, restartInterval, progressive = false } = {}) {
   const out = [...header];
   if (marker) {
     let at = 0;
     while (at < out.length && out[at].marker >= 0xe0 && out[at].marker <= 0xef) at++;
     out.splice(at, 0, { marker: M.APP15, data: marker });
   }
+  if (progressive) {
+    out.push({ marker: M.SOF2, data: frame.sof });
+    for (const { dht, sos, ecs } of encodeProgressive(frame)) {
+      out.push({ marker: M.DHT, data: dht }, { marker: M.SOS, data: sos, ecs });
+    }
+    return writeSegments(out);
+  }
+  const { dht, sos, ecs, dri } = encodeScan(frame, { restartInterval });
   out.push({ marker: sofMarkerFor(header.filter((s) => s.marker === M.DQT)), data: frame.sof });
   out.push({ marker: M.DHT, data: dht });
   if (dri) out.push({ marker: M.DRI, data: dri });

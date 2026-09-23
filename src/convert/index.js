@@ -90,8 +90,8 @@ export async function decodeForJxl(input, opts = {}) {
 
 async function decodeJob(bytes, job, { keepThumbnails = false }) {
   const decoded = await job.decoder.decode(bytes, job.from);
-  const image = { ...decoded, data: toBytes(decoded.data) };
   const meta = mergedMeta(bytes, job.from, decoded, keepThumbnails);
+  const image = to8bit(normalise(decoded), meta); // the JPEG XL encoder is 8-bit
   return { image, meta, from: job.from, decoder: job.decoder.name };
 }
 
@@ -128,6 +128,20 @@ function prepare(bytes, { format, decoders = [], keepThumbnails = false }) {
   return { from, target, decoder };
 }
 
+/** Plugins may hand back Node Buffers; 16-bit data stays a Uint16Array. */
+function normalise(decoded) {
+  return decoded.depth === 16 ? { ...decoded, data: Uint16Array.from(decoded.data) } : { ...decoded, data: toBytes(decoded.data) };
+}
+
+/** 16-bit RGBA to 8-bit (rounded), noting the loss. */
+function to8bit(image, meta) {
+  if (image.depth !== 16) return image;
+  meta.dropped.push('16-bit precision (reduced to 8-bit)');
+  const d = new Uint8Array(image.data.length);
+  for (let i = 0; i < d.length; i++) d[i] = (image.data[i] + 128) / 257;
+  return { ...image, depth: 8, data: d };
+}
+
 // pixmix's own container reader wins; the decoder fills in what it cannot see (e.g. the
 // colour profile of a JPEG XL, which lives in the codestream).
 function mergedMeta(bytes, from, decoded, keepThumbnails) {
@@ -143,11 +157,12 @@ function mergedMeta(bytes, from, decoded, keepThumbnails) {
   return meta;
 }
 
-function finish(bytes, { from, target, decoder }, decoded, { keepThumbnails = false, quality, subsampling, background }) {
-  decoded = { ...decoded, data: toBytes(decoded.data) }; // plugins may hand back Node Buffers
+function finish(bytes, { from, target, decoder }, decoded, { keepThumbnails = false, quality, subsampling, background, progressive }) {
+  decoded = normalise(decoded);
   const meta = mergedMeta(bytes, from, decoded, keepThumbnails);
+  if (target !== 'png') decoded = to8bit(decoded, meta); // PNG keeps 16 bits; JPEG cannot
   const built = target === 'jpeg'
-    ? (({ jpeg, ...r }) => ({ bytes: jpeg, ...r }))(buildJpeg(decoded, meta, { quality, subsampling, background }))
+    ? (({ jpeg, ...r }) => ({ bytes: jpeg, ...r }))(buildJpeg(decoded, meta, { quality, subsampling, background, progressive }))
     : (({ png, ...r }) => ({ bytes: png, ...r }))(buildPng(decoded, meta));
   return { bytes: built.bytes, format: target, from, decoder: decoder.name, transferred: built.transferred, dropped: [...new Set(built.dropped)] };
 }

@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto';
 import { encodeAsync, rekeyAsync, inspect, detectFormat, sharpDecoder, PixmixError } from '../dist/pixmix-encoder.mjs';
 import { decodeAsync } from '../src/decoder.js';
 
-const PORT = Number(process.env.PORT) || 8080;
+const PORT = process.env.PORT ? Number(process.env.PORT) : 8080; // 0 = any free port
 const HOST = process.env.HOST || '127.0.0.1';
 const ROOT = new URL('..', import.meta.url).pathname;
 const MAX_BODY = 64 * 1024 * 1024;
@@ -73,7 +73,7 @@ const routes = {
 const pick = ({ format, width, height, mode, block }) => ({ format, width, height, mode, block });
 const urlFor = (id, bytes) => `/images/${id}.${IMAGE[detectFormat(bytes)][1]}`;
 
-createServer(async (req, res) => {
+const server = createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   try {
     const route = routes[`${req.method} ${url.pathname}`];
@@ -87,7 +87,8 @@ createServer(async (req, res) => {
     if (status === 500) console.error(err);
     send(res, json({ error: err.message, code: err.code }, status));
   }
-}).listen(PORT, HOST, () => console.log(`pixmix dev server on http://${HOST}:${PORT}${sharp ? ' (sharp: on)' : ''}`));
+});
+server.listen(PORT, HOST, () => console.log(`pixmix dev server on http://${HOST}:${server.address().port}${sharp ? ' (sharp: on)' : ''}`));
 
 async function staticFile(pathname) {
   const img = pathname.match(/^\/images\/([\w-]+)\.(png|jpg|jxl)$/);

@@ -4,12 +4,18 @@
 // a little precision to premultiplied alpha.
 
 const DEFAULT_FORMATS = ['webp', 'avif', 'bmp', 'heic', 'jxl', 'tiff'];
+// Animated WebP/AVIF keep every frame (as APNG) where WebCodecs' ImageDecoder exists.
 
 export function browserDecoder({ formats = DEFAULT_FORMATS } = {}) {
   return {
     name: 'browser',
     formats,
-    async decode(bytes) {
+    async decode(bytes, format) {
+      const animation = await frames(bytes, format);
+      if (animation) {
+        const [first] = animation.frames;
+        return { width: animation.width, height: animation.height, data: first.data, animation, metadata: { dropped: [] } };
+      }
       const bitmap = await createImageBitmap(new Blob([bytes]), {
         colorSpaceConversion: 'none',
         premultiplyAlpha: 'none',
@@ -23,4 +29,37 @@ export function browserDecoder({ formats = DEFAULT_FORMATS } = {}) {
       return { width: canvas.width, height: canvas.height, data: new Uint8Array(data.buffer) };
     },
   };
+}
+
+const MIME = { webp: 'image/webp', avif: 'image/avif', gif: 'image/gif', jxl: 'image/jxl' };
+
+/**
+ * Every frame of an animated image through WebCodecs' ImageDecoder, where the browser has
+ * it; null for still images or when it is unavailable.
+ */
+async function frames(bytes, format) {
+  if (typeof ImageDecoder === 'undefined' || !MIME[format]) return null;
+  if (!(await ImageDecoder.isTypeSupported(MIME[format]))) return null;
+  const decoder = new ImageDecoder({ data: bytes, type: MIME[format], colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
+  try {
+    await decoder.tracks.ready;
+    const track = decoder.tracks.selectedTrack;
+    await decoder.completed;
+    if (!track?.animated || track.frameCount < 2) return null;
+    const out = [];
+    let width = 0, height = 0;
+    for (let i = 0; i < track.frameCount; i++) {
+      const { image } = await decoder.decode({ frameIndex: i });
+      width = image.displayWidth;
+      height = image.displayHeight;
+      const canvas = new OffscreenCanvas(width, height);
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(image, 0, 0);
+      out.push({ data: new Uint8Array(ctx.getImageData(0, 0, width, height).data.buffer), delay: [Math.round((image.duration ?? 100000) / 1000), 1000] });
+      image.close();
+    }
+    return { width, height, frames: out, plays: track.repetitionCount === Infinity ? 0 : track.repetitionCount + 1 };
+  } finally {
+    decoder.close();
+  }
 }

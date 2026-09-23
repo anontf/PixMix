@@ -24,8 +24,13 @@ browser use case the key ships to the visitor.
 ```sh
 npm install
 npm test            # PngSuite and JPEG round trips, conversion, CLI, browser reveal (fake DOM)
+npm run test:browser  # the same in real Chromium: decoder, worker, lab, demo site (see below)
 npm run serve       # builds dist/ and starts http://127.0.0.1:8080
+npm run serve:lan   # the same, reachable from other machines on the network (HOST=0.0.0.0)
 ```
+
+The dev server has no authentication: anyone who can reach it can encode, decode and publish
+to the demo gallery. Only use `serve:lan` on a network you trust.
 
 - **Lab** (`/`): load an image in any format, or a generated PNG/JPEG/WebP sample.
   - Encode it on the server or in the browser, and see what metadata was kept or dropped.
@@ -150,10 +155,13 @@ In browsers, `browserDecoder()` uses the browser's own decoders (WebP, AVIF, BMP
   - Frames are composited to full size following GIF disposal.
   - Delays and the loop count are kept; a delay of 0 or 1 plays as 10, as browsers do.
   - The whole animation shares one colour type, usually a palette.
-- **Other formats:**
-  - Converting an animation to JPEG or JPEG XL keeps the first frame, and the report says
-    so.
-  - Animated JPEG XL and WebP input keep their first frame too.
+- **Animated WebP and JPEG XL → PNG** give an APNG too, with every frame, delays and loop
+  count:
+  - WebP through `sharpDecoder`, or through `browserDecoder` in browsers with WebCodecs'
+    `ImageDecoder`.
+  - JPEG XL through the built-in decoder.
+- **Other formats:** converting an animation to JPEG or JPEG XL keeps the first frame, and
+  the report says so (neither writer does animation).
 - **In the browser,** the reveal animates frame 0, then the `<img>` gets the restored
   APNG, which plays normally.
 
@@ -203,13 +211,18 @@ Some things are dropped, and the report says so:
 - animation frames after the first;
 - CMYK and other non-RGB/grey profiles;
 - extended XMP;
-- precision above 8 bits;
+- precision above 8 bits when writing JPEG or JPEG XL (PNG keeps 16 bits);
 - PNG text chunks other than comments, and gamma without an ICC profile, when writing JPEG;
 - transparency when writing JPEG (flattened onto `background`).
 
 A PNG gets the smallest colour type that loses nothing: grey, palette (1–8 bit), RGB or
 RGBA. Palette output also compresses far better once the pixels are scrambled. A JPEG is
 written as a single component when the image is grey.
+
+Sources deeper than 8 bits become 16-bit PNGs:
+- 16-bit TIFF/PNG/AVIF/HEIF through sharp, and 10/12/16-bit or float JPEG XL.
+- If every sample is exactly an 8-bit value, the PNG is 8-bit, since that loses nothing.
+- Animations are 8-bit.
 
 ## Decoder (websites)
 
@@ -224,7 +237,14 @@ Or from code:
 PixMix.revealAll({ key: 'site-key', effect: 'blocks', duration: 1500 });
 await PixMix.reveal(imgElement, { key, effect: 'scan', onProgress: (p) => … });
 const original = await PixMix.decodeAsync(bytes, { key });   // just the bytes
+const { bytes: shown, type } = await PixMix.restoreForDisplay(bytes, { key });
 ```
+
+`restoreForDisplay` returns what an `<img>` can show:
+- PNG and JPEG as they are;
+- a JPEG XL as a PNG of its pixels, or as its JPEG on the JPEG route.
+
+It needs neither the JPEG XL encoder nor `cjxl`.
 
 - Effects:
   - `dissolve`, `scan`.
@@ -283,7 +303,8 @@ when re-encoding a JPEG XL input on the pixel route:
   decoded pixels, so the file grows.
 - **Colour space:** anything other than sRGB is converted to sRGB. The bundled encoder
   can't tag another colour space.
-- **Precision:** above 8 bits is reduced to 8, and animation keeps the first frame.
+- **Precision:** above 8 bits is reduced to 8, and animation keeps the first frame. The
+  encoder is 8-bit and single-frame; convert to PNG to keep either.
 - **Boxes that would be stale or leak the image:**
   - `jbrd` (JPEG reconstruction data, no longer matching the pixels);
   - `jhgm` (an HDR gain map, a second image);
@@ -296,8 +317,9 @@ The codec has three parts:
 - **libjxl's encoder** (the single-threaded build from `@jsquash/jxl`) for lossless encoding.
 - **libjxl's `cjxl`** (from `jxl-wasm`, libjxl 0.7) for JPEG recompression, on servers only.
 - **pixmix's own jxl-oxide binding** (`native/jxl`) for decoding and JPEG reconstruction.
-  - It returns raw 8-bit pixels and the ICC profile, converting colour with `moxcms`, a
-    pure-Rust colour-management library.
+  - It returns raw 8- or 16-bit pixels and the ICC profile, converting colour with `moxcms`,
+    a pure-Rust colour-management library.
+  - It can also return every keyframe of an animation.
   - Neither published option would do. `@jsquash/jxl`'s decoder isn't bit-exact: it
     colour-converts even sRGB images and turns (4,255,0) into (3,255,0). The
     `jxl-oxide-wasm` package can't reconstruct JPEGs. A test guards the exactness.
@@ -340,15 +362,26 @@ cargo install wasm-bindgen-cli --version 0.2.128   # must match native/jxl/Cargo
    - The transforms are applied exactly on the coefficients: flipping negates the odd
      frequencies, transposing swaps u and v. Square MCUs get 8 transforms; 4:2:2 (16×8)
      gets the 4 flips.
-   - The coefficients are written back as one baseline scan with Huffman tables optimised
-     for the data, as `jpegtran -optimize` does.
+   - The coefficients are written back with Huffman tables optimised for the data, as
+     `jpegtran -optimize` does.
+     - Baseline sources are written as one baseline scan.
+     - Progressive sources are written as progressive scans: DC first, then AC bands,
+       spectral selection with per-scan tables. `progressive: true | false` overrides that.
    - Nothing is requantised. APPn, COM and DQT segments and the SOF payload are copied
      unchanged, and an APP15 `pixmix\0` segment holds the marker.
-   - Progressive input comes back as baseline with identical coefficients, so it decodes to
-     identical pixels. Restart markers are not kept.
+   - Restart markers are not kept.
+   - **Progressive caveat.** Progressive AC scans can't store the padding blocks of partial
+     edge MCUs, and scrambling may move real content into them. So a scrambled file is
+     progressive only when the image has no such padding (width and height fit whole MCUs);
+     otherwise it's baseline.
+     - The marker records that the source was progressive, and restoring writes a
+       progressive file again. That's exact, since the original couldn't hold AC data in
+       padding blocks either.
+     - The JPEG inside a JPEG-route JPEG XL is always baseline (see jxl-oxide above).
 
-Marker v1: `u8 version | u8 mode | u16 block | u8 saltLen | salt | u8[4] check`. In `mcu`
-mode, `block` holds flags (bit 0 = transforms).
+Marker v1: `u8 version | u8 mode | u16 block | u8 saltLen | salt | u8[4] check`.
+- In `mcu` mode, `block` holds flags: bit 0 = transforms, bit 1 = restore as progressive.
+- APNG frames mix their index into the seed; it's 0 for still images.
 The permutation stream is pinned by a test. Any change to it must bump the version.
 
 ### Size and speed
@@ -362,7 +395,7 @@ The permutation stream is pinned by a test. Any change to it must bump the versi
   sharp. In both cases building the PNG is most of the time.
 - JPEG → JPEG is fast and keeps the size: a 12 MP photo takes about 0.5 s to scramble and
   0.4 s to restore, and grows about 3% (shuffled MCUs make the DC differences larger).
-  Progressive input comes out about the same size as before.
+  pixmix's progressive scans come out about the same size as libjpeg's.
 - Converting 12 MP PNG → scrambled JPEG takes about 1.7 s (colour conversion, DCT and
   entropy coding in JS).
 - JPEG XL, JPEG route: see above. It's fast because nothing is DCT'd or entropy-optimised
@@ -374,6 +407,29 @@ The permutation stream is pinned by a test. Any change to it must bump the versi
   - Decoding 12 MP takes 5–9 s.
   - Lower `effort` trades size for speed: at 2 MP, effort 5 gives 0.92 MB in 3.0 s,
     against 0.78 MB in 4.4 s at effort 7.
+
+## Browser tests
+
+`npm run test:browser` builds `dist/` and drives headless Chromium through Playwright
+(`npx playwright install chromium` once). It covers:
+- the `<script>` decoder: every format and effect, with the final bytes checked in Node and
+  the rendering compared with the original's;
+- the Web Worker, and the main-thread fallback (`data-worker="false"`, CSP
+  `worker-src 'none'`);
+- a decoder loaded from another origin, a wrong key, EXIF rotation;
+- animated WebP through `ImageDecoder`;
+- the lab (every input/output/mode, encoded on the server and in the browser) and the demo
+  site.
+
+Console errors fail a test.
+
+If Chromium can't start because the host lacks its shared libraries, either install them
+system-wide (`sudo npx playwright install-deps`), or unpack them somewhere and set:
+- `PIXMIX_BROWSER_LIBS` to that library directory (it's added to `LD_LIBRARY_PATH`);
+- `FONTCONFIG_FILE` if the host has no fonts.
+
+Firefox isn't covered yet: Playwright's Firefox needs a newer NSS than some distributions
+ship.
 
 ## Roadmap
 
@@ -389,10 +445,11 @@ The permutation stream is pinned by a test. Any change to it must bump the versi
   - Browser reveal, CLI, server and lab support.
 - [x] Phase 5: APNG in/out (per-frame permutations), animated GIF → APNG, decoding in a
   Web Worker with a main-thread fallback
+- [x] Phase 6: real-browser test suite (Chromium); animated WebP / JPEG XL → APNG; 16-bit
+  input kept in PNG; progressive JPEGs stay progressive
 - [ ] Newer libjxl for recompression (the only prebuilt WASM `cjxl` is 0.7 and Node-only)
-- [ ] Animated JPEG XL / WebP (currently the first frame)
-- [ ] 16-bit input through plugins (currently reduced to 8-bit)
-- [ ] Keep progressive JPEGs progressive (write progressive scans)
+- [ ] Firefox in the browser suite
+- [ ] Animated and >8-bit JPEG XL output (needs a JPEG XL encoder beyond `@jsquash/jxl`'s)
 
 ## Third-party code
 

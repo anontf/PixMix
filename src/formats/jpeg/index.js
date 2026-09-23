@@ -2,9 +2,15 @@
 // re-entropy-coded; nothing is requantized. APPn/COM/DQT segments and the SOF payload are
 // copied through unchanged. The scramble parameters go in an APP15 "pixmix\0" segment.
 //
-// What does change: Huffman tables are re-optimised, the output is always a single
-// baseline scan (progressive input becomes baseline, with identical coefficients), and
-// restart markers are dropped.
+// What does change: Huffman tables are re-optimised, restart markers are dropped, and the
+// scans are rewritten: baseline files as one baseline scan, progressive files as progressive
+// scans with pixmix's own scan script (option `progressive` overrides either way).
+//
+// One catch: progressive AC scans only cover an image's real blocks, not the padding blocks
+// of partial edge MCUs. Scrambling can move real content into those, so a scrambled file is
+// only progressive when there is no such padding; the marker remembers that the original was
+// progressive, and restoring writes progressive again (exactly: the original could not hold
+// AC data in padding blocks either).
 
 import { readSegments, writeSegments, isJpeg, isSof, isApp, startsWith, M } from './markers.js';
 import { decodeFrame } from './decode.js';
@@ -12,7 +18,7 @@ import { assembleJpeg } from './encode.js';
 import { applyMcuLayout, transformCount } from './transform.js';
 import { computeGridLayout } from '../../core/layout.js';
 import {
-  makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError, MCU_TRANSFORMS,
+  makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError, MCU_TRANSFORMS, MCU_PROGRESSIVE,
 } from '../../core/params.js';
 import { readJpegMetadata } from '../../meta/jpeg.js';
 import { readOrientation } from '../../meta/exif.js';
@@ -110,11 +116,15 @@ export function sanitizeJpeg(bytes) {
   return { bytes: writeSegments(out), dropped };
 }
 
+// 'auto' keeps the source's structure: progressive stays progressive, baseline baseline.
+const isProgressive = (frame, progressive) => (progressive === 'auto' || progressive === undefined ? frame.marker === M.SOF2 : !!progressive);
+const hasPadding = (frame) => frame.components.some((c) => c.realW < c.blocksW || c.realH < c.blocksH);
+
 /**
  * @param {Uint8Array} bytes JPEG
- * @param {{key: string|Uint8Array, transforms?: boolean, salt?: Uint8Array, mode?: string}} opts
+ * @param {{key: string|Uint8Array, transforms?: boolean, salt?: Uint8Array, mode?: string, progressive?: boolean|'auto'}} opts
  */
-export function scrambleJpeg(bytes, { key, transforms = true, salt, mode } = {}) {
+export function scrambleJpeg(bytes, { key, transforms = true, salt, mode, progressive } = {}) {
   if (mode && mode !== 'mcu') {
     throw new PixmixError(`JPEG output is scrambled per MCU; mode "${mode}" does not apply (use mode "mcu" or omit it)`, 'BAD_OPTION');
   }
@@ -122,14 +132,18 @@ export function scrambleJpeg(bytes, { key, transforms = true, salt, mode } = {})
   if (markerSegment(segments)) {
     throw new PixmixError('Image is already scrambled (decode it first, or use rekey)', 'ALREADY_SCRAMBLED');
   }
-  const params = makeParams({ mode: 'mcu', transforms, salt });
+  const restoreProgressive = isProgressive(frame, progressive);
+  const params = makeParams({ mode: 'mcu', transforms, progressive: restoreProgressive, salt });
   const layout = layoutFor(key, params, frame);
   const scrambled = applyMcuLayout(frame, layout, 'scramble');
-  return assembleJpeg(headerSegments(segments), scrambled, { marker: markerPayload(params, layout.check) });
+  return assembleJpeg(headerSegments(segments), scrambled, {
+    marker: markerPayload(params, layout.check),
+    progressive: restoreProgressive && !hasPadding(frame),
+  });
 }
 
 /** Full decode with the layout, for the browser reveal. */
-export function unscrambleJpegDetailed(bytes, { key } = {}) {
+export function unscrambleJpegDetailed(bytes, { key, progressive } = {}) {
   const { segments, frame } = parse(bytes);
   const marker = readMarkerFrom(segments);
   if (!marker) throw new PixmixError('Image carries no pixmix marker', 'NOT_SCRAMBLED');
@@ -140,7 +154,9 @@ export function unscrambleJpegDetailed(bytes, { key } = {}) {
     layout,
     params: marker.params,
     segments: header,
-    toJpeg: () => assembleJpeg(header, restored),
+    toJpeg: () => assembleJpeg(header, restored, {
+      progressive: progressive === undefined || progressive === 'auto' ? !!(marker.params.block & MCU_PROGRESSIVE) : !!progressive,
+    }),
   };
 }
 
@@ -148,15 +164,20 @@ export function unscrambleJpeg(bytes, opts) {
   return unscrambleJpegDetailed(bytes, opts).toJpeg();
 }
 
-export function rekeyJpeg(bytes, { from, to, transforms, salt, mode } = {}) {
+export function rekeyJpeg(bytes, { from, to, transforms, salt, mode, progressive } = {}) {
   if (mode && mode !== 'mcu') throw new PixmixError(`JPEG only supports mode "mcu"`, 'BAD_OPTION');
   const { segments, frame } = parse(bytes);
   const marker = readMarkerFrom(segments);
   if (!marker) throw new PixmixError('Image carries no pixmix marker', 'NOT_SCRAMBLED');
   const plain = applyMcuLayout(frame, layoutFor(from, marker.params, frame, marker.check), 'unscramble');
-  const params = makeParams({ mode: 'mcu', transforms: transforms ?? !!(marker.params.block & MCU_TRANSFORMS), salt });
+  const restoreProgressive = progressive === undefined || progressive === 'auto' ? !!(marker.params.block & MCU_PROGRESSIVE) : !!progressive;
+  const params = makeParams({
+    mode: 'mcu', transforms: transforms ?? !!(marker.params.block & MCU_TRANSFORMS), progressive: restoreProgressive, salt,
+  });
   const layout = layoutFor(to, params, frame);
-  return assembleJpeg(headerSegments(segments), applyMcuLayout(plain, layout, 'scramble'), { marker: markerPayload(params, layout.check) });
+  return assembleJpeg(headerSegments(segments), applyMcuLayout(plain, layout, 'scramble'), {
+    marker: markerPayload(params, layout.check), progressive: restoreProgressive && !hasPadding(frame),
+  });
 }
 
 /** Cheap: parses segments only, no entropy decoding. */

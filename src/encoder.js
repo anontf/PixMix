@@ -40,6 +40,8 @@ const needsAsync = (what) => new PixmixError(`JPEG XL ${what} is async; use ${wh
  * @property {number} [block=8]        block mode tile size
  * @property {number} [effort]         JPEG XL encoder effort 1-9 (default 2 in pixel mode, else 7)
  * @property {boolean} [transforms=true]  JPEG: also flip/rotate each MCU (lossless)
+ * @property {boolean|'auto'} [progressive='auto']  JPEG: write progressive scans; 'auto'
+ *           keeps a JPEG source's structure (and means baseline for other sources)
  * @property {number} [level]          zlib level for PNG output
  * @property {number} [quality=90]     JPEG quality when the input is not already JPEG
  * @property {'4:2:0'|'4:2:2'|'4:4:4'} [subsampling]  likewise

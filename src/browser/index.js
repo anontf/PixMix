@@ -32,13 +32,21 @@ export async function decodeAsync(input, { key } = {}) {
 }
 
 /**
- * Fetches and decodes to a blob: URL an <img> can show: the original PNG/JPEG, or for
- * JPEG XL (which most browsers cannot display) a lossless PNG of its pixels.
+ * The restored image in a form every browser displays: PNG and JPEG as they are; JPEG XL
+ * (which most browsers cannot show) as a lossless PNG of its pixels, or, on the JPEG
+ * route, as the original JPEG. Works without the JPEG XL encoder or cjxl.
+ * @returns {Promise<{bytes: Uint8Array, type: string}>}
  */
-export async function decodeToURL(url, { key, fetchOptions, worker } = {}) {
-  const bytes = await fetchBytes(url, fetchOptions);
+export async function restoreForDisplay(input, { key, worker } = {}) {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
   const job = await prepare(bytes, key, 'ignore', false, worker);
-  return URL.createObjectURL(new Blob([await job.restored()], { type: job.type }));
+  return { bytes: job.restored(), type: job.type };
+}
+
+/** Fetches, restores for display (see restoreForDisplay) and returns a blob: URL. */
+export async function decodeToURL(url, { key, fetchOptions, worker } = {}) {
+  const { bytes, type } = await restoreForDisplay(await fetchBytes(url, fetchOptions), { key, worker });
+  return URL.createObjectURL(new Blob([bytes], { type }));
 }
 
 /**

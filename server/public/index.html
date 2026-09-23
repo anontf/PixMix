@@ -283,7 +283,11 @@ async function runDecode() {
     return;
   }
   $('decTime').textContent = ms(performance.now() - t0);
-  $('decMeta').innerHTML = await verify();
+  try {
+    $('decMeta').innerHTML = await verify();
+  } catch (err) {
+    $('decMeta').innerHTML = `<span class="bad">verification failed: ${esc(err.message)}</span>`;
+  }
 }
 
 async function rgba(bytes) {
@@ -299,20 +303,26 @@ async function rgba(bytes) {
 
 async function verify() {
   const key = $('decKey').value || activeKey;
-  const restored = await Dec.decodeAsync(scrambled, { key });
-  const [a, b] = await Promise.all([rgba(reference), rgba(restored)]);
+  // A JPEG-route JPEG XL restores to JPEG XL only with cjxl (servers); in the browser,
+  // compare the JPEG inside it with the (sanitised) original JPEG instead.
+  const info = Enc.inspect(scrambled);
+  const jpegRoute = info.format === 'jxl' && info.mode === 'mcu';
+  const restored = jpegRoute ? (await Dec.restoreForDisplay(scrambled, { key })).bytes : await Dec.decodeAsync(scrambled, { key });
+  const ref = jpegRoute ? (await Enc.convertAsync(original, { format: 'jpeg' })).bytes : reference;
+  const [a, b] = await Promise.all([rgba(ref), rgba(restored)]);
   let diff = 0, maxDelta = 0;
   for (let i = 0; i < a.length; i++) {
     const d = Math.abs(a[i] - b[i]);
     if (d) { diff++; if (d > maxDelta) maxDelta = d; }
   }
-  const meta = (b) => JSON.stringify(structure(b).filter((c) => !CODING.has(c.type) && !/^SOF/.test(c.type)));
-  const sameMeta = meta(reference) === meta(restored);
-  const vs = Enc.detectFormat(original) === 'png' ? 'original' : 'browser-side conversion of the original';
+  const meta = (x) => JSON.stringify(structure(x).filter((c) => !CODING.has(c.type) && !/^SOF/.test(c.type)));
+  const sameMeta = meta(ref) === meta(restored);
+  const vs = Enc.detectFormat(original) === Enc.detectFormat(restored) ? 'original' : 'browser-side conversion of the original';
   const pixelsLine = a.length !== b.length ? '<span class="bad">✗ size differs</span>'
     : diff === 0 ? `<span class="ok">✓ pixel-identical to the ${vs}</span>`
     : `<span class="bad">≈ ${diff} samples differ (max Δ ${maxDelta}) from the ${vs}: server and browser decoded the lossy source differently</span>`;
   return `${pixelsLine} · ${sameMeta ? '<span class="ok">✓ metadata chunks identical</span>' : '<span class="bad">✗ chunks differ</span>'}` +
+    `${jpegRoute ? ' · JPEG route: compared the JPEG inside' : ''}` +
     ` · restored ${kib(restored.length)} · <a download="restored.${EXT[Enc.detectFormat(restored)]}" href="${blobUrl(restored)}">download</a>`;
 }
 

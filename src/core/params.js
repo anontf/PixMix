@@ -4,7 +4,8 @@
 // JPEG: APP15 segment "pixmix\0"):
 //   u8  version        (1)
 //   u8  mode           (0 = pixel, 1 = block, 2 = mcu)
-//   u16 block          (big-endian; block: tile size, pixel: 0, mcu: flags, bit 0 = transforms)
+//   u16 block          (big-endian; block: tile size, pixel: 0, mcu: flags, bit 0 = transforms,
+//                       bit 1 = restore as progressive JPEG)
 //   u8  salt length    (0..255)
 //   ..  salt
 //   u8[4] key check    (lets the decoder reject a wrong key instead of producing noise)
@@ -14,6 +15,7 @@ import { hkdf } from './sha256.js';
 export const VERSION = 1;
 export const MODES = /** @type {const} */ (['pixel', 'block', 'mcu']);
 export const MCU_TRANSFORMS = 1;
+export const MCU_PROGRESSIVE = 2;
 const SALT_BYTES = 16;
 const CHECK_BYTES = 4;
 
@@ -28,7 +30,7 @@ const utf8 = new TextEncoder();
  */
 
 /** @returns {ScrambleParams} */
-export function makeParams({ mode = 'pixel', block = 8, transforms = true, salt } = {}) {
+export function makeParams({ mode = 'pixel', block = 8, transforms = true, progressive = false, salt } = {}) {
   if (!MODES.includes(mode)) throw new PixmixError(`Unknown mode "${mode}" (expected pixel, block or mcu)`);
   if (mode === 'block' && !(Number.isInteger(block) && block >= 2 && block <= 4096)) {
     throw new PixmixError('Block size must be an integer between 2 and 4096');
@@ -37,7 +39,7 @@ export function makeParams({ mode = 'pixel', block = 8, transforms = true, salt 
     salt = new Uint8Array(SALT_BYTES);
     globalThis.crypto.getRandomValues(salt);
   }
-  const field = mode === 'block' ? block : mode === 'mcu' ? (transforms ? MCU_TRANSFORMS : 0) : 0;
+  const field = mode === 'block' ? block : mode === 'mcu' ? (transforms ? MCU_TRANSFORMS : 0) | (progressive ? MCU_PROGRESSIVE : 0) : 0;
   return { version: VERSION, mode, block: field, salt };
 }
 

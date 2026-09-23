@@ -28,6 +28,7 @@ Options:
   --block <n>              tile size in block mode (default 8)
   --effort <1-9>           JPEG XL encoder effort (default 2 in pixel mode, 7 in block mode)
   --no-transforms          JPEG: shuffle MCUs only, without flipping/rotating them
+  --progressive | --baseline  JPEG scan structure (default: same as a JPEG source, else baseline)
   --quality <1-100>        JPEG quality when converting to JPEG (default 90)
   --subsampling <s>        JPEG chroma subsampling when converting: 4:2:0 (default), 4:2:2, 4:4:4
   --background <#rrggbb>   JPEG: colour transparency is flattened onto (default #ffffff)
@@ -60,6 +61,8 @@ const OPTIONS = {
   subsampling: { type: 'string' },
   background: { type: 'string' },
   'no-transforms': { type: 'boolean' },
+  progressive: { type: 'boolean' },
+  baseline: { type: 'boolean' },
   'keep-thumbnails': { type: 'boolean' },
   'in-place': { type: 'boolean' },
   force: { type: 'boolean', short: 'f' },
@@ -124,6 +127,9 @@ async function commandOptions(command, o) {
   if (o.subsampling) opts.subsampling = o.subsampling;
   if (o.background) opts.background = o.background;
   if (o['no-transforms']) opts.transforms = false;
+  if (o.progressive && o.baseline) throw new UsageError('Use either --progressive or --baseline');
+  if (o.progressive) opts.progressive = true;
+  if (o.baseline) opts.progressive = false;
   if (o['keep-thumbnails']) opts.keepThumbnails = true;
   if (command === 'rekey') {
     opts.from = await keyFrom(o.key, o['key-file'], 'PIXMIX_KEY', 'old key (-k, --key-file or $PIXMIX_KEY)');

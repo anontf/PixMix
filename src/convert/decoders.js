@@ -99,9 +99,16 @@ export const jxlDecoder = {
   async decode(bytes) {
     const header = readJxlHeader(readJxl(bytes).codestream);
     const keepColour = header.srgb === false;
-    const image = await (await loadJxlCodec()).decode(bytes, { srgb: !keepColour });
-    const dropped = reencodeNotes(header).filter((n) => !n.startsWith('lossy') && !(keepColour && n.startsWith('colour')));
-    return { ...image, metadata: { dropped, ...(image.icc ? { icc: image.icc } : {}) } };
+    const codec = await loadJxlCodec();
+    const high = !header.animated && (header.bits > 8 || header.float);
+    const image = await codec.decode(bytes, { srgb: !keepColour, high });
+    // Precision above 8 bits is kept (as 16-bit); the notes that remain are about what's lost.
+    const dropped = reencodeNotes(header).filter((n) => !n.startsWith('lossy') && !(keepColour && n.startsWith('colour')) && !(high && n.includes('precision')));
+    const metadata = { dropped, ...(image.icc ? { icc: image.icc } : {}) };
+    if (!header.animated) return { ...image, metadata };
+    // Animations: every frame, for APNG output (other targets keep the first).
+    const anim = await codec.decodeAnimation(bytes, { srgb: !keepColour });
+    return { ...image, animation: { frames: anim.frames, plays: anim.plays }, metadata };
   },
 };
 

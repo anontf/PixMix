@@ -130,9 +130,12 @@ async function toJxlWithMarker(scrambledJpeg) {
   return writeJxl([...kept, { type: MARKER_BOX, data: jpegMarkerBytes(scrambledJpeg) }], codestream);
 }
 
-/** JPEG (already sanitised) -> DCT-domain scramble -> recompressed JPEG XL. */
+/**
+ * JPEG (already sanitised) -> DCT-domain scramble -> recompressed JPEG XL. The JPEG inside
+ * is always baseline: jxl-oxide 0.12 cannot reconstruct some progressive JPEGs.
+ */
 export async function scrambleJpegToJxl(jpeg, { key, transforms, salt } = {}) {
-  return toJxlWithMarker(scrambleJpeg(jpeg, { key, transforms, salt }));
+  return toJxlWithMarker(scrambleJpeg(jpeg, { key, transforms, salt, progressive: false }));
 }
 
 // --- both routes -------------------------------------------------------------------
@@ -178,7 +181,7 @@ export async function rekeyJxl(bytes, { from, to, mode, block, salt, effort, tra
   if (marker.params.mode === 'mcu') {
     if (mode && mode !== 'mcu') throw new PixmixError('This JPEG XL holds a scrambled JPEG; it can only be re-keyed in mode "mcu"', 'BAD_OPTION');
     const jpeg = await reconstructJpeg(bytes);
-    return toJxlWithMarker(rekeyJpeg(jpeg, { from, to, transforms, salt }));
+    return toJxlWithMarker(rekeyJpeg(jpeg, { from, to, transforms, salt, progressive: false }));
   }
   if (mode === 'mcu') throw new PixmixError('Mode "mcu" needs a JPEG XL that holds a JPEG', 'BAD_OPTION');
   const image = await (await loadJxlCodec()).decode(bytes);

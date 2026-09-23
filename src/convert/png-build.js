@@ -6,7 +6,9 @@
 
 import { writeChunks } from '../formats/png/chunks.js';
 import { encodeRaster } from '../formats/png/raster.js';
-import { deflate } from '../formats/png/zlib.js';
+// Metadata is compressed with fflate everywhere (not native zlib) so the same input gives
+// byte-identical chunks on servers and in browsers.
+import { zlibSync } from 'fflate';
 
 const utf8 = new TextEncoder();
 const latin1Bytes = (s) => Uint8Array.from(s, (c) => { const n = c.charCodeAt(0); return n < 256 ? n : 63; });
@@ -20,11 +22,19 @@ const latin1Bytes = (s) => Uint8Array.from(s, (c) => { const n = c.charCodeAt(0)
  */
 export function buildPng(image, meta = {}) {
   const { width, height } = image;
-  const frames = image.animation?.frames.length > 1 ? image.animation.frames : null;
+  if (image.depth === 16) {
+    // 16-bit RGBA (a Uint16Array). If every sample is exactly an 8-bit value (v * 257),
+    // 8 bits lose nothing, so take the smaller 8-bit route.
+    const d = image.data;
+    let exact8 = true;
+    for (let i = 0; i < d.length; i++) if (d[i] % 257) { exact8 = false; break; }
+    if (exact8) return buildPng({ ...image, depth: 8, data: Uint8Array.from(d, (v) => v / 257) }, meta);
+  }
+  const frames = image.depth !== 16 && image.animation?.frames.length > 1 ? image.animation.frames : null;
   // All frames share one colour type (and palette), so analyse them together; Uint32 views
   // below need 4-byte alignment (pooled Node Buffers may not have it).
   let data = frames ? concatAll(frames.map((f) => f.data)) : image.data.byteOffset % 4 ? image.data.slice() : image.data;
-  if (data.length !== width * height * 4 * (frames?.length ?? 1)) throw new RangeError('Decoder must return width*height RGBA bytes');
+  if (data.length !== width * height * 4 * (frames?.length ?? 1)) throw new RangeError('Decoder must return width*height RGBA samples');
   const transferred = frames ? ['animation'] : [];
   const dropped = [...(meta.dropped ?? [])].filter((d) => !(frames && d.startsWith('animation')));
 
@@ -37,16 +47,17 @@ export function buildPng(image, meta = {}) {
     icc = undefined;
   }
   const rows = height * (frames?.length ?? 1);
-  let raster = pickRaster(width, rows, data, icc ? iccSpace : null);
+  const pick = image.depth === 16 ? pickRaster16 : pickRaster;
+  let raster = pick(width, rows, data, icc ? iccSpace : null);
   if (raster.iccMismatch) {
     dropped.push('ICC profile (GRAY profile on a colour image)');
     icc = undefined;
-    raster = pickRaster(width, rows, data, null);
+    raster = pick(width, rows, data, null);
   }
 
   const chunks = [{ type: 'IHDR', data: ihdr(width, height, raster.depth, raster.colorType) }];
   if (icc) {
-    chunks.push({ type: 'iCCP', data: concat(latin1Bytes('ICC profile'), new Uint8Array([0, 0]), deflate(icc, 9)) });
+    chunks.push({ type: 'iCCP', data: concat(latin1Bytes('ICC profile'), new Uint8Array([0, 0]), zlibSync(icc, { level: 9 })) });
     transferred.push('ICC profile');
   }
   if (meta.density) {
@@ -155,6 +166,29 @@ function u32(...values) {
 }
 
 const concatAll = (parts) => concat(...parts);
+
+/** 16-bit counterpart of pickRaster: grey / grey+alpha / RGB / RGBA, big-endian samples. */
+function pickRaster16(width, height, d, iccSpace) {
+  const n = width * height;
+  let grey = true, opaque = true;
+  for (let o = 0; o < n * 4 && (grey || opaque); o += 4) {
+    if (grey && (d[o] !== d[o + 1] || d[o] !== d[o + 2])) grey = false;
+    if (opaque && d[o + 3] !== 65535) opaque = false;
+  }
+  if (iccSpace === 'GRAY' && !grey) return { iccMismatch: true };
+  if (iccSpace === 'RGB ') grey = false;
+  const keep = grey ? (opaque ? [0] : [0, 3]) : opaque ? [0, 1, 2] : [0, 1, 2, 3];
+  const pixels = new Uint8Array(n * keep.length * 2);
+  for (let i = 0, o = 0; i < n; i++) {
+    for (const c of keep) {
+      const v = d[i * 4 + c];
+      pixels[o++] = v >> 8;
+      pixels[o++] = v & 255;
+    }
+  }
+  const colorType = grey ? (opaque ? 0 : 4) : opaque ? 2 : 6;
+  return { colorType, depth: 16, pixels };
+}
 
 function ihdr(width, height, depth, colorType) {
   const d = new Uint8Array(13);

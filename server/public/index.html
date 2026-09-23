@@ -31,6 +31,13 @@
     </label>
     <label class="jpeg-only">Quality <input type="number" id="quality" value="90" min="1" max="100" title="only used when converting to JPEG"></label>
     <label class="jxl-only">Effort <input type="number" id="effort" min="1" max="9" placeholder="auto" title="JPEG XL encoder effort; auto = 2 for pixel, 7 for block"></label>
+    <label>Carry watermark
+      <select id="encWm" class="wm-list" title="the decoder draws it on the restored image"><option value="">none</option></select>
+    </label>
+    <label>id only <input type="checkbox" id="encWmRef" title="carry just the id; decoders fetch /watermarks/&lt;id&gt;.json"></label>
+    <label>Visible watermark
+      <select id="visWm" class="wm-list" title="drawn on the scrambled image; restoring stays exact"><option value="">none</option></select>
+    </label>
     <label>Encode on
       <select id="where"><option value="server">server (Node)</option><option value="browser">browser</option></select>
     </label>
@@ -63,6 +70,9 @@
     </label>
     <label>Duration ms <input type="number" id="duration" value="1600" min="0" step="100"></label>
     <label>Web Worker <input type="checkbox" id="worker" checked title="decode off the main thread"></label>
+    <label>Watermark
+      <select id="decWm" class="wm-list"><option value="auto">the file's own</option><option value="none">none</option></select>
+    </label>
     <button class="primary" id="replay" disabled>Decode again</button>
     <label>New key <input id="newKey" placeholder="rotate to…" size="18"></label>
     <button id="rekey" disabled>Rekey</button>
@@ -76,6 +86,30 @@
       <div id="chunks" class="meta">–</div>
     </div>
   </div>
+
+  <section class="card wm" id="wmEditor">
+    <h2>Watermarks <span class="meta" id="wmStatus"></span></h2>
+    <div class="controls wm-bar">
+      <label>Watermark <select id="wmPick" class="wm-list"></select></label>
+      <button id="wmNew">New</button>
+      <button id="wmCopy">Duplicate</button>
+      <button id="wmDelete">Delete</button>
+      <button class="primary" id="wmSave">Save to watermarks/</button>
+      <label>Preview on
+        <select id="wmBg"><option value="current">current image</option><option value="light">light 800×500</option><option value="dark">dark 800×500</option><option value="small">small 160×100</option><option value="large">large 4000×2600</option></select>
+      </label>
+      <label>Zoom <select id="wmZoom"><option>1</option><option selected>2</option><option>4</option></select></label>
+    </div>
+    <div class="wm-body">
+      <form id="wmForm" class="wm-form" autocomplete="off" onsubmit="return false"></form>
+      <div class="wm-preview">
+        <div class="stage"><canvas id="wmCanvas" width="800" height="500"></canvas></div>
+        <div class="stage wm-zoom"><canvas id="wmZoomCanvas" width="1" height="1"></canvas></div>
+        <div class="meta" id="wmInfo"></div>
+        <details class="meta"><summary>definition JSON (as saved)</summary><textarea id="wmJson" rows="14" spellcheck="false"></textarea></details>
+      </div>
+    </div>
+  </section>
 </main>
 
 <script type="module">
@@ -112,6 +146,7 @@ async function jxlToPng(bytes) {
 async function loadOriginal(bytes, name, note = '') {
   original = bytes;
   originalName = name;
+  document.dispatchEvent(new CustomEvent('lab:image', { detail: bytes })); // the watermark editor previews on it
   scrambled = null;
   reference = null;
   showImage('origStage', bytes);
@@ -220,16 +255,31 @@ function encodeOpts() {
 // Query-string form for the server (booleans as 0/1).
 const toQuery = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, typeof v === 'boolean' ? Number(v) : v]));
 
+// Watermarks chosen for encoding: ids for the server, compiled watermarks in the browser.
+const compiledWm = (id) => fetch(`/watermarks/${encodeURIComponent(id)}.json`, { cache: 'no-cache' }).then((r) => r.json());
+async function withWatermarks(o, where) {
+  const carry = $('encWm').value, visible = $('visWm').value;
+  if (where === 'server') {
+    return { ...o, ...(carry ? { watermark: carry, ...($('encWmRef').checked ? { watermarkEmbed: 'id' } : {}) } : {}), ...(visible ? { visibleWatermark: visible } : {}) };
+  }
+  return {
+    ...o,
+    ...(carry ? { watermark: $('encWmRef').checked ? { id: carry } : await compiledWm(carry) } : {}),
+    ...(visible ? { visibleWatermark: await compiledWm(visible) } : {}),
+  };
+}
+
 $('encode').addEventListener('click', async () => {
   const opts = encodeOpts();
   const where = $('where').value;
   const t0 = performance.now();
   let report;
   try {
+    const wm = await withWatermarks(opts, where);
     if (where === 'server') {
-      ({ bytes: scrambled, report } = await serverCall('/api/encode', toQuery(opts), original));
+      ({ bytes: scrambled, report } = await serverCall('/api/encode', toQuery(wm), original));
     } else {
-      scrambled = await Enc.encodeAsync(original, { ...opts, decoders: browserDecoders, onConvert: (r) => { report = r; } });
+      scrambled = await Enc.encodeAsync(original, { ...wm, decoders: browserDecoders, onConvert: (r) => { report = r; } });
     }
     // Reference for verification: the input as the encoder saw it before scrambling
     // (sanitised, or converted), recomputed in the browser.
@@ -259,7 +309,8 @@ function showScrambled(note, report) {
   const info = Enc.inspect(scrambled);
   $('scrSize').textContent = `${kib(scrambled.length)} (${(scrambled.length / original.length).toFixed(2)}×)`;
   const mode = info.format === 'jpeg' ? `mcu ${info.mcu}${info.transforms ? ' + flips' : ''}` : `${info.mode}${info.block ? ` ${info.block}px` : ''}`;
-  $('scrMeta').innerHTML = `${note} · <b>${info.format.toUpperCase()}</b> · mode <b>${mode}</b> · ` +
+  const wms = [info.watermark ? `carries <b>${esc(info.watermark.id)}</b>${info.watermark.embedded ? '' : ' (id)'}` : '', info.visibleWatermark ? 'visible watermark' : ''].filter(Boolean);
+  $('scrMeta').innerHTML = `${note} · <b>${info.format.toUpperCase()}</b> · mode <b>${mode}</b> · ${wms.length ? `${wms.join(' · ')} · ` : ''}` +
     `<a download="scrambled.${EXT[info.format]}" href="${blobUrl(scrambled)}">download</a>${describe(report)}`;
   renderChunks(structure(reference), structure(scrambled), Enc.detectFormat(original) !== info.format);
   for (const id of ['replay', 'rekey', 'publish']) $(id).disabled = false;
@@ -281,6 +332,7 @@ async function runDecode() {
       effect: $('effect').value,
       duration: Number($('duration').value),
       worker: $('worker').checked,
+      watermark: $('decWm').value === 'auto' ? undefined : $('decWm').value === 'none' ? false : $('decWm').value,
       onProgress: (p) => { $('bar').style.width = `${p * 100}%`; },
     });
   } catch (err) {
@@ -289,7 +341,8 @@ async function runDecode() {
   }
   $('decTime').textContent = ms(performance.now() - t0);
   try {
-    $('decMeta').innerHTML = await verify();
+    const drawn = $('decWm').value === 'none' ? null : $('decWm').value === 'auto' ? Enc.inspect(scrambled).watermark?.id : $('decWm').value;
+    $('decMeta').innerHTML = await verify() + (drawn ? ` · watermark <b>${esc(drawn)}</b> drawn on the shown image (the check above is the exact restore)` : '');
   } catch (err) {
     $('decMeta').innerHTML = `<span class="bad">verification failed: ${esc(err.message)}</span>`;
   }
@@ -386,11 +439,13 @@ $('rekey').addEventListener('click', async () => {
 });
 
 $('publish').addEventListener('click', async () => {
-  const q = new URLSearchParams({ key: activeKey, effect: $('effect').value, name: originalName });
+  // (the demo site reveals it with the watermark picked for decoding, unless it overrides)
+  const q = new URLSearchParams({ key: activeKey, effect: $('effect').value, name: originalName, watermark: $('decWm').value === 'auto' ? '' : $('decWm').value });
   const res = await fetch(`/api/gallery?${q}`, { method: 'POST', body: scrambled });
   const out = await res.json();
   $('pubMeta').innerHTML = res.ok ? `published → <a href="/site.html">demo site</a>` : `<span class="bad">${esc(out.error)}</span>`;
 });
 </script>
+<script type="module" src="/watermarks.js"></script>
 </body>
 </html>

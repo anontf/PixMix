@@ -3,12 +3,18 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { mkdtempSync, cpSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { launch, engines, openPage } from './harness.js';
 
-let proc, base;
+let proc, base, wmDir;
 before(async () => {
+  // The lab saves watermarks: give it a copy of the directory, not the repository's.
+  wmDir = mkdtempSync(join(tmpdir(), 'pixmix-lab-wm-'));
+  cpSync(new URL('../../watermarks', import.meta.url).pathname, wmDir, { recursive: true });
   proc = spawn(process.execPath, [new URL('../../server/server.js', import.meta.url).pathname], {
-    env: { ...process.env, PORT: '0' }, stdio: ['ignore', 'pipe', 'inherit'],
+    env: { ...process.env, PORT: '0', PIXMIX_WATERMARKS_DIR: wmDir }, stdio: ['ignore', 'pipe', 'inherit'],
   });
   base = await new Promise((resolve, reject) => {
     proc.stdout.on('data', (d) => { const m = /http:\/\/[\d.]+:\d+/.exec(String(d)); if (m) resolve(m[0]); });
@@ -17,6 +23,7 @@ before(async () => {
 });
 after(async () => {
   proc?.kill();
+  if (wmDir) rmSync(wmDir, { recursive: true, force: true });
 });
 
 async function encodeInLab(p, { sample, format, where, mode = '' }) {
@@ -59,6 +66,58 @@ for (const { name: engine, skip } of await engines()) describe(engine, { skip },
       });
     }
   }
+
+  test('lab watermark editor: live preview, save to disk, then decode with it', async () => {
+    const { page: p, errors } = await openPage(browser);
+    await p.goto(base);
+    await p.waitForFunction(() => document.querySelectorAll('#wmPick option').length === 3);
+    await p.selectOption('#wmPick', 'vivi-window');
+    await p.waitForFunction(() => /size .* px/.test(document.querySelector('#wmInfo').textContent), null, { timeout: 20000 });
+    for (const bg of ['dark', 'small', 'large', 'light']) {
+      await p.selectOption('#wmBg', bg);
+      await p.waitForFunction((b) => document.querySelector('#wmInfo').textContent.startsWith({ dark: '800×500', small: '160×100', large: '4000×2600', light: '800×500' }[b]), bg);
+    }
+    // A new one, edited in the form.
+    const id = `lab-${engine}`;
+    await p.click('#wmNew');
+    await p.waitForFunction(() => /not saved/.test(document.querySelector('#wmStatus').textContent));
+    await p.fill('#wmForm input[name="id"]', id);
+    await p.fill('#wmForm textarea[name="text"]', 'Hi Vivi');
+    await p.selectOption('#wmForm select[name="font"]', 'PressStart2P-Regular');
+    await p.check('#wmForm input[name="shadow:on"]');
+    await p.waitForFunction(() => /"text": "Hi Vivi"/.test(document.querySelector('#wmJson').value) && /"shadow": \{/.test(document.querySelector('#wmJson').value), null, { timeout: 10000 });
+    const before = await p.textContent('#wmInfo');
+    await p.fill('#wmForm input[name="size.max"]', '20');
+    await p.fill('#wmForm input[name="size.relative"]', '0.5');
+    await p.waitForFunction((b) => document.querySelector('#wmInfo').textContent !== b && /size 20\.0 px/.test(document.querySelector('#wmInfo').textContent), before);
+    await p.click('#wmSave');
+    await p.waitForFunction(() => /^saved watermarks/.test(document.querySelector("#wmStatus").textContent));
+    const saved = JSON.parse(readFileSync(join(wmDir, `${id}.json`), 'utf8'));
+    assert.equal(saved.text, 'Hi Vivi');
+    assert.equal(saved.size.max, 20);
+    assert.ok(saved.shadow && existsSync(join(wmDir, 'compiled', `${id}.json`)));
+    // It is now offered for encoding and decoding.
+    await p.waitForFunction((w) => [...document.querySelectorAll('#decWm option, #encWm option')].filter((o) => o.value === w).length === 2, id);
+    await p.selectOption('#sampleType', 'image/jpeg');
+    await p.click('#sample');
+    await p.waitForFunction(() => !document.querySelector('#encode').disabled);
+    await p.selectOption('#encWm', id);
+    await p.selectOption('#visWm', 'vivi-pixel');
+    await p.fill('#duration', '200');
+    await p.click('#encode');
+    await p.waitForFunction(() => /✓|✗|≈|Error/.test(document.querySelector('#decMeta').textContent), null, { timeout: 60000 });
+    const dec = await p.textContent('#decMeta');
+    assert.match(dec, /✓ pixel-identical/, dec);
+    assert.match(dec, new RegExp(`watermark ${id} drawn`));
+    assert.match(await p.textContent('#scrMeta'), new RegExp(`carries ${id} · visible watermark`));
+    // Delete it again.
+    p.once('dialog', (d) => d.accept());
+    await p.click('#wmDelete');
+    await p.waitForFunction(() => /deleted/.test(document.querySelector('#wmStatus').textContent));
+    assert.equal(existsSync(join(wmDir, `${id}.json`)), false);
+    assert.deepEqual(errors, []);
+    await p.close();
+  });
 
   test('lab rekey, wrong decode key, then publish to the demo site', async () => {
     const { page: p, errors } = await openPage(browser);

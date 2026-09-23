@@ -56,6 +56,34 @@ tr.added td { color: var(--accent); }
 .gallery figcaption { padding: 8px 12px; font-size: 13px; color: var(--muted); }
 .empty { color: var(--muted); padding: 40px; text-align: center; border: 1px dashed var(--line); border-radius: 10px; }
 
+.wm { margin-top: 16px; }
+.wm-bar { border: 0; padding: 0 0 12px; }
+.wm-body { display: grid; grid-template-columns: minmax(320px, 1fr) minmax(300px, 1.3fr); gap: 16px; align-items: start; }
+.wm-form { display: grid; gap: 10px; max-height: 760px; overflow: auto; padding-right: 4px; }
+.wm-form fieldset { border: 1px solid var(--line); border-radius: 8px; margin: 0; padding: 8px 10px 10px;
+  display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: end; }
+.wm-form legend { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; padding: 0 4px; }
+.wm-form legend label { display: flex; flex-direction: row; gap: 6px; align-items: center; }
+.wm-form label { display: grid; gap: 3px; font-size: 11px; color: var(--muted); }
+.wm-form input[type=number] { width: 76px; }
+.wm-form input[type=range] { width: 90px; padding: 0; }
+.wm-form input[type=color] { width: 44px; height: 30px; padding: 2px; }
+.wm-form textarea, .wm-preview textarea { font: 12px ui-monospace, monospace; color: var(--ink); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 6px; padding: 6px; width: 100%; }
+.wm-form textarea { width: 220px; }
+.wm-paint, .wm-inline, .wm-orn { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: end; }
+.wm-orn { border-top: 1px dashed var(--line); padding-top: 8px; width: 100%; }
+.wm-anchors { display: grid; grid-template-columns: repeat(3, 18px); gap: 3px; }
+.wm-anchors button { width: 18px; height: 18px; padding: 0; border-radius: 4px; }
+.wm-anchors button[aria-pressed=true] { background: var(--accent); border-color: var(--accent); }
+.wm-preview { display: grid; gap: 10px; min-width: 0; }
+.wm-preview canvas { max-width: 100%; height: auto; display: block; }
+.wm-zoom { min-height: 60px; }
+.wm-zoom canvas { image-rendering: pixelated; }
+
+@media (max-width: 900px) {
+  .wm-body { grid-template-columns: 1fr; }
+}
 @media (max-width: 600px) {
   header, main { padding-left: 16px; padding-right: 16px; }
 }

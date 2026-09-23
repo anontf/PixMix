@@ -27,13 +27,25 @@ class FakeCanvas extends FakeElement {
   getContext() {
     const c = this;
     c.pixels ??= new Uint8ClampedArray(c.width * c.height * 4);
+    let m = [1, 0, 0, 1, 0, 0];
     return {
+      setTransform(...t) { m = t; },
+      clearRect() { c.pixels.fill(0); },
       putImageData(img, x, y) {
         for (let r = 0; r < img.height; r++) {
           c.pixels.set(img.data.subarray(r * img.width * 4, (r + 1) * img.width * 4), ((y + r) * c.width + x) * 4);
         }
       },
       drawImage(src, sx, sy, sw, sh, dx, dy) {
+        if (sw === undefined) { // drawImage(src, x, y) through the current transform
+          for (let y = 0; y < src.height; y++) for (let x = 0; x < src.width; x++) {
+            const X = Math.floor(m[0] * (x + 0.5) + m[2] * (y + 0.5) + m[4]);
+            const Y = Math.floor(m[1] * (x + 0.5) + m[3] * (y + 0.5) + m[5]);
+            const s = (y * src.width + x) * 4, d = (Y * c.width + X) * 4;
+            for (let k = 0; k < 4; k++) c.pixels[d + k] = src.pixels[s + k];
+          }
+          return;
+        }
         dx = Math.round(dx); dy = Math.round(dy);
         for (let r = 0; r < sh; r++) for (let q = 0; q < sw; q++) {
           const s = ((sy + r) * src.width + sx + q) * 4, d = ((dy + r) * c.width + dx + q) * 4;
@@ -89,4 +101,22 @@ test('reveal with wrong key leaves the image alone', async () => {
   await assert.rejects(reveal(img, { key: 'nope' }), { code: 'WRONG_KEY' });
   assert.equal(img.dataset.pixmixState, 'error');
   assert.equal(img.src, 'scrambled.png');
+});
+
+test('reveal applies EXIF orientation to the animation', async () => {
+  // A PNG tagged "rotate 90° CW" (orientation 6), as a converted phone JPEG would be.
+  const { buildPng } = await import('../src/convert/png-build.js');
+  const w = 6, h = 4;
+  const data = new Uint8Array(w * h * 4).map((_, i) => (i * 37) & 255).map((v, i) => (i % 4 === 3 ? 255 : v));
+  const tiff = new Uint8Array([0x49, 0x49, 0x2a, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0]);
+  const { png } = buildPng({ width: w, height: h, data }, { exif: tiff });
+  globalThis.fetch = async () => new Response(encode(png, { key: 'k' }));
+  const img = new FakeImg();
+  const out = await reveal(img, { key: 'k', duration: 20, final: 'canvas', orientation: 'apply' });
+  assert.equal(out.width, h);
+  assert.equal(out.height, w);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const s = (y * w + x) * 4, d = (x * h + (h - 1 - y)) * 4;
+    assert.deepEqual([...out.pixels.subarray(d, d + 4)], [...data.subarray(s, s + 4)]);
+  }
 });

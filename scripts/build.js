@@ -17,7 +17,7 @@ await rm(out(''), { recursive: true, force: true });
 const targets = [
   { entryPoints: [`${root}src/browser/index.js`], outfile: out('pixmix-decoder.js'), format: 'esm', platform: 'browser' },
   { entryPoints: [`${root}src/browser/auto.js`], outfile: out('pixmix-decoder.min.js'), format: 'iife', globalName: 'PixMix', platform: 'browser', minify: true },
-  { entryPoints: [`${root}src/encoder.js`], outfile: out('pixmix-encoder.mjs'), format: 'esm', platform: 'neutral' },
+  { entryPoints: [`${root}src/encoder.js`], outfile: out('pixmix-encoder.mjs'), format: 'esm', platform: 'neutral', mainFields: ['module', 'main'] },
   { entryPoints: [`${root}src/encoder.js`], outfile: out('pixmix-encoder.cjs'), format: 'cjs', platform: 'node' },
 ];
 

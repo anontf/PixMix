@@ -10,6 +10,8 @@
 import { decode, inspect, detectFormat, PixmixError, WrongKeyError } from '../decoder.js';
 import { unscramblePngDetailedAsync } from '../formats/png/index.js';
 import { toRGBA8 } from './rgba.js';
+import { readOrientation } from '../meta/exif.js';
+import { orientationTransform, swapsAxes, browserHonoursPngOrientation } from './orient.js';
 
 export { decode, inspect, detectFormat, PixmixError, WrongKeyError };
 
@@ -40,6 +42,8 @@ export async function decodeToURL(url, { key, fetchOptions } = {}) {
  * @param {string} [opts.src] defaults to data-pixmix-src, then the image's own src
  * @param {(p: number) => void} [opts.onProgress]
  * @param {RequestInit} [opts.fetchOptions]
+ * @param {'auto'|'apply'|'ignore'} [opts.orientation='auto'] EXIF orientation during the
+ *        animation; 'auto' matches whatever this browser does for the final <img>
  */
 export async function reveal(img, opts = {}) {
   const {
@@ -48,6 +52,7 @@ export async function reveal(img, opts = {}) {
     final = 'image',
     onProgress,
     fetchOptions,
+    orientation = 'auto',
   } = opts;
   const key = img.dataset.pixmixKey ?? optKey;
   let effect = img.dataset.pixmixEffect ?? opts.effect ?? 'dissolve';
@@ -62,9 +67,27 @@ export async function reveal(img, opts = {}) {
     const d = await unscramblePngDetailedAsync(bytes, { key });
 
     if (effect !== 'none') {
+      const { width, height } = d.layout;
+      const o = await effectiveOrientation(d.img, orientation);
       const canvas = document.createElement('canvas');
-      canvas.width = d.layout.width;
-      canvas.height = d.layout.height;
+      canvas.width = swapsAxes(o) ? height : width;
+      canvas.height = swapsAxes(o) ? width : height;
+      // Frames are drawn unrotated; with an orientation they go to an off-screen canvas
+      // and are copied through the EXIF transform after each frame.
+      let work = canvas, present;
+      if (o !== 1) {
+        work = document.createElement('canvas');
+        work.width = width;
+        work.height = height;
+        const vctx = canvas.getContext('2d');
+        const m = orientationTransform(o, width, height);
+        present = () => {
+          vctx.setTransform(1, 0, 0, 1, 0, 0);
+          vctx.clearRect(0, 0, canvas.width, canvas.height);
+          vctx.setTransform(...m);
+          vctx.drawImage(work, 0, 0);
+        };
+      }
       for (const attr of ['class', 'style', 'width', 'height']) {
         const v = img.getAttribute(attr);
         if (v !== null) canvas.setAttribute(attr, v);
@@ -73,7 +96,7 @@ export async function reveal(img, opts = {}) {
       const prevDisplay = img.style.display;
       img.before(canvas);
       img.style.display = 'none';
-      await animate(canvas, d, toRGBA8(d.img, d.img.pixels), { effect, duration, onProgress });
+      await animate(work, d, toRGBA8(d.img, d.img.pixels), { effect, duration, onProgress, present });
       if (final === 'canvas') {
         img.remove();
         canvas.dataset.pixmixState = 'done';
@@ -119,6 +142,14 @@ export function revealAll({ selector = 'img[data-pixmix]', root = document, lazy
   })));
 }
 
+async function effectiveOrientation(img, mode) {
+  if (mode === 'ignore') return 1;
+  const exif = img.chunks.find((c) => c.type === 'eXIf');
+  const o = exif ? readOrientation(exif.data) : 1;
+  if (o === 1 || mode === 'apply') return o;
+  return (await browserHonoursPngOrientation()) ? o : 1;
+}
+
 async function fetchBytes(url, fetchOptions) {
   const res = await fetch(url, fetchOptions);
   if (!res.ok) throw new PixmixError(`Failed to load ${url} (${res.status})`, 'FETCH');
@@ -140,13 +171,13 @@ function setImageSource(img, pngBytes) {
 
 const easeInOut = (t) => (t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2);
 
-function animate(canvas, d, scrambledRGBA, { effect, duration, onProgress }) {
+function animate(canvas, d, scrambledRGBA, { effect, duration, onProgress, present }) {
   const { width, height, map, tiles } = d.layout;
   const ctx = canvas.getContext('2d');
   const src32 = new Uint32Array(scrambledRGBA.buffer);
 
   if (effect === 'blocks' && tiles && tiles.perm.length && tiles.perm.length <= MAX_ANIMATED_TILES) {
-    return animateBlocks(ctx, d.layout, scrambledRGBA, duration, onProgress);
+    return animateBlocks(ctx, d.layout, scrambledRGBA, duration, onProgress, present);
   }
 
   const frame = new ImageData(scrambledRGBA.slice(), width, height);
@@ -169,11 +200,12 @@ function animate(canvas, d, scrambledRGBA, { effect, duration, onProgress }) {
     step(done, target);
     done = target;
     ctx.putImageData(frame, 0, 0);
+    present?.();
     onProgress?.(t);
   });
 }
 
-function animateBlocks(ctx, layout, scrambledRGBA, duration, onProgress) {
+function animateBlocks(ctx, layout, scrambledRGBA, duration, onProgress, present) {
   const { width, height, map, tiles } = layout;
   const { size, cols, rows, perm } = tiles;
   const count = perm.length;
@@ -230,6 +262,7 @@ function animateBlocks(ctx, layout, scrambledRGBA, duration, onProgress) {
         ctx.drawImage(sheet, moves[o], moves[o + 1], size, size, x, y, size, size);
       }
     }
+    present?.();
     onProgress?.(t);
   });
 }

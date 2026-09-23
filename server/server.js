@@ -8,7 +8,7 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { encode, rekey, inspect, PixmixError } from '../dist/pixmix-encoder.mjs';
+import { encodeAsync, rekey, inspect, sharpDecoder, PixmixError } from '../dist/pixmix-encoder.mjs';
 import { decode } from '../src/decoder.js';
 
 const PORT = Number(process.env.PORT) || 8080;
@@ -17,16 +17,29 @@ const ROOT = new URL('..', import.meta.url).pathname;
 const MAX_BODY = 64 * 1024 * 1024;
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.map': 'application/json' };
 
+// sharp is optional: with it the server also accepts WebP, AVIF, HEIC and TIFF uploads.
+const sharp = await import('sharp').then((m) => m.default, () => null);
+const decoders = sharp ? [sharpDecoder(sharp, { formats: ['webp', 'avif', 'heic', 'tiff', 'jxl'] })] : [];
+
 /** In-memory "CDN" for the demo site: id -> {bytes, key, name, effect}. */
 const gallery = new Map();
 
 const routes = {
-  'POST /api/encode': async (req, q) => png(encode(await body(req), {
-    key: q.get('key'),
-    mode: q.get('mode') || 'pixel',
-    block: q.has('block') ? Number(q.get('block')) : undefined,
-    level: q.has('level') ? Number(q.get('level')) : undefined,
-  })),
+  // Any supported input; the X-Pixmix-Convert header reports what happened to it.
+  'POST /api/encode': async (req, q) => {
+    let report;
+    const out = await encodeAsync(await body(req), {
+      key: q.get('key'),
+      mode: q.get('mode') || 'pixel',
+      block: q.has('block') ? Number(q.get('block')) : undefined,
+      level: q.has('level') ? Number(q.get('level')) : undefined,
+      format: q.get('format') || undefined,
+      decoders,
+      onConvert: (r) => { report = r; },
+    });
+    const { png: _, ...info } = report;
+    return { ...png(out), headers: { 'X-Pixmix-Convert': JSON.stringify(info) } };
+  },
   'POST /api/decode': async (req, q) => png(decode(await body(req), { key: q.get('key') })),
   'POST /api/rekey': async (req, q) => png(rekey(await body(req), {
     from: q.get('from'),
@@ -67,7 +80,7 @@ createServer(async (req, res) => {
     if (status === 500) console.error(err);
     send(res, json({ error: err.message, code: err.code }, status));
   }
-}).listen(PORT, HOST, () => console.log(`pixmix dev server on http://${HOST}:${PORT}`));
+}).listen(PORT, HOST, () => console.log(`pixmix dev server on http://${HOST}:${PORT}${sharp ? ' (sharp: on)' : ''}`));
 
 async function staticFile(pathname) {
   const img = pathname.match(/^\/images\/([\w-]+)\.png$/);
@@ -103,7 +116,7 @@ function body(req) {
 const png = (data) => ({ status: 200, type: 'image/png', data, cache: 'no-store' });
 const json = (obj, status = 200) => ({ status, type: 'application/json', data: JSON.stringify(obj) });
 
-function send(res, { status, type, data, cache = 'no-store' }) {
-  res.writeHead(status, { 'Content-Type': type, 'Cache-Control': cache, 'Content-Length': Buffer.byteLength(data) });
+function send(res, { status, type, data, cache = 'no-store', headers = {} }) {
+  res.writeHead(status, { 'Content-Type': type, 'Cache-Control': cache, 'Content-Length': Buffer.byteLength(data), ...headers });
   res.end(data);
 }

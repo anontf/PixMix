@@ -9,20 +9,42 @@
     ".": "./src/index.js",
     "./encoder": "./src/encoder.js",
     "./decoder": "./src/decoder.js",
-    "./browser": "./src/browser/index.js"
+    "./browser": "./src/browser/index.js",
+    "./plugins/sharp": "./src/plugins/sharp.js",
+    "./plugins/browser": "./src/plugins/browser.js"
   },
-  "files": ["src", "dist"],
+  "files": [
+    "src",
+    "dist",
+    "bin"
+  ],
   "scripts": {
     "build": "node scripts/build.js",
     "test": "node --test test/*.test.js",
     "serve": "npm run build && node server/server.js"
   },
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "fflate": "^0.8.2"
+    "fflate": "^0.8.2",
+    "jpeg-js": "^0.4.4",
+    "omggif": "^1.0.10"
   },
   "devDependencies": {
     "esbuild": "^0.28.2",
-    "pngjs": "^7.0.0"
+    "pngjs": "^7.0.0",
+    "sharp": "^0.35.4"
+  },
+  "bin": {
+    "pixmix": "bin/pixmix.js"
+  },
+  "peerDependencies": {
+    "sharp": ">=0.33"
+  },
+  "peerDependenciesMeta": {
+    "sharp": {
+      "optional": true
+    }
   }
 }

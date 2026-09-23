@@ -11,10 +11,18 @@ const SIGNATURES = [
   ['gif', [0x47, 0x49, 0x46, 0x38]],
   ['webp', [0x52, 0x49, 0x46, 0x46, -1, -1, -1, -1, 0x57, 0x45, 0x42, 0x50]],
   ['bmp', [0x42, 0x4d]],
+  ['tiff', [0x49, 0x49, 0x2a, 0x00]],
+  ['tiff', [0x4d, 0x4d, 0x00, 0x2a]],
 ];
+
+// ISO-BMFF images: 'ftyp' box at offset 4, then the major brand.
+const FTYP_BRANDS = { avif: 'avif', avis: 'avif', heic: 'heic', heix: 'heic', mif1: 'heic', msf1: 'heic' };
 
 /** @returns {string|null} */
 export function detectFormat(bytes) {
+  if (bytes.length >= 12 && String.fromCharCode(...bytes.subarray(4, 8)) === 'ftyp') {
+    return FTYP_BRANDS[String.fromCharCode(...bytes.subarray(8, 12))] ?? null;
+  }
   for (const [name, sig] of SIGNATURES) {
     if (bytes.length >= sig.length && sig.every((b, i) => b < 0 || bytes[i] === b)) return name;
   }

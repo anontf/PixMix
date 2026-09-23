@@ -10,6 +10,7 @@ import { loadJxlCodec } from './formats/jxl/load.js';
 import { readJxl, readJxlHeader } from './formats/jxl/container.js';
 import { convert, convertAsync, decodeForJxl, targetFormat, OUTPUT_FORMATS } from './convert/index.js';
 import { PixmixError } from './core/params.js';
+import { withLimits } from './core/limits.js';
 import { readWebpMetadata } from './meta/webp.js';
 import { readOrientation } from './meta/exif.js';
 
@@ -19,6 +20,7 @@ export { configureJxl, loadJxlCodec } from './formats/jxl/load.js';
 export { sharpDecoder } from './plugins/sharp.js';
 export { browserDecoder } from './plugins/browser.js';
 export { PixmixError, WrongKeyError } from './core/params.js';
+export { DEFAULT_LIMITS } from './core/limits.js';
 
 // JPEG XL only has async operations (its codec is WASM, loaded on first use).
 const SCRAMBLERS = {
@@ -50,6 +52,8 @@ const needsAsync = (what) => new PixmixError(`JPEG XL ${what} is async; use ${wh
  * @property {object[]} [decoders]     extra input decoders (see plugins/)
  * @property {(r: import('./convert/index.js').ConvertResult) => void} [onConvert]
  *           called with what happened to the input (decoder, metadata transferred/dropped)
+ * @property {Partial<import('./core/limits.js').Limits>} [limits]  resource limits for untrusted
+ *           input, over the defaults in core/limits.js; a violation throws code 'LIMIT'
  */
 
 /**
@@ -58,17 +62,20 @@ const needsAsync = (what) => new PixmixError(`JPEG XL ${what} is async; use ${wh
  * @param {Uint8Array|ArrayBuffer} input @param {EncodeOptions} opts @returns {Uint8Array}
  */
 export function encode(input, opts) {
-  const withFormat = withTarget(input, opts);
-  if (withFormat.format === 'jxl' || detectFormat(toBytes(input)) === 'jxl') throw needsAsync('encode');
-  const converted = convert(input, withFormat);
+  const bytes = toBytes(input);
+  opts = withLimits(bytes, opts);
+  const withFormat = withTarget(bytes, opts);
+  if (withFormat.format === 'jxl' || detectFormat(bytes) === 'jxl') throw needsAsync('encode');
+  const converted = convert(bytes, withFormat);
   opts.onConvert?.(converted);
   return SCRAMBLERS[converted.format].scramble(converted.bytes, opts);
 }
 
 /** Like encode, but also accepts async decoder plugins (sharp, browser-native) and JPEG XL. */
 export async function encodeAsync(input, opts) {
-  const withFormat = withTarget(input, opts);
   const bytes = toBytes(input);
+  opts = withLimits(bytes, opts);
+  const withFormat = withTarget(bytes, opts);
   const from = detectFormat(bytes);
   if (withFormat.format === 'jxl') {
     const viaJpeg = await jpegForJxl(bytes, from, opts);
@@ -81,13 +88,13 @@ export async function encodeAsync(input, opts) {
   }
   if (withFormat.format === 'jxl' && from !== 'jxl') {
     // Decode once, scramble the pixels, encode once (no intermediate unscrambled JXL).
-    const { image, boxes, report } = await decodeForJxl(input, withFormat);
+    const { image, boxes, report } = await decodeForJxl(bytes, withFormat);
     opts.onConvert?.(report);
     return scrambleJxlPixels(image, boxes, { ...opts, mode: opts.mode ?? 'pixel' });
   }
-  const converted = await convertAsync(input, withFormat);
+  const converted = await convertAsync(bytes, withFormat);
   if (converted.format === 'jxl') {
-    converted.dropped.push(...reencodeNotes(readJxlHeader(readJxl(converted.bytes).codestream)));
+    converted.dropped.push(...reencodeNotes(readJxlHeader(readJxl(converted.bytes, opts.limits).codestream, opts.limits)));
   }
   opts.onConvert?.(converted);
   const s = SCRAMBLERS[converted.format];
@@ -99,9 +106,9 @@ export async function encodeAsync(input, opts) {
  * The route is used when asked for (mode mcu), or by default when the source is a JPEG or a
  * recompressed-JPEG JXL and this runtime can run cjxl.
  */
-async function jpegForJxl(bytes, from, { mode }) {
+async function jpegForJxl(bytes, from, { mode, limits }) {
   if (mode && mode !== 'mcu') return null;
-  const isJpegSource = from === 'jpeg' || (from === 'jxl' && hasJpegData(bytes));
+  const isJpegSource = from === 'jpeg' || (from === 'jxl' && hasJpegData(bytes, limits));
   if (!isJpegSource) {
     if (mode === 'mcu') throw new PixmixError('Mode "mcu" needs a JPEG source (a JPEG, or a JPEG XL made from one)', 'BAD_OPTION');
     return null;
@@ -113,9 +120,9 @@ async function jpegForJxl(bytes, from, { mode }) {
   }
   if (from === 'jpeg') return { jpeg: bytes, decoder: 'none', notes: [] };
   try {
-    return { jpeg: await reconstructJpeg(bytes), decoder: 'jpeg reconstruction', notes: [] };
+    return { jpeg: await reconstructJpeg(bytes, limits), decoder: 'jpeg reconstruction', notes: [] };
   } catch (err) {
-    if (mode === 'mcu') throw err;
+    if (mode === 'mcu' || err?.code === 'LIMIT') throw err;
     return null; // e.g. a progressive JPEG jxl-oxide cannot rebuild: fall back to pixels
   }
 }
@@ -138,27 +145,34 @@ function withTarget(input, opts) {
  * Swaps the key (and optionally the mode) of a scrambled image without an
  * intermediate unscrambled file.
  * @param {Uint8Array|ArrayBuffer} input
- * @param {{from: string|Uint8Array, to: string|Uint8Array, mode?: 'pixel'|'block', block?: number, level?: number}} opts
+ * @param {{from: string|Uint8Array, to: string|Uint8Array, mode?: 'pixel'|'block', block?: number, level?: number,
+ *   limits?: Partial<import('./core/limits.js').Limits>}} opts
  */
 export function rekey(input, opts) {
   const bytes = toBytes(input);
   const s = pick(SCRAMBLERS, bytes);
   if (!s.rekey) throw needsAsync('rekey');
-  return s.rekey(bytes, opts);
+  return s.rekey(bytes, withLimits(bytes, opts));
 }
 
 /** rekey for every format, including JPEG XL. */
 export async function rekeyAsync(input, opts) {
   const bytes = toBytes(input);
   const s = pick(SCRAMBLERS, bytes);
+  opts = withLimits(bytes, opts);
   return s.rekey ? s.rekey(bytes, opts) : s.rekeyAsync(bytes, opts);
 }
 
-/** Describes an image and whether it carries a pixmix marker. */
-export function inspect(input) {
+/**
+ * Describes an image and whether it carries a pixmix marker. Reads headers only, and checks
+ * them against the same limits as decoding, so it doubles as a cheap check up front.
+ * @param {Uint8Array|ArrayBuffer} input @param {{limits?: Partial<import('./core/limits.js').Limits>}} [opts]
+ */
+export function inspect(input, opts) {
   const bytes = toBytes(input);
+  const { limits } = withLimits(bytes, opts);
   const format = detectFormat(bytes);
-  if (SCRAMBLERS[format]) return SCRAMBLERS[format].inspect(bytes);
+  if (SCRAMBLERS[format]) return SCRAMBLERS[format].inspect(bytes, limits);
   if (!format) throw new PixmixError('Unrecognised image format', 'UNSUPPORTED');
   const out = { format, scrambled: false };
   const meta = format === 'webp' ? readWebpMetadata(bytes) : null;

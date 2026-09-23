@@ -17,6 +17,7 @@ import { computeLayout, applyMap } from '../../core/layout.js';
 import {
   makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError,
 } from '../../core/params.js';
+import { checkPixels, checkFrames } from '../../core/limits.js';
 
 export const MARKER_CHUNK = 'pmIx';
 export { isPng };
@@ -37,10 +38,13 @@ export { isPng };
  * @property {number} pixelBytes
  */
 
-function parsePng(bytes) {
-  const chunks = readChunks(bytes);
+// Sizes are checked against the limits here, before any image data is inflated.
+function parsePng(bytes, limits) {
+  const chunks = readChunks(bytes, limits);
   const ihdr = parseIhdr(chunks[0].data);
+  checkPixels(ihdr.width, ihdr.height, limits);
   const frames = parseFrames(chunks, ihdr);
+  if (frames.length > 1) checkFrames(frames.length, frames.reduce((n, f) => n + f.width * f.height, 0), limits);
   return { chunks, ihdr, frames, animated: chunks.some((c) => c.type === 'acTL'), pixelBytes: pixelBytesOf(ihdr) };
 }
 
@@ -80,18 +84,21 @@ function parseFrames(chunks, ihdr) {
 
 const frameIhdr = (ihdr, f) => ({ ...ihdr, width: f.width, height: f.height });
 
-/** @returns {PngImage} */
-export function readPng(bytes) {
-  const { frames, ...img } = parsePng(bytes);
-  const pixels = frames.map((f) => decodeRaster(frameIhdr(img.ihdr, f), f.zdata));
+/**
+ * @param {Uint8Array} bytes @param {Partial<import('../../core/limits.js').Limits>} [limits]
+ * @returns {PngImage}
+ */
+export function readPng(bytes, limits) {
+  const { frames, ...img } = parsePng(bytes, limits);
+  const pixels = frames.map((f) => decodeRaster(frameIhdr(img.ihdr, f), f.zdata, limits));
   return withFrames(img, frames, pixels);
 }
 
 /** Same as readPng, using native async inflate where the platform has it. */
-export async function readPngAsync(bytes) {
-  const { frames, ...img } = parsePng(bytes);
+export async function readPngAsync(bytes, limits) {
+  const { frames, ...img } = parsePng(bytes, limits);
   const pixels = [];
-  for (const f of frames) pixels.push(await decodeRasterAsync(frameIhdr(img.ihdr, f), f.zdata));
+  for (const f of frames) pixels.push(await decodeRasterAsync(frameIhdr(img.ihdr, f), f.zdata, limits));
   return withFrames(img, frames, pixels);
 }
 
@@ -174,8 +181,8 @@ const mapFrames = (img, layouts, direction) => img.frames.map((px, i) => applyMa
  * @param {Uint8Array} bytes PNG or APNG
  * @param {{key: string|Uint8Array, mode?: 'pixel'|'block', block?: number, level?: number, salt?: Uint8Array}} opts
  */
-export function scramblePng(bytes, { key, mode, block, level, salt } = {}) {
-  const img = readPng(bytes);
+export function scramblePng(bytes, { key, mode, block, level, salt, limits } = {}) {
+  const img = readPng(bytes, limits);
   if (readPngMarker(img.chunks)) {
     throw new PixmixError('Image is already scrambled (decode it first, or use rekey)', 'ALREADY_SCRAMBLED');
   }
@@ -203,8 +210,8 @@ function unscrambled(img, key) {
  * frame 0's; `toPng` rebuilds the whole file, every frame included.
  * @param {Uint8Array} bytes scrambled PNG
  */
-export function unscramblePngDetailed(bytes, { key, level } = {}) {
-  const img = readPng(bytes);
+export function unscramblePngDetailed(bytes, { key, level, limits } = {}) {
+  const img = readPng(bytes, limits);
   const { marker, layouts, frames } = unscrambled(img, key);
   return {
     img,
@@ -220,8 +227,8 @@ export function unscramblePngDetailed(bytes, { key, level } = {}) {
  * Async flavour of unscramblePngDetailed for browsers (native inflate/deflate).
  * `toPng` returns a Promise here.
  */
-export async function unscramblePngDetailedAsync(bytes, { key, level } = {}) {
-  const img = await readPngAsync(bytes);
+export async function unscramblePngDetailedAsync(bytes, { key, level, limits } = {}) {
+  const img = await readPngAsync(bytes, limits);
   const { marker, layouts, frames } = unscrambled(img, key);
   return {
     img,
@@ -237,8 +244,8 @@ export function unscramblePng(bytes, opts) {
 }
 
 /** Re-scrambles with a new key (and optionally new mode/block) in one pass. */
-export function rekeyPng(bytes, { from, to, mode, block, level, salt } = {}) {
-  const img = readPng(bytes);
+export function rekeyPng(bytes, { from, to, mode, block, level, salt, limits } = {}) {
+  const img = readPng(bytes, limits);
   const { marker, frames } = unscrambled(img, from);
   const params = makeParams({
     mode: mode ?? marker.params.mode,
@@ -250,10 +257,13 @@ export function rekeyPng(bytes, { from, to, mode, block, level, salt } = {}) {
   return writePng(img, mapFrames(plain, layouts, 'scramble'), writeMarker(params, layouts[0].check), scrambledRaster(params, level));
 }
 
-/** Cheap: parses chunks only, no inflate. */
-export function inspectPng(bytes) {
-  const chunks = readChunks(bytes);
+/** Cheap: parses chunks only, no inflate. Checks the same size limits as decoding. */
+export function inspectPng(bytes, limits) {
+  const chunks = readChunks(bytes, limits);
   const ihdr = parseIhdr(chunks[0].data);
+  checkPixels(ihdr.width, ihdr.height, limits);
+  const fctl = chunks.filter((c) => c.type === 'fcTL').length;
+  if (fctl > 1) checkFrames(fctl, 0, limits);
   const marker = readPngMarker(chunks);
   const actl = chunks.find((c) => c.type === 'acTL');
   const dv = actl?.data.length === 8 ? new DataView(actl.data.buffer, actl.data.byteOffset, 8) : null;

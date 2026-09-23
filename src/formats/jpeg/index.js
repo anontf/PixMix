@@ -20,6 +20,7 @@ import { computeGridLayout } from '../../core/layout.js';
 import {
   makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError, MCU_TRANSFORMS, MCU_PROGRESSIVE,
 } from '../../core/params.js';
+import { checkPixels } from '../../core/limits.js';
 import { readJpegMetadata } from '../../meta/jpeg.js';
 import { readOrientation } from '../../meta/exif.js';
 import { stripExifThumbnail, stripIrbThumbnails, stripJfifThumbnail } from '../../meta/thumbnails.js';
@@ -51,9 +52,9 @@ function headerSegments(segments) {
   return segments.filter((s) => !CODING.has(s.marker) && !isSof(s.marker) && !(s.marker === M.APP15 && startsWith(s.data, SIG)));
 }
 
-function parse(bytes) {
-  const { segments, trailing } = readSegments(bytes);
-  const frame = decodeFrame(segments);
+function parse(bytes, limits) {
+  const { segments, trailing } = readSegments(bytes, limits);
+  const frame = decodeFrame(segments, limits);
   return { segments, trailing, frame };
 }
 
@@ -86,8 +87,8 @@ const markerPayload = (params, check) => {
  * images, motion-photo video). The entropy-coded data is untouched.
  * @returns {{bytes: Uint8Array, dropped: string[]}}
  */
-export function sanitizeJpeg(bytes) {
-  const { segments, trailing } = readSegments(bytes);
+export function sanitizeJpeg(bytes, limits) {
+  const { segments, trailing } = readSegments(bytes, limits);
   const dropped = [];
   const out = [];
   for (const seg of segments) {
@@ -124,11 +125,11 @@ const hasPadding = (frame) => frame.components.some((c) => c.realW < c.blocksW |
  * @param {Uint8Array} bytes JPEG
  * @param {{key: string|Uint8Array, transforms?: boolean, salt?: Uint8Array, mode?: string, progressive?: boolean|'auto'}} opts
  */
-export function scrambleJpeg(bytes, { key, transforms = true, salt, mode, progressive } = {}) {
+export function scrambleJpeg(bytes, { key, transforms = true, salt, mode, progressive, limits } = {}) {
   if (mode && mode !== 'mcu') {
     throw new PixmixError(`JPEG output is scrambled per MCU; mode "${mode}" does not apply (use mode "mcu" or omit it)`, 'BAD_OPTION');
   }
-  const { segments, frame } = parse(bytes);
+  const { segments, frame } = parse(bytes, limits);
   if (markerSegment(segments)) {
     throw new PixmixError('Image is already scrambled (decode it first, or use rekey)', 'ALREADY_SCRAMBLED');
   }
@@ -143,8 +144,8 @@ export function scrambleJpeg(bytes, { key, transforms = true, salt, mode, progre
 }
 
 /** Full decode with the layout, for the browser reveal. */
-export function unscrambleJpegDetailed(bytes, { key, progressive } = {}) {
-  const { segments, frame } = parse(bytes);
+export function unscrambleJpegDetailed(bytes, { key, progressive, limits } = {}) {
+  const { segments, frame } = parse(bytes, limits);
   const marker = readMarkerFrom(segments);
   if (!marker) throw new PixmixError('Image carries no pixmix marker', 'NOT_SCRAMBLED');
   const layout = layoutFor(key, marker.params, frame, marker.check);
@@ -164,9 +165,9 @@ export function unscrambleJpeg(bytes, opts) {
   return unscrambleJpegDetailed(bytes, opts).toJpeg();
 }
 
-export function rekeyJpeg(bytes, { from, to, transforms, salt, mode, progressive } = {}) {
+export function rekeyJpeg(bytes, { from, to, transforms, salt, mode, progressive, limits } = {}) {
   if (mode && mode !== 'mcu') throw new PixmixError(`JPEG only supports mode "mcu"`, 'BAD_OPTION');
-  const { segments, frame } = parse(bytes);
+  const { segments, frame } = parse(bytes, limits);
   const marker = readMarkerFrom(segments);
   if (!marker) throw new PixmixError('Image carries no pixmix marker', 'NOT_SCRAMBLED');
   const plain = applyMcuLayout(frame, layoutFor(from, marker.params, frame, marker.check), 'unscramble');
@@ -181,11 +182,12 @@ export function rekeyJpeg(bytes, { from, to, transforms, salt, mode, progressive
 }
 
 /** Cheap: parses segments only, no entropy decoding. */
-export function inspectJpeg(bytes) {
-  const { segments, trailing } = readSegments(bytes);
+export function inspectJpeg(bytes, limits) {
+  const { segments, trailing } = readSegments(bytes, limits);
   const sof = segments.find((s) => isSof(s.marker));
   const marker = readMarkerFrom(segments);
   const meta = readJpegMetadata(bytes);
+  if (meta.width && meta.height) checkPixels(meta.width, meta.height, limits);
   const n = sof?.data[5] ?? 0;
   const comps = [];
   for (let i = 0; i < n; i++) comps.push(sof.data[7 + i * 3]);

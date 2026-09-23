@@ -8,6 +8,7 @@ import { unscrambleJxlDetailed, reconstructJpeg } from '../formats/jxl/index.js'
 import { toRGBA8 } from '../formats/png/rgba.js';
 import { writeChunks } from '../formats/png/chunks.js';
 import { encodeRasterAsync } from '../formats/png/raster.js';
+import { checkInputSize } from '../core/limits.js';
 
 /**
  * @typedef {object} PixelsResult  PNG, and JPEG XL on the pixel route
@@ -25,10 +26,11 @@ import { encodeRasterAsync } from '../formats/png/raster.js';
  */
 
 /** @returns {Promise<PixelsResult|JpegResult>} */
-export async function compute(bytes, key, { animated = true } = {}) {
+export async function compute(bytes, key, { animated = true, limits } = {}) {
+  checkInputSize(bytes, limits);
   const format = detectFormat(bytes);
   if (format === 'png') {
-    const d = await unscramblePngDetailedAsync(bytes, { key });
+    const d = await unscramblePngDetailedAsync(bytes, { key, limits });
     return {
       kind: 'pixels',
       type: 'image/png',
@@ -39,7 +41,7 @@ export async function compute(bytes, key, { animated = true } = {}) {
     };
   }
   if (format === 'jpeg') {
-    const d = unscrambleJpegDetailed(bytes, { key });
+    const d = unscrambleJpegDetailed(bytes, { key, limits });
     const app1 = d.segments.find((s) => s.marker === 0xe1 && s.data[0] === 0x45 && s.data[4] === 0 && s.data[5] === 0);
     const { perm, transforms, cols, rows, tileW, tileH, width, height } = d.layout;
     return {
@@ -53,9 +55,9 @@ export async function compute(bytes, key, { animated = true } = {}) {
   }
   if (format === 'jxl') {
     // JPEG route: rebuild the scrambled JPEG and reveal that; visitors get the JPEG.
-    if (inspect(bytes).mode === 'mcu') return compute(await reconstructJpeg(bytes), key, { animated });
+    if (inspect(bytes, { limits }).mode === 'mcu') return compute(await reconstructJpeg(bytes, limits), key, { animated, limits });
     // Pixel route: the <img> gets a PNG, since most browsers cannot display JPEG XL.
-    const d = await unscrambleJxlDetailed(bytes, { key });
+    const d = await unscrambleJxlDetailed(bytes, { key, limits });
     return {
       kind: 'pixels',
       type: 'image/png',

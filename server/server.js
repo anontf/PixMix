@@ -15,6 +15,13 @@ const PORT = process.env.PORT ? Number(process.env.PORT) : 8080; // 0 = any free
 const HOST = process.env.HOST || '127.0.0.1';
 const ROOT = new URL('..', import.meta.url).pathname;
 const MAX_BODY = 64 * 1024 * 1024;
+// Uploads are untrusted: every call gets pixmix's resource limits (the defaults, with the
+// upload size as the input limit). PIXMIX_MAX_PIXELS and PIXMIX_MAX_FRAMES override two.
+const LIMITS = {
+  maxInputBytes: MAX_BODY,
+  ...(process.env.PIXMIX_MAX_PIXELS ? { maxPixels: Number(process.env.PIXMIX_MAX_PIXELS) } : {}),
+  ...(process.env.PIXMIX_MAX_FRAMES ? { maxFrames: Number(process.env.PIXMIX_MAX_FRAMES) } : {}),
+};
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.map': 'application/json', '.wasm': 'application/wasm' };
 const IMAGE = { png: ['image/png', 'png'], jpeg: ['image/jpeg', 'jpg'], jxl: ['image/jxl', 'jxl'] };
 
@@ -40,25 +47,27 @@ const routes = {
       quality: num('quality'),
       transforms: q.get('transforms') !== '0',
       decoders,
+      limits: LIMITS,
       onConvert: (r) => { report = r; },
     });
     const { bytes: _, ...info } = report;
     return { ...image(out), headers: { 'X-Pixmix-Convert': JSON.stringify(info) } };
   },
-  'POST /api/decode': async (req, q) => image(await decodeAsync(await body(req), { key: q.get('key') })),
+  'POST /api/decode': async (req, q) => image(await decodeAsync(await body(req), { key: q.get('key'), limits: LIMITS })),
   'POST /api/rekey': async (req, q) => image(await rekeyAsync(await body(req), {
     from: q.get('from'),
     to: q.get('to'),
     mode: q.get('mode') || undefined,
     block: q.has('block') ? Number(q.get('block')) : undefined,
     transforms: q.has('transforms') ? q.get('transforms') !== '0' : undefined,
+    limits: LIMITS,
   })),
-  'POST /api/inspect': async (req) => json(inspect(await body(req))),
+  'POST /api/inspect': async (req) => json(inspect(await body(req), { limits: LIMITS })),
 
   // Stores an already-scrambled image for the demo site.
   'POST /api/gallery': async (req, q) => {
     const bytes = await body(req);
-    const info = inspect(bytes);
+    const info = inspect(bytes, { limits: LIMITS });
     if (!info.scrambled) throw new PixmixError('Only scrambled images can be published', 'NOT_SCRAMBLED');
     const id = randomUUID().slice(0, 8);
     gallery.set(id, { bytes, key: q.get('key'), name: q.get('name') || id, effect: q.get('effect') || 'dissolve' });
@@ -83,7 +92,9 @@ const server = createServer(async (req, res) => {
     else out = json({ error: 'Not found' }, 404);
     send(res, out);
   } catch (err) {
-    const status = err.code === 'WRONG_KEY' ? 403 : err instanceof PixmixError ? 400 : err.status || 500;
+    // decodeAsync comes from src/, so its errors are another copy of the PixmixError class.
+    const pixmix = err instanceof PixmixError || err?.name === 'PixmixError';
+    const status = err.code === 'WRONG_KEY' ? 403 : err.code === 'LIMIT' ? 413 : pixmix ? 400 : err.status || 500;
     if (status === 500) console.error(err);
     send(res, json({ error: err.message, code: err.code }, status));
   }

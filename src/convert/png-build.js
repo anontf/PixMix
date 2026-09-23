@@ -6,6 +6,7 @@
 
 import { writeChunks } from '../formats/png/chunks.js';
 import { encodeRaster } from '../formats/png/raster.js';
+import { PixmixError } from '../core/params.js';
 // Metadata is compressed with fflate everywhere (not native zlib) so the same input gives
 // byte-identical chunks on servers and in browsers.
 import { zlibSync } from 'fflate';
@@ -34,7 +35,7 @@ export function buildPng(image, meta = {}) {
   // All frames share one colour type (and palette), so analyse them together; Uint32 views
   // below need 4-byte alignment (pooled Node Buffers may not have it).
   let data = frames ? concatAll(frames.map((f) => f.data)) : image.data.byteOffset % 4 ? image.data.slice() : image.data;
-  if (data.length !== width * height * 4 * (frames?.length ?? 1)) throw new RangeError('Decoder must return width*height RGBA samples');
+  if (data.length !== width * height * 4 * (frames?.length ?? 1)) throw new PixmixError('Decoder must return width*height RGBA samples', 'DECODER');
   const transferred = frames ? ['animation'] : [];
   const dropped = [...(meta.dropped ?? [])].filter((d) => !(frames && d.startsWith('animation')));
 

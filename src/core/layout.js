@@ -8,7 +8,7 @@
 // compatibility with existing images, so bump the marker version if you ever do.
 
 import { ChaChaRng } from './prng.js';
-import { deriveSeed } from './params.js';
+import { deriveSeed, PixmixError } from './params.js';
 
 /**
  * @typedef {object} Layout
@@ -25,7 +25,7 @@ export function computeLayout(key, params, width, height, index = 0) {
   const { rngKey, nonce, check } = deriveSeed(key, params, width, height, index);
   const rng = new ChaChaRng(rngKey, nonce);
   const total = width * height;
-  if (total > 0xffffffff) throw new RangeError('Image too large');
+  if (total > 0xffffffff) throw new PixmixError('Image too large (more than 2^32 pixels)', 'LIMIT');
   const map = new Uint32Array(total);
 
   if (params.mode === 'pixel') {

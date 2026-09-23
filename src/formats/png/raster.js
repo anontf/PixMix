@@ -6,8 +6,9 @@
 // Interlaced images are de-interlaced here and re-interlaced on write, so the
 // permutation always works on the real pixel grid.
 
-import { deflate, inflate, deflateAsync, inflateAsync } from './zlib.js';
+import { deflate, inflateUpTo, deflateAsync, inflateUpToAsync } from './zlib.js';
 import { PixmixError } from '../../core/params.js';
+import { resolveLimits, decompressedLimitError } from '../../core/limits.js';
 
 const CHANNELS = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 };
 const VALID_DEPTHS = { 0: [1, 2, 4, 8, 16], 2: [8, 16], 3: [1, 2, 4, 8], 4: [8, 16], 6: [8, 16] };
@@ -58,21 +59,42 @@ function passes(ihdr) {
 const bitsPerPixel = (ihdr) => CHANNELS[ihdr.colorType] * ihdr.depth;
 const rowBytes = (ihdr, w) => Math.ceil((w * bitsPerPixel(ihdr)) / 8);
 
-/** @param {Ihdr} ihdr @param {Uint8Array} zdata concatenated IDAT payloads */
-export function decodeRaster(ihdr, zdata) {
+/** Size of the filtered raster the IHDR describes: what the image data must inflate to. */
+export function rawSize(ihdr) {
+  let total = 0;
+  for (const p of passes(ihdr)) total += p.h * (1 + rowBytes(ihdr, p.w));
+  return total;
+}
+
+// The raster's size is known up front, so inflating never goes past it: a decompression
+// bomb stops there, and data beyond the image (tolerated, as by libpng) is not inflated.
+function rasterSize(ihdr, limits) {
+  const size = rawSize(ihdr);
+  const { maxDecompressedBytes } = resolveLimits(limits);
+  if (size > maxDecompressedBytes) throw decompressedLimitError(maxDecompressedBytes);
+  return size;
+}
+
+/**
+ * @param {Ihdr} ihdr @param {Uint8Array} zdata concatenated IDAT payloads
+ * @param {Partial<import('../../core/limits.js').Limits>} [limits]
+ */
+export function decodeRaster(ihdr, zdata, limits) {
+  const size = rasterSize(ihdr, limits);
   let raw;
   try {
-    raw = inflate(zdata);
+    raw = inflateUpTo(zdata, size);
   } catch {
     throw new PixmixError('Corrupt PNG image data', 'BAD_PNG');
   }
   return unfilterRaster(ihdr, raw);
 }
 
-export async function decodeRasterAsync(ihdr, zdata) {
+export async function decodeRasterAsync(ihdr, zdata, limits) {
+  const size = rasterSize(ihdr, limits);
   let raw;
   try {
-    raw = await inflateAsync(zdata);
+    raw = await inflateUpToAsync(zdata, size);
   } catch {
     throw new PixmixError('Corrupt PNG image data', 'BAD_PNG');
   }
@@ -118,9 +140,7 @@ function filterRaster(ihdr, pixels, filter = 'adaptive') {
   const pb = pixelBytesOf(ihdr);
   const fbpp = Math.max(1, bitsPerPixel(ihdr) >> 3);
   const ps = passes(ihdr);
-  let total = 0;
-  for (const p of ps) total += p.h * (1 + rowBytes(ihdr, p.w));
-  const raw = new Uint8Array(total);
+  const raw = new Uint8Array(rawSize(ihdr));
   // Filtering does not help sub-byte or palette images (per the PNG spec's advice).
   const adaptive = filter === 'adaptive' && ihdr.depth >= 8 && ihdr.colorType !== 3;
   let pos = 0;

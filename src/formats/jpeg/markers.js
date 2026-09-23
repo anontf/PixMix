@@ -2,6 +2,7 @@
 // Segments are kept as raw payloads so everything not rewritten is copied back verbatim.
 
 import { PixmixError } from '../../core/params.js';
+import { resolveLimits, checkChunks } from '../../core/limits.js';
 
 export const M = {
   SOI: 0xd8, EOI: 0xd9, SOS: 0xda, DQT: 0xdb, DHT: 0xc4, DRI: 0xdd, DNL: 0xdc, COM: 0xfe,
@@ -19,14 +20,16 @@ export function isJpeg(bytes) {
  * @typedef {{marker: number, data: Uint8Array, ecs?: Uint8Array}} Segment
  *   data is the payload after the length field; SOS segments carry `ecs`, the
  *   entropy-coded bytes (including any RST markers) that follow the header.
- * @param {Uint8Array} bytes
+ * @param {Uint8Array} bytes @param {Partial<import('../../core/limits.js').Limits>} [limits]
  * @returns {{segments: Segment[], trailing: Uint8Array}}
  */
-export function readSegments(bytes) {
+export function readSegments(bytes, limits) {
   if (!isJpeg(bytes)) throw new PixmixError('Not a JPEG file', 'BAD_JPEG');
+  const { maxChunks } = resolveLimits(limits);
   const segments = [];
   let pos = 2;
   for (;;) {
+    if (segments.length >= maxChunks) checkChunks(segments.length + 1, limits, 'segments');
     while (pos < bytes.length && bytes[pos] === 0xff && bytes[pos + 1] === 0xff) pos++; // fill bytes
     if (pos + 2 > bytes.length) throw new PixmixError('JPEG ends before EOI', 'BAD_JPEG');
     if (bytes[pos] !== 0xff) throw new PixmixError('Corrupt JPEG marker stream', 'BAD_JPEG');

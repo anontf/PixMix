@@ -3,6 +3,7 @@
 
 import { PixmixError } from '../../core/params.js';
 import { crc32 } from './zlib.js';
+import { resolveLimits, checkChunks } from '../../core/limits.js';
 
 export const SIGNATURE = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
 
@@ -14,14 +15,17 @@ export function isPng(bytes) {
 
 /**
  * @typedef {{type: string, data: Uint8Array}} Chunk
- * @param {Uint8Array} bytes @returns {Chunk[]}
+ * @param {Uint8Array} bytes @param {Partial<import('../../core/limits.js').Limits>} [limits]
+ * @returns {Chunk[]}
  */
-export function readChunks(bytes) {
+export function readChunks(bytes, limits) {
   if (!isPng(bytes)) throw new PixmixError('Not a PNG file', 'BAD_PNG');
+  const { maxChunks } = resolveLimits(limits);
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const chunks = [];
   let pos = 8;
   while (pos < bytes.length) {
+    if (chunks.length >= maxChunks) checkChunks(chunks.length + 1, limits);
     if (pos + 12 > bytes.length) throw new PixmixError('Truncated PNG chunk', 'BAD_PNG');
     const len = dv.getUint32(pos);
     if (len > 0x7fffffff || pos + 12 + len > bytes.length) {

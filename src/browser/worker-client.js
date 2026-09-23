@@ -46,10 +46,11 @@ function rebuildError({ name, message, code }) {
 
 /**
  * @param {Uint8Array} bytes
- * @param {{worker?: boolean|string}} [opts] false: inline; a string: worker script URL
+ * @param {{animated?: boolean, worker?: boolean|string, limits?: object}} [opts] worker false: inline;
+ *        a string: the worker script URL. limits: see core/limits.js (plain data, so it crosses)
  */
-export function computeAnywhere(bytes, key, { animated = true, worker: use = true } = {}) {
-  const inline = () => compute(bytes, key, { animated });
+export function computeAnywhere(bytes, key, { animated = true, worker: use = true, limits } = {}) {
+  const inline = () => compute(bytes, key, { animated, limits });
   if (!use || broken || typeof Worker === 'undefined') return inline();
   try {
     worker ??= start(typeof use === 'string' ? use : undefined);
@@ -60,6 +61,6 @@ export function computeAnywhere(bytes, key, { animated = true, worker: use = tru
   return new Promise((resolve, reject) => {
     const id = nextId++;
     pending.set(id, { resolve, reject, fallback: () => inline().then(resolve, reject) });
-    worker.postMessage({ id, bytes, key, animated }); // copied, so the fallback still has it
+    worker.postMessage({ id, bytes, key, animated, limits }); // copied, so the fallback still has it
   });
 }

@@ -35,7 +35,7 @@ const STALE = {
  * Metadata boxes to carry over, with EXIF thumbnails removed unless kept.
  * @returns {{boxes: import('./container.js').Box[], dropped: string[]}}
  */
-export function sanitizeBoxes(boxes, { keepThumbnails = false } = {}) {
+export function sanitizeBoxes(boxes, { keepThumbnails = false, limits } = {}) {
   const out = [], dropped = [];
   for (const box of boxes) {
     if (STRUCTURE.has(box.type)) continue;
@@ -49,7 +49,7 @@ export function sanitizeBoxes(boxes, { keepThumbnails = false } = {}) {
         continue;
       }
     } else if (box.type === 'brob' && String.fromCharCode(...box.data.subarray(0, 4)) === 'Exif') {
-      const inner = unwrapBrob(box.data);
+      const inner = unwrapBrob(box.data, limits);
       if (!inner.data) { dropped.push('compressed EXIF (cannot be checked for a thumbnail here)'); continue; }
       const stripped = stripExifThumbnail(exifTiff(inner.data));
       out.push(stripped ? { type: 'Exif', data: withOffset(stripped) } : box);
@@ -75,6 +75,13 @@ export function reencodeNotes(header) {
   if (header.bits > 8 || header.float) notes.push(`${header.float ? 'floating-point' : `${header.bits}-bit`} precision (reduced to 8-bit)`);
   if (header.srgb === false) notes.push('colour space (converted to sRGB)');
   return notes;
+}
+
+/** Container and codestream header, the size checked against the limits before decoding. */
+function readChecked(bytes, limits) {
+  const jxl = readJxl(bytes, limits);
+  readJxlHeader(jxl.codestream, limits);
+  return jxl;
 }
 
 function readMarkerBox(boxes) {
@@ -107,20 +114,22 @@ export async function scrambleJxlPixels(image, boxes, { key, mode, block, salt, 
 }
 
 export async function scrambleJxl(bytes, opts = {}) {
-  const { boxes } = readJxl(bytes);
+  const { limits } = opts;
+  const { boxes } = readChecked(bytes, limits);
   if (readMarkerBox(boxes)) throw new PixmixError('Image is already scrambled (decode it first, or use rekey)', 'ALREADY_SCRAMBLED');
-  const image = await (await loadJxlCodec()).decode(bytes);
+  const image = await (await loadJxlCodec()).decode(bytes, { limits });
   return scrambleJxlPixels(image, sanitizeBoxes(boxes, opts).boxes, opts);
 }
 
 // --- JPEG route -------------------------------------------------------------------
 
 /** True when the file is a losslessly recompressed JPEG (it has reconstruction data). */
-export const hasJpegData = (bytes) => readJxl(bytes).boxes.some((b) => b.type === 'jbrd');
+export const hasJpegData = (bytes, limits) => readJxl(bytes, limits).boxes.some((b) => b.type === 'jbrd');
 
 /** The JPEG inside a recompressed JPEG XL, bit for bit (null if it is not one). */
-export async function reconstructJpeg(bytes) {
-  return (await loadJxlCodec()).reconstructJpeg(bytes);
+export async function reconstructJpeg(bytes, limits) {
+  readChecked(bytes, limits);
+  return (await loadJxlCodec()).reconstructJpeg(bytes, { limits });
 }
 
 async function toJxlWithMarker(scrambledJpeg) {
@@ -134,8 +143,8 @@ async function toJxlWithMarker(scrambledJpeg) {
  * JPEG (already sanitised) -> DCT-domain scramble -> recompressed JPEG XL. The JPEG inside
  * is always baseline: jxl-oxide 0.12 cannot reconstruct some progressive JPEGs.
  */
-export async function scrambleJpegToJxl(jpeg, { key, transforms, salt } = {}) {
-  return toJxlWithMarker(scrambleJpeg(jpeg, { key, transforms, salt, progressive: false }));
+export async function scrambleJpegToJxl(jpeg, { key, transforms, salt, limits } = {}) {
+  return toJxlWithMarker(scrambleJpeg(jpeg, { key, transforms, salt, progressive: false, limits }));
 }
 
 // --- both routes -------------------------------------------------------------------
@@ -145,18 +154,18 @@ export async function scrambleJpegToJxl(jpeg, { key, transforms, salt } = {}) {
  * scrambled RGBA and `toJxl` re-encodes losslessly. JPEG route: `jpeg` is the unscrambled
  * JPEG's detail (see formats/jpeg) and `toJxl` recompresses it (Node only).
  */
-export async function unscrambleJxlDetailed(bytes, { key, effort } = {}) {
-  const { boxes } = readJxl(bytes);
+export async function unscrambleJxlDetailed(bytes, { key, effort, limits } = {}) {
+  const { boxes } = readChecked(bytes, limits);
   const marker = readMarkerBox(boxes);
   if (!marker) throw new PixmixError('Image carries no pixmix marker', 'NOT_SCRAMBLED');
   const codec = await loadJxlCodec();
   if (marker.params.mode === 'mcu') {
-    const scrambledJpeg = await codec.reconstructJpeg(bytes);
+    const scrambledJpeg = await reconstructJpeg(bytes, limits);
     if (!scrambledJpeg) throw new PixmixError('JPEG XL file lost its JPEG reconstruction data', 'BAD_JXL');
-    const jpeg = unscrambleJpegDetailed(scrambledJpeg, { key });
+    const jpeg = unscrambleJpegDetailed(scrambledJpeg, { key, limits });
     return { route: 'jpeg', params: marker.params, jpeg, toJxl: () => codec.transcodeJpeg(jpeg.toJpeg()) };
   }
-  const image = await codec.decode(bytes);
+  const image = await codec.decode(bytes, { limits });
   const layout = layoutFor(key, marker.params, image.width, image.height, marker.check);
   const pixels = applyMap(image.data, layout.map, 4, 'unscramble');
   const kept = boxes.filter((b) => !STRUCTURE.has(b.type));
@@ -174,17 +183,17 @@ export async function unscrambleJxl(bytes, opts) {
   return (await unscrambleJxlDetailed(bytes, opts)).toJxl();
 }
 
-export async function rekeyJxl(bytes, { from, to, mode, block, salt, effort, transforms } = {}) {
-  const { boxes } = readJxl(bytes);
+export async function rekeyJxl(bytes, { from, to, mode, block, salt, effort, transforms, limits } = {}) {
+  const { boxes } = readChecked(bytes, limits);
   const marker = readMarkerBox(boxes);
   if (!marker) throw new PixmixError('Image carries no pixmix marker', 'NOT_SCRAMBLED');
   if (marker.params.mode === 'mcu') {
     if (mode && mode !== 'mcu') throw new PixmixError('This JPEG XL holds a scrambled JPEG; it can only be re-keyed in mode "mcu"', 'BAD_OPTION');
-    const jpeg = await reconstructJpeg(bytes);
-    return toJxlWithMarker(rekeyJpeg(jpeg, { from, to, transforms, salt, progressive: false }));
+    const jpeg = await reconstructJpeg(bytes, limits);
+    return toJxlWithMarker(rekeyJpeg(jpeg, { from, to, transforms, salt, progressive: false, limits }));
   }
   if (mode === 'mcu') throw new PixmixError('Mode "mcu" needs a JPEG XL that holds a JPEG', 'BAD_OPTION');
-  const image = await (await loadJxlCodec()).decode(bytes);
+  const image = await (await loadJxlCodec()).decode(bytes, { limits });
   const old = layoutFor(from, marker.params, image.width, image.height, marker.check);
   const plain = { ...image, data: applyMap(image.data, old.map, 4, 'unscramble') };
   const kept = boxes.filter((b) => !STRUCTURE.has(b.type));
@@ -196,9 +205,9 @@ export async function rekeyJxl(bytes, { from, to, mode, block, salt, effort, tra
 }
 
 /** Cheap: container and codestream headers only. */
-export function inspectJxl(bytes) {
-  const { container, boxes, codestream } = readJxl(bytes);
-  const header = readJxlHeader(codestream);
+export function inspectJxl(bytes, limits) {
+  const { container, boxes, codestream } = readJxl(bytes, limits);
+  const header = readJxlHeader(codestream, limits);
   const marker = readMarkerBox(boxes);
   return {
     format: 'jxl',

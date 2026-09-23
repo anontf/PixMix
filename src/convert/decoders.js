@@ -1,5 +1,7 @@
 // Built-in pure-JS pixel decoders (synchronous, work everywhere).
-// A decoder: { name, formats: string[], decode(bytes, format) -> DecodedImage | Promise }.
+// A decoder: { name, formats: string[], decode(bytes, format, { limits }) -> DecodedImage | Promise }.
+// `limits` (see core/limits.js) is always passed fully resolved; decoders check what they
+// can before allocating, and pixmix checks the result's size again afterwards.
 //
 // @typedef {object} DecodedImage
 // @property {number} width
@@ -11,9 +13,11 @@
 import decodeJpeg from 'jpeg-js/lib/decoder.js';
 import { GifReader } from 'omggif';
 import { PixmixError } from '../core/params.js';
+import { resolveLimits, checkPixels, checkFrames } from '../core/limits.js';
 import { readPng } from '../formats/png/index.js';
 import { toRGBA8 } from '../formats/png/rgba.js';
 import { readPngMetadata } from '../meta/png.js';
+import { readJpegMetadata } from '../meta/jpeg.js';
 import { loadJxlCodec } from '../formats/jxl/load.js';
 import { readJxlHeader, readJxl } from '../formats/jxl/container.js';
 import { reencodeNotes } from '../formats/jxl/index.js';
@@ -22,9 +26,9 @@ import { reencodeNotes } from '../formats/jxl/index.js';
 export const pngDecoder = {
   name: 'pixmix',
   formats: ['png'],
-  decode(bytes) {
-    const img = readPng(bytes);
-    const metadata = readPngMetadata(img.chunks);
+  decode(bytes, _format, { limits } = {}) {
+    const img = readPng(bytes, limits);
+    const metadata = readPngMetadata(img.chunks, limits);
     if (img.ihdr.depth === 16) metadata.dropped.push('16-bit precision (reduced to 8-bit)');
     if (img.animated) metadata.dropped.push('animation (first frame kept)');
     return { width: img.ihdr.width, height: img.ihdr.height, data: new Uint8Array(toRGBA8(img, img.pixels).buffer), metadata };
@@ -34,17 +38,23 @@ export const pngDecoder = {
 export const jpegDecoder = {
   name: 'jpeg-js',
   formats: ['jpeg'],
-  decode(bytes) {
+  decode(bytes, _format, { limits } = {}) {
+    const l = resolveLimits(limits);
+    // The frame header first, so jpeg-js never starts on an image over the limit.
+    const { width, height, components = 3 } = readJpegMetadata(bytes);
+    if (width && height) checkPixels(width, height, l);
     try {
       const img = decodeJpeg(bytes, {
         useTArray: true,
         formatAsRGBA: true,
         tolerantDecoding: true,
-        maxResolutionInMP: 500,
-        maxMemoryUsageInMB: 4096,
+        maxResolutionInMP: l.maxPixels / 1e6,
+        // Coefficients (2 bytes per sample, padded) plus the RGBA output, with headroom.
+        maxMemoryUsageInMB: Math.ceil((l.maxPixels * (4 + 4 * Math.max(components, 1))) / 2 ** 20) + 64,
       });
       return { width: img.width, height: img.height, data: img.data };
     } catch (err) {
+      if (err instanceof PixmixError) throw err;
       throw new PixmixError(`JPEG decode failed: ${err.message}`, 'BAD_JPEG');
     }
   },
@@ -53,7 +63,9 @@ export const jpegDecoder = {
 export const gifDecoder = {
   name: 'omggif',
   formats: ['gif'],
-  decode(bytes) {
+  decode(bytes, _format, { limits } = {}) {
+    // The logical screen, straight from the header, before omggif parses anything.
+    if (bytes.length >= 10) checkPixels(bytes[6] | (bytes[7] << 8), bytes[8] | (bytes[9] << 8), limits);
     let reader;
     try {
       reader = new GifReader(bytes);
@@ -62,6 +74,11 @@ export const gifDecoder = {
     }
     const { width, height } = reader;
     const n = reader.numFrames();
+    if (n > 1) checkFrames(n, n * width * height, limits);
+    for (let i = 0; i < n; i++) {
+      const f = reader.frameInfo(i);
+      checkPixels(f.width, f.height, limits, `GIF frame ${i}`);
+    }
     if (n <= 1) {
       const data = new Uint8Array(width * height * 4);
       reader.decodeAndBlitFrameRGBA(0, data);
@@ -96,18 +113,18 @@ export const gifDecoder = {
 export const jxlDecoder = {
   name: 'jxl-oxide',
   formats: ['jxl'],
-  async decode(bytes) {
-    const header = readJxlHeader(readJxl(bytes).codestream);
+  async decode(bytes, _format, { limits } = {}) {
+    const header = readJxlHeader(readJxl(bytes, limits).codestream, limits);
     const keepColour = header.srgb === false;
     const codec = await loadJxlCodec();
     const high = !header.animated && (header.bits > 8 || header.float);
-    const image = await codec.decode(bytes, { srgb: !keepColour, high });
+    const image = await codec.decode(bytes, { srgb: !keepColour, high, limits });
     // Precision above 8 bits is kept (as 16-bit); the notes that remain are about what's lost.
     const dropped = reencodeNotes(header).filter((n) => !n.startsWith('lossy') && !(keepColour && n.startsWith('colour')) && !(high && n.includes('precision')));
     const metadata = { dropped, ...(image.icc ? { icc: image.icc } : {}) };
     if (!header.animated) return { ...image, metadata };
     // Animations: every frame, for APNG output (other targets keep the first).
-    const anim = await codec.decodeAnimation(bytes, { srgb: !keepColour });
+    const anim = await codec.decodeAnimation(bytes, { srgb: !keepColour, limits });
     return { ...image, animation: { frames: anim.frames, plays: anim.plays }, metadata };
   },
 };

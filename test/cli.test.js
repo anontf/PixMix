@@ -99,3 +99,27 @@ test('JPEG XL: encode to .jxl, decode and rekey through the async paths', async 
   r = run(['inspect', '--json', join(dir, 'x.restored.jxl')]);
   assert.equal(JSON.parse(r.stdout).format, 'jxl');
 });
+
+test('watermarks: carry one, draw one on decode, show one on the scrambled image', async () => {
+  const src = await sharp({ create: { width: 400, height: 240, channels: 3, background: '#335577' } }).png().toBuffer();
+  writeFileSync(join(dir, 'wm.png'), src);
+  let r = run(['encode', '-k', 'w', '--watermark', 'vivi-gold', '--visible-watermark', 'vivi-window', join(dir, 'wm.png')]);
+  assert.equal(r.status, 0, r.stderr.toString());
+  r = run(['inspect', join(dir, 'wm.scrambled.png')]);
+  assert.match(r.stdout.toString(), /watermark: vivi-gold\n.*visible watermark/);
+  r = run(['decode', '-k', 'w', '-o', join(dir, 'wm.exact.png'), join(dir, 'wm.scrambled.png')]);
+  assert.equal(r.status, 0, r.stderr.toString());
+  assert.ok(pixels(join(dir, 'wm.exact.png')).equals(PNG.sync.read(src).data), 'exact without --watermark');
+  r = run(['decode', '-k', 'w', '--watermark', 'embedded', '-o', join(dir, 'wm.gold.png'), join(dir, 'wm.scrambled.png')]);
+  assert.equal(r.status, 0, r.stderr.toString());
+  assert.ok(!pixels(join(dir, 'wm.gold.png')).equals(PNG.sync.read(src).data), 'drawn');
+  // A definition file works too (compiled with the fonts of the watermarks directory).
+  const def = new URL('../watermarks/vivi-pixel.json', import.meta.url).pathname;
+  r = run(['decode', '-k', 'w', '--watermark', def, '-o', join(dir, 'wm.pixel.png'), join(dir, 'wm.scrambled.png')]);
+  assert.equal(r.status, 0, r.stderr.toString());
+  r = run(['rekey', '-k', 'w', '--to', 'v', '--no-watermark', '-o', join(dir, 'wm.plain.png'), join(dir, 'wm.scrambled.png')]);
+  assert.equal(r.status, 0, r.stderr.toString());
+  assert.doesNotMatch(run(['inspect', join(dir, 'wm.plain.png')]).stdout.toString(), /watermark/);
+  assert.equal(run(['decode', '-k', 'w', '--watermark', 'no-such-mark', join(dir, 'wm.scrambled.png')]).status, 2);
+  assert.equal(run(['decode', '-k', 'w', '--visible-watermark', 'vivi-gold', join(dir, 'wm.scrambled.png')]).status, 2);
+});

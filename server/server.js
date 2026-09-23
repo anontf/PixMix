@@ -3,6 +3,10 @@
 // way a real image server would embed it.
 //
 //   npm run serve        (builds dist/ first)   ->  http://localhost:8080
+//
+// Watermarks live in the repository's watermarks/ directory ($PIXMIX_WATERMARKS_DIR
+// overrides it): the lab edits them through /api/watermarks, and decoders fetch the compiled
+// ones from /watermarks/<id>.json.
 
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -10,12 +14,15 @@ import { extname, join, normalize } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { encodeAsync, rekeyAsync, inspect, detectFormat, sharpDecoder, PixmixError } from '../dist/pixmix-encoder.mjs';
 import { decodeAsync } from '../src/decoder.js';
+import { watermarkStore } from '../src/watermark/store.js';
+import { ID_PATTERN, normalizeDefinition } from '../src/watermark/schema.js';
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8080; // 0 = any free port
 const HOST = process.env.HOST || '127.0.0.1';
 const ROOT = new URL('..', import.meta.url).pathname;
 const MAX_BODY = 64 * 1024 * 1024;
-const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.map': 'application/json', '.wasm': 'application/wasm' };
+const MAX_JSON = 256 * 1024;
+const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.map': 'application/json', '.wasm': 'application/wasm', '.svg': 'image/svg+xml' };
 const IMAGE = { png: ['image/png', 'png'], jpeg: ['image/jpeg', 'jpg'], jxl: ['image/jxl', 'jxl'] };
 
 // sharp is optional: with it the server also accepts WebP, AVIF, HEIC and TIFF uploads.
@@ -24,6 +31,16 @@ const decoders = sharp ? [sharpDecoder(sharp, { formats: ['webp', 'avif', 'heic'
 
 /** In-memory "CDN" for the demo site: id -> {bytes, key, name, effect}. */
 const gallery = new Map();
+
+const watermarks = watermarkStore();
+const httpError = (status, message) => Object.assign(new Error(message), { status });
+
+/** The ?watermark= style parameter: an id in the store, or null. */
+async function storedWatermark(id) {
+  if (!id) return null;
+  if (!ID_PATTERN.test(id)) throw httpError(400, `Invalid watermark id "${id}"`);
+  return watermarks.compiled(id);
+}
 
 const routes = {
   // Any supported input; the X-Pixmix-Convert header reports what happened to it.
@@ -41,11 +58,23 @@ const routes = {
       transforms: q.get('transforms') !== '0',
       decoders,
       onConvert: (r) => { report = r; },
+      // watermark: carried for the decoder (whole, or just its id with watermarkEmbed=id);
+      // visibleWatermark: drawn on the scrambled image.
+      watermark: q.get('watermarkEmbed') === 'id' && q.get('watermark') ? { id: q.get('watermark') } : await storedWatermark(q.get('watermark')),
+      visibleWatermark: await storedWatermark(q.get('visibleWatermark')),
     });
     const { bytes: _, ...info } = report;
     return { ...image(out), headers: { 'X-Pixmix-Convert': JSON.stringify(info) } };
   },
-  'POST /api/decode': async (req, q) => image(await decodeAsync(await body(req), { key: q.get('key') })),
+  // ?watermark=<id> draws that watermark on the result, ?watermark=embedded the file's own.
+  'POST /api/decode': async (req, q) => {
+    const wm = q.get('watermark');
+    return image(await decodeAsync(await body(req), {
+      key: q.get('key'),
+      watermark: wm === 'embedded' ? 'embedded' : await storedWatermark(wm),
+      resolveWatermark: (id) => storedWatermark(id),
+    }));
+  },
   'POST /api/rekey': async (req, q) => image(await rekeyAsync(await body(req), {
     from: q.get('from'),
     to: q.get('to'),
@@ -61,29 +90,65 @@ const routes = {
     const info = inspect(bytes);
     if (!info.scrambled) throw new PixmixError('Only scrambled images can be published', 'NOT_SCRAMBLED');
     const id = randomUUID().slice(0, 8);
-    gallery.set(id, { bytes, key: q.get('key'), name: q.get('name') || id, effect: q.get('effect') || 'dissolve' });
+    gallery.set(id, { bytes, key: q.get('key'), name: q.get('name') || id, effect: q.get('effect') || 'dissolve', watermark: q.get('watermark') || '' });
     return json({ id, url: urlFor(id, bytes) }, 201);
   },
   'GET /api/gallery': async () => json([...gallery].map(([id, g]) => ({
-    id, url: urlFor(id, g.bytes), key: g.key, name: g.name, effect: g.effect, ...pick(inspect(g.bytes)),
+    id, url: urlFor(id, g.bytes), key: g.key, name: g.name, effect: g.effect, watermark: g.watermark, ...pick(inspect(g.bytes)),
   }))),
   'DELETE /api/gallery': async () => { gallery.clear(); return json({ ok: true }); },
+
+  // Watermark definitions, saved to the watermarks/ directory (and compiled next to it).
+  'GET /api/watermarks': async () => json({
+    watermarks: await watermarks.list(), fonts: await watermarks.fonts(), assets: await watermarks.assets(),
+  }),
+  'POST /api/watermarks': async (req) => {
+    const def = await jsonBody(req);
+    if (ID_PATTERN.test(def?.id) && (await watermarks.exists(def.id))) throw httpError(409, `Watermark "${def.id}" already exists`);
+    return json(await watermarks.save(def), 201);
+  },
+  // Compiles without saving, for the lab's live preview.
+  // (and gives the definition back normalised, defaults filled in).
+  'POST /api/watermarks/preview': async (req) => {
+    const definition = normalizeDefinition(await jsonBody(req));
+    return json({ definition, compiled: watermarks.compile(definition) });
+  },
 };
 
-const pick = ({ format, width, height, mode, block }) => ({ format, width, height, mode, block });
+/** /api/watermarks/<id>: read, create or replace, delete. */
+const watermarkRoutes = {
+  GET: async (id) => json({ definition: await watermarks.get(id), compiled: await watermarks.compiled(id) }),
+  PUT: async (id, req) => {
+    const def = await jsonBody(req);
+    if (def?.id !== id) throw httpError(400, 'The definition\'s id must match the URL');
+    const created = !(await watermarks.exists(id));
+    return json(await watermarks.save(def), created ? 201 : 200);
+  },
+  DELETE: async (id) => { await watermarks.remove(id); return json({ ok: true }); },
+};
+
+const pick = ({ format, width, height, mode, block, watermark, visibleWatermark }) => ({
+  format, width, height, mode, block, carries: watermark?.id ?? null, visibleWatermark,
+});
 const urlFor = (id, bytes) => `/images/${id}.${IMAGE[detectFormat(bytes)][1]}`;
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   try {
     const route = routes[`${req.method} ${url.pathname}`];
+    const wm = /^\/api\/watermarks\/([^/]+)$/.exec(url.pathname);
     let out;
     if (route) out = await route(req, url.searchParams);
-    else if (req.method === 'GET') out = await staticFile(url.pathname);
+    else if (wm && watermarkRoutes[req.method]) {
+      if (!ID_PATTERN.test(wm[1])) throw httpError(400, 'Invalid watermark id');
+      out = await watermarkRoutes[req.method](wm[1], req);
+    } else if (req.method === 'GET') out = await staticFile(url.pathname);
     else out = json({ error: 'Not found' }, 404);
     send(res, out);
   } catch (err) {
-    const status = err.code === 'WRONG_KEY' ? 403 : err instanceof PixmixError ? 400 : err.status || 500;
+    // PixmixErrors come from the bundle and from src/ (two classes): go by name.
+    const pixmix = err instanceof PixmixError || err?.name === 'PixmixError' || err?.name === 'WrongKeyError';
+    const status = err.status || (err.code === 'WRONG_KEY' ? 403 : pixmix ? 400 : 500);
     if (status === 500) console.error(err);
     send(res, json({ error: err.message, code: err.code }, status));
   }
@@ -96,6 +161,13 @@ async function staticFile(pathname) {
     const g = gallery.get(img[1]);
     return g ? image(g.bytes) : json({ error: 'Not found' }, 404);
   }
+  const wm = pathname.match(/^\/watermarks\/([a-z0-9-]+)\.(json|svg)$/);
+  if (wm) {
+    if (!ID_PATTERN.test(wm[1]) || !(await watermarks.exists(wm[1]))) return json({ error: 'Not found' }, 404);
+    if (wm[2] === 'json') return { status: 200, type: 'application/json', data: JSON.stringify(await watermarks.compiled(wm[1])), cache: 'no-cache' };
+    const { watermarkToSvg } = await import('../src/watermark/compile.js');
+    return { status: 200, type: TYPES['.svg'], data: watermarkToSvg(await watermarks.compiled(wm[1])), cache: 'no-cache' };
+  }
   if (pathname === '/') pathname = '/index.html';
   const base = pathname.startsWith('/dist/') ? ROOT : join(ROOT, 'server/public');
   const file = normalize(join(base, pathname));
@@ -107,18 +179,28 @@ async function staticFile(pathname) {
   }
 }
 
-function body(req) {
+function body(req, max = MAX_BODY) {
   return new Promise((resolve, reject) => {
     const parts = [];
     let size = 0;
     req.on('data', (c) => {
       size += c.length;
-      if (size > MAX_BODY) { reject(Object.assign(new Error('Body too large'), { status: 413 })); req.destroy(); }
+      if (size > max) { reject(Object.assign(new Error('Body too large'), { status: 413 })); req.destroy(); }
       else parts.push(c);
     });
     req.on('end', () => resolve(new Uint8Array(Buffer.concat(parts))));
     req.on('error', reject);
   });
+}
+
+/** A JSON request body (small), parsed. */
+async function jsonBody(req) {
+  const bytes = await body(req, MAX_JSON);
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    throw httpError(400, 'The body is not valid JSON');
+  }
 }
 
 const image = (data) => ({ status: 200, type: IMAGE[detectFormat(data)][0], data, cache: 'no-store' });

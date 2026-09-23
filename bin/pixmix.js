@@ -7,6 +7,7 @@ import { basename, dirname, extname, join } from 'node:path';
 import { encodeAsync, decodeAsync, rekeyAsync, inspect, detectFormat, PixmixError } from '../src/index.js';
 import { targetFormat } from '../src/convert/index.js';
 import { sharpDecoder } from '../src/plugins/sharp.js';
+import { loadWatermark } from '../src/watermark/store.js';
 
 const USAGE = `Usage:
   pixmix encode  <file...> [options]   scramble images (any supported input -> PNG, JPEG or JPEG XL)
@@ -34,6 +35,15 @@ Options:
   --background <#rrggbb>   JPEG: colour transparency is flattened onto (default #ffffff)
   --keep-thumbnails        keep embedded previews (they show the UNSCRAMBLED image)
   --level <0-9>            zlib level for PNG output
+
+Watermarks (<wm> is an id in the watermarks directory, or a .json definition / compiled file):
+  --watermark <wm>         decode: draw it on the restored image ("embedded": the one the
+                           file carries). encode/rekey: carry it, for decoders to draw
+  --watermark-ref          encode/rekey: carry only the watermark's id (decoders look it up)
+  --visible-watermark <wm> encode/rekey: draw it on the scrambled image too (restoring
+                           stays exact: the pixels under it are kept, encrypted, in the file)
+  --no-watermark           rekey: remove both watermarks
+  --watermarks <dir>       watermarks directory (default: $PIXMIX_WATERMARKS_DIR or pixmix's own)
   --in-place               rekey: overwrite the input
   -f, --force              overwrite existing outputs
   --no-sharp               do not use sharp even if installed
@@ -64,6 +74,11 @@ const OPTIONS = {
   progressive: { type: 'boolean' },
   baseline: { type: 'boolean' },
   'keep-thumbnails': { type: 'boolean' },
+  watermark: { type: 'string' },
+  'watermark-ref': { type: 'boolean' },
+  'visible-watermark': { type: 'string' },
+  'no-watermark': { type: 'boolean' },
+  watermarks: { type: 'string' },
   'in-place': { type: 'boolean' },
   force: { type: 'boolean', short: 'f' },
   'no-sharp': { type: 'boolean' },
@@ -131,6 +146,7 @@ async function commandOptions(command, o) {
   if (o.progressive) opts.progressive = true;
   if (o.baseline) opts.progressive = false;
   if (o['keep-thumbnails']) opts.keepThumbnails = true;
+  Object.assign(opts, await watermarkOptions(command, o));
   if (command === 'rekey') {
     opts.from = await keyFrom(o.key, o['key-file'], 'PIXMIX_KEY', 'old key (-k, --key-file or $PIXMIX_KEY)');
     opts.to = await keyFrom(o.to, o['to-file'], 'PIXMIX_NEW_KEY', 'new key (--to, --to-file or $PIXMIX_NEW_KEY)');
@@ -145,6 +161,31 @@ async function commandOptions(command, o) {
     if (sharp) opts.decoders = [sharpDecoder(sharp, { formats: ['webp', 'avif', 'heic', 'tiff', 'jxl'] })];
   }
   return opts;
+}
+
+async function watermarkOptions(command, o) {
+  const load = (ref) => loadWatermark(ref, { dir: o.watermarks }).catch((err) => {
+    throw new UsageError(`watermark "${ref}": ${err.message}`);
+  });
+  const out = {};
+  if (o['no-watermark']) {
+    if (command !== 'rekey') throw new UsageError('--no-watermark only applies to rekey');
+    if (o.watermark || o['visible-watermark']) throw new UsageError('Use either --no-watermark or --watermark / --visible-watermark');
+    return { watermark: null, visibleWatermark: null };
+  }
+  if (o['visible-watermark']) {
+    if (command === 'decode') throw new UsageError('--visible-watermark applies to encode and rekey');
+    out.visibleWatermark = await load(o['visible-watermark']);
+  }
+  if (o.watermark) {
+    if (command === 'decode' && o.watermark === 'embedded') out.watermark = 'embedded';
+    else {
+      const wm = await load(o.watermark);
+      out.watermark = o['watermark-ref'] && command !== 'decode' ? { id: wm.id } : wm;
+    }
+    if (command === 'decode') out.resolveWatermark = (id) => loadWatermark(id, { dir: o.watermarks });
+  } else if (o['watermark-ref']) throw new UsageError('--watermark-ref needs --watermark');
+  return out;
 }
 
 async function run(command, input, opts) {
@@ -174,6 +215,8 @@ async function runInspect(files, o) {
       const parts = info.chunks ?? info.segments ?? info.boxes;
       if (parts) console.log(`  ${info.chunks ? 'chunks' : info.segments ? 'segments' : 'boxes'}: ${parts.map((c) => c.type).join(' ')}`);
       if (info.metadata) console.log(`  metadata: ${info.metadata.join(', ') || 'none'}${info.orientation > 1 ? ` (orientation ${info.orientation})` : ''}`);
+      if (info.watermark) console.log(`  watermark: ${info.watermark.id}${info.watermark.embedded ? '' : ' (id only)'}`);
+      if (info.visibleWatermark) console.log('  visible watermark on the scrambled image');
     } catch (err) {
       failed++;
       process.stderr.write(`pixmix: ${file}: ${err.message}\n`);

@@ -16,6 +16,8 @@ import { encodeRaster } from '../src/formats/png/raster.js';
 import { writeJxl } from '../src/formats/jxl/container.js';
 import { loadJxlCodec } from '../src/formats/jxl/load.js';
 import { readSegments, writeSegments, M } from '../src/formats/jpeg/markers.js';
+import { assembleJpeg } from '../src/formats/jpeg/encode.js';
+import { encodePixels } from '../src/formats/jpeg/fdct.js';
 import { makeParams, writeMarker } from '../src/core/params.js';
 import { computeGridLayout } from '../src/core/layout.js';
 
@@ -142,6 +144,32 @@ test('JPEG: sampling factors of 0 are refused (the MCU grid was infinite: a hang
   assert.equal(await inWorker('encode', await jpegWithSampling(0x00), { key: 'k' }), 'PixmixError BAD_JPEG');
   await rejectsPixmix(async () => decode(await jpegWithSampling(0x10), { key: 'k' }), 'BAD_JPEG');
   assert.ok(encode(await jpegWithSampling(0x22), { key: 'k' })); // 2x2 everywhere is fine
+});
+
+test('JPEG: a coefficient that overflowed on decoding is refused, not written as a garbled stream', async () => {
+  // A successive-approximation shift of 15 turns an AC value of 1 into 32768, which wraps
+  // to -32768 in the Int16 coefficients: category 16, which an AC symbol cannot hold. The
+  // encoder used to write it anyway, and decode of its own output failed or differed.
+  const { frame, dqt } = encodePixels({ width: 16, height: 16, data: new Uint8Array(1024).fill(128) }, { quality: 90, subsampling: '4:4:4', grey: false });
+  frame.components[0].coefs[1] = -32768;
+  for (const progressive of [false, true]) {
+    assert.throws(() => assembleJpeg([dqt], frame, { progressive }), (err) => err.name === 'PixmixError' && err.code === 'BAD_JPEG');
+  }
+  // End to end, from a progressive JPEG with Al = 15 in an AC scan.
+  const src = new Uint8Array(await sharp(Buffer.alloc(32 * 32 * 3).map((_, i) => (i * 37) & 255), { raw: { width: 32, height: 32, channels: 3 } })
+    .jpeg({ progressive: true, quality: 95 }).toBuffer());
+  const { segments } = readSegments(src);
+  let tried = 0;
+  for (const scan of segments.filter((s) => s.marker === M.SOS && s.data[1 + s.data[0] * 2] > 0)) {
+    const data = scan.data.slice();
+    data[3 + data[0] * 2] = (data[3 + data[0] * 2] & 0xf0) | 15;
+    const jpeg = writeSegments(segments.map((s) => (s === scan ? { ...s, data } : s)));
+    let scrambled;
+    try { scrambled = encode(jpeg, { key: 'k' }); } catch (err) { assert.equal(err.name, 'PixmixError'); tried++; continue; }
+    assert.ok(decode(scrambled, { key: 'k' }), 'whatever encode writes, decode reads');
+    tried++;
+  }
+  assert.ok(tried > 0);
 });
 
 test('JPEG XL: a box with a 64-bit size cut off inside its header', async () => {

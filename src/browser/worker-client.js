@@ -46,10 +46,11 @@ function rebuildError({ name, message, code }) {
 
 /**
  * @param {Uint8Array} bytes
- * @param {{worker?: boolean|string}} [opts] false: inline; a string: worker script URL
+ * @param {{animated?: boolean, worker?: boolean|string, watermark?: object|'embedded'|null}} [opts]
+ *        worker false: inline; a string: worker script URL
  */
-export function computeAnywhere(bytes, key, { animated = true, worker: use = true } = {}) {
-  const inline = () => compute(bytes, key, { animated });
+export function computeAnywhere(bytes, key, { animated = true, worker: use = true, watermark = null } = {}) {
+  const inline = () => compute(bytes, key, { animated, watermark });
   if (!use || broken || typeof Worker === 'undefined') return inline();
   try {
     worker ??= start(typeof use === 'string' ? use : undefined);
@@ -60,6 +61,6 @@ export function computeAnywhere(bytes, key, { animated = true, worker: use = tru
   return new Promise((resolve, reject) => {
     const id = nextId++;
     pending.set(id, { resolve, reject, fallback: () => inline().then(resolve, reject) });
-    worker.postMessage({ id, bytes, key, animated }); // copied, so the fallback still has it
+    worker.postMessage({ id, bytes, key, animated, watermark }); // copied, so the fallback still has it
   });
 }

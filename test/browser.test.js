@@ -122,6 +122,27 @@ test('reveal swaps the restored PNG into the <img>', async () => {
   assert.equal(img.inserted.getAttribute('aria-label'), 'cat');
 });
 
+test('reveal draws the watermark the file carries, fading it in, unless told not to', async () => {
+  const { watermarkStore } = await import('../src/watermark/store.js');
+  const wm = await watermarkStore().compiled('vivi-pixel');
+  const big = (await import('../src/convert/png-build.js')).buildPng({
+    width: 200, height: 120, data: new Uint8Array(200 * 120 * 4).map((_, i) => (i % 4 === 3 ? 255 : (i * 7) & 255)),
+  }).png;
+  const scrambled = encode(big, { key: 'k', watermark: wm });
+  const shown = async (opts) => {
+    globalThis.fetch = async () => new Response(scrambled);
+    const img = new FakeImg();
+    await reveal(img, { key: 'k', duration: 20, worker: false, ...opts });
+    return new Uint8Array(await resolveObjectURL(img.src).arrayBuffer());
+  };
+  const { decodeAsync } = await import('../src/decoder.js');
+  const marked = await decodeAsync(scrambled, { key: 'k', watermark: true });
+  assert.deepEqual(await shown({}), marked, 'the file\'s own watermark by default');
+  assert.deepEqual(await shown({ watermark: wm }), marked, 'or passed in');
+  assert.deepEqual(await shown({ watermark: false }), decode(scrambled, { key: 'k' }), 'or none');
+  assert.deepEqual(await shown({ effect: 'none' }), marked);
+});
+
 test('reveal with wrong key leaves the image alone', async () => {
   globalThis.fetch = async () => new Response(encode(orig, { key: 'k' }));
   const img = new FakeImg();

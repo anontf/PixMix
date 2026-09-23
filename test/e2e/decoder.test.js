@@ -14,6 +14,7 @@ import { toRGBA8 } from '../../src/formats/png/rgba.js';
 import { readSegments } from '../../src/formats/jpeg/markers.js';
 import { decodeFrame } from '../../src/formats/jpeg/decode.js';
 import { loadJxlCodec } from '../../src/formats/jxl/load.js';
+import { watermarkStore } from '../../src/watermark/store.js';
 import { startServer, launch, engines, openPage, revealed, rendered, decoderPage } from './harness.js';
 
 let server, cdn;
@@ -32,7 +33,13 @@ async function photo(w, h, jpegOpts) {
 }
 
 const F = {};
+const W = {};
 before(async () => {
+  const store = watermarkStore();
+  W.gold = await store.compiled('vivi-gold');
+  W.pixel = await store.compiled('vivi-pixel');
+  W.window = await store.compiled('vivi-window');
+  W.byId = { 'vivi-gold': W.gold, 'vivi-pixel': W.pixel, 'vivi-window': W.window };
   server = await startServer();
   cdn = await startServer({ cors: true });
   F.png = await photo(160, 100);
@@ -113,6 +120,71 @@ for (const { name: engine, skip } of await engines()) describe(engine, { skip },
       });
     }
   }
+
+  // Watermarks: the browser draws exactly the bytes Node draws (same renderer, same maths),
+  // and only fetches the painter when there is something to draw.
+  const WM_CASES = [
+    ['PNG, carried whole', async () => encode(F.png, { key: 'k', watermark: W.gold }), '', 'png'],
+    ['PNG block, visible watermark and one by id (data-watermark)', async () => encode(F.png, { key: 'k', mode: 'block', block: 8, visibleWatermark: W.pixel }), 'data-watermark="vivi-window"', 'png'],
+    ['JPEG, carried by id', async () => encode(F.jpeg, { key: 'k', watermark: { id: 'vivi-gold' }, visibleWatermark: W.window }), '', 'jpeg'],
+    ['JPEG XL pixel route', async () => encodeAsync(F.jxlSource, { key: 'k', mode: 'block', block: 8, watermark: W.window }), '', 'jxl'],
+    ['JPEG XL JPEG route', async () => encodeAsync(F.jpeg, { key: 'k', format: 'jxl', watermark: W.gold, visibleWatermark: W.pixel }), '', 'jxl-jpeg'],
+  ];
+  for (const [name, make, extra, kind] of WM_CASES) {
+    test(`watermark · ${name}: the <img> shows exactly what Node draws`, async () => {
+      const scrambled = await make();
+      const ext = { png: 'png', jpeg: 'jpg', jxl: 'jxl', 'jxl-jpeg': 'jxl' }[kind];
+      const files = { [`/s.${ext}`]: scrambled };
+      for (const [id, c] of Object.entries(W.byId)) files[`/watermarks/${id}.json`] = JSON.stringify(c);
+      const { page: p, errors } = await page(decoderPage({ src: `/s.${ext}`, effect: 'dissolve', extra }), files);
+      const r = await revealed(p);
+      assert.equal(r.state, 'done');
+      const shown = new Uint8Array(r.bytes);
+      const want = extra ? W.window : undefined;
+      const node = await decodeAsync(scrambled, { key: 'k', watermark: want ?? true, resolveWatermark: (id) => W.byId[id] });
+      if (kind === 'jxl') {
+        const px = Buffer.from((await (await loadJxlCodec()).decode(node)).data);
+        assert.ok(pngFrames(shown)[0].equals(px), 'same pixels as Node');
+      } else if (kind === 'jxl-jpeg') {
+        assert.ok(Buffer.from(shown).equals(Buffer.from(await reconstructJpeg(node))), 'same JPEG as Node');
+      } else if (kind === 'png') {
+        // Same pixels; the deflate stream is the engine's own (CompressionStream).
+        assert.deepEqual(pngFrames(shown), pngFrames(node), 'same pixels as Node');
+      } else {
+        assert.ok(Buffer.from(shown).equals(Buffer.from(node)), 'same file as Node');
+      }
+      if (!kind.startsWith('jxl')) assert.ok(!Buffer.from(shown).equals(Buffer.from(await decodeAsync(scrambled, { key: 'k' }))), 'watermarked');
+      assert.deepEqual(errors, []);
+      await p.close();
+    });
+  }
+
+  test('watermark: the painter is only fetched when something is drawn', async () => {
+    // On the main thread (data-worker="false"), so the page's resource timing sees the fetch.
+    const loaded = (p) => p.evaluate(() => performance.getEntriesByType('resource').some((e) => e.name.includes('pixmix-watermark')));
+    const run = async (bytes, extra = '') => {
+      const { page: p, errors } = await page(decoderPage({ src: '/s.png', extra: `data-worker="false" ${extra}` }), { '/s.png': bytes });
+      const r = await revealed(p);
+      const out = { frames: pngFrames(new Uint8Array(r.bytes)), painter: await loaded(p), errors };
+      await p.close();
+      return out;
+    };
+    const plain = await run(encode(F.png, { key: 'k' }));
+    assert.deepEqual([plain.frames, plain.painter], [pngFrames(F.png), false], 'no watermark: not fetched');
+    const marked = await run(encode(F.png, { key: 'k', watermark: W.gold }));
+    assert.equal(marked.painter, true);
+    const off = await run(encode(F.png, { key: 'k', watermark: W.gold }), 'data-watermark="none"');
+    assert.deepEqual([off.frames, off.painter], [pngFrames(F.png), false], 'data-watermark="none"');
+    assert.deepEqual([...plain.errors, ...marked.errors, ...off.errors], []);
+  });
+
+  test('watermark: a missing one is skipped with a warning, the image still shows', async () => {
+    const { page: p } = await page(decoderPage({ src: '/s.png', extra: 'data-watermark="not-there"' }), { '/s.png': encode(F.png, { key: 'k' }) });
+    const r = await revealed(p);
+    assert.equal(r.state, 'done');
+    assert.deepEqual(pngFrames(new Uint8Array(r.bytes)), pngFrames(F.png));
+    await p.close();
+  });
 
   test('animation frames are drawn on a canvas while revealing', async () => {
     const { page: p, errors } = await page(decoderPage({ src: '/s.png', effect: 'blocks', duration: 1500 }), { '/s.png': encode(F.png, { key: 'k', mode: 'block', block: 8 }) });

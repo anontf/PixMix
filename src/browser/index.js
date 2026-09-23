@@ -6,14 +6,20 @@
 // The animation runs on a canvas that temporarily replaces the <img>. At the end the
 // <img> gets the exactly restored file (as a blob: URL), so colour management, ICC
 // profiles, alt text, CSS and right-click "save image" all behave as usual.
+//
+// Watermarks: when the file carries one (or `watermark` names one), it is drawn onto the
+// restored image; the animation ends by fading it in, and the <img> gets the watermarked
+// file. The painter (dist/pixmix-watermark.mjs) is only fetched when that happens.
 
-import { decode, decodeAsync as decodeAnyAsync, inspect, detectFormat, configureJxl, PixmixError, WrongKeyError } from '../decoder.js';
+import {
+  decode, decodeAsync as decodeAnyAsync, inspect, detectFormat, configureJxl, configureWatermarks, PixmixError, WrongKeyError,
+} from '../decoder.js';
 import { unscramblePngDetailedAsync } from '../formats/png/index.js';
 import { computeAnywhere } from './worker-client.js';
 import { readOrientation } from '../meta/exif.js';
 import { orientationTransform, swapsAxes, browserHonoursPngOrientation } from './orient.js';
 
-export { decode, inspect, detectFormat, configureJxl, PixmixError, WrongKeyError };
+export { decode, inspect, detectFormat, configureJxl, configureWatermarks, PixmixError, WrongKeyError };
 
 export const EFFECTS = ['dissolve', 'scan', 'blocks', 'none'];
 const MAX_ANIMATED_TILES = 12000;
@@ -24,11 +30,15 @@ const TYPES = { png: 'image/png', jpeg: 'image/jpeg' };
  * for PNG. JPEG XL comes back as lossless JPEG XL, which needs the JPEG XL encoder too;
  * for display, decodeToURL (a PNG for JPEG XL) is cheaper.
  */
-export async function decodeAsync(input, { key } = {}) {
+export async function decodeAsync(input, { key, watermark, watermarkBase, fetchOptions } = {}) {
   const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
   const format = detectFormat(bytes);
-  if (format === 'png') return (await unscramblePngDetailedAsync(bytes, { key })).toPng();
-  return decodeAnyAsync(bytes, { key });
+  if (!watermark) {
+    if (format === 'png') return (await unscramblePngDetailedAsync(bytes, { key })).toPng();
+    return decodeAnyAsync(bytes, { key });
+  }
+  // Exact restoring stays the default; a watermark is only drawn when asked for.
+  return decodeAnyAsync(bytes, { key, watermark, resolveWatermark: (id) => fetchWatermark(id, watermarkBase, fetchOptions) });
 }
 
 /**
@@ -37,16 +47,55 @@ export async function decodeAsync(input, { key } = {}) {
  * animated), or, on the JPEG route, as the original JPEG. Needs only the JPEG XL decoder.
  * @returns {Promise<{bytes: Uint8Array, type: string}>}
  */
-export async function restoreForDisplay(input, { key, worker } = {}) {
+export async function restoreForDisplay(input, { key, worker, watermark = false, watermarkBase, fetchOptions } = {}) {
   const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
-  const job = await prepare(bytes, key, 'ignore', false, worker);
+  const wm = await watermarkFor(watermark, bytes, watermarkBase, fetchOptions);
+  const job = await prepare(bytes, key, 'ignore', false, worker, wm);
   return { bytes: job.restored(), type: job.type };
 }
 
 /** Fetches, restores for display (see restoreForDisplay) and returns a blob: URL. */
-export async function decodeToURL(url, { key, fetchOptions, worker } = {}) {
-  const { bytes, type } = await restoreForDisplay(await fetchBytes(url, fetchOptions), { key, worker });
+export async function decodeToURL(url, { key, fetchOptions, worker, watermark, watermarkBase } = {}) {
+  const { bytes, type } = await restoreForDisplay(await fetchBytes(url, fetchOptions), { key, worker, watermark, watermarkBase, fetchOptions });
   return URL.createObjectURL(new Blob([bytes], { type }));
+}
+
+// --- watermarks ---------------------------------------------------------------------
+
+const fetched = new Map();
+
+/**
+ * A compiled watermark from an id (fetched from `${base}${id}.json`, base defaulting to
+ * "watermarks/" next to the page) or a URL. Cached per URL.
+ */
+export function fetchWatermark(ref, base = 'watermarks/', fetchOptions) {
+  const page = typeof document !== 'undefined' ? document.baseURI : globalThis.location?.href;
+  const url = /[/:]|\.json$/.test(ref) ? new URL(ref, page) : new URL(`${encodeURIComponent(ref)}.json`, new URL(base, page));
+  if (!fetched.has(url.href)) {
+    fetched.set(url.href, fetch(url, fetchOptions).then(async (res) => {
+      if (!res.ok) throw new PixmixError(`Failed to load watermark ${url.href} (${res.status})`, 'FETCH');
+      return res.json();
+    }).catch((err) => { fetched.delete(url.href); throw err; }));
+  }
+  return fetched.get(url.href);
+}
+
+/**
+ * What to draw: false / 'none' nothing; undefined / 'auto' / true / 'embedded' the file's own
+ * watermark if it carries one (its id is looked up when it carries no more than that); an
+ * id or URL string; or a compiled watermark object.
+ * @returns {Promise<object|'embedded'|null>}
+ */
+async function watermarkFor(spec, bytes, base, fetchOptions) {
+  if (spec === false || spec === null || spec === '' || spec === 'none') return null;
+  if (spec === undefined || spec === true || spec === 'auto' || spec === 'embedded') {
+    const info = inspect(bytes).watermark;
+    if (!info) return null;
+    return info.embedded ? 'embedded' : fetchWatermark(info.id, base, fetchOptions);
+  }
+  if (typeof spec === 'string') return fetchWatermark(spec, base, fetchOptions);
+  if (!spec.format && typeof spec.id === 'string') return fetchWatermark(spec.id, base, fetchOptions);
+  return spec;
 }
 
 /**
@@ -64,6 +113,10 @@ export async function decodeToURL(url, { key, fetchOptions, worker } = {}) {
  *        animation; 'auto' matches whatever this browser does for the final <img>
  * @param {boolean|string} [opts.worker=true] decode in a Web Worker (falls back to the main
  *        thread when one cannot start); a string is the worker script's URL
+ * @param {object|string|boolean} [opts.watermark='auto'] drawn on the revealed image: 'auto'
+ *        the file's own if it carries one, false none, an id / URL, or a compiled watermark;
+ *        data-pixmix-watermark overrides it per image
+ * @param {string} [opts.watermarkBase='watermarks/'] where ids are looked up (id.json)
  */
 export async function reveal(img, opts = {}) {
   const {
@@ -84,7 +137,11 @@ export async function reveal(img, opts = {}) {
   img.dataset.pixmixState = 'decoding';
   try {
     const bytes = await fetchBytes(url, fetchOptions);
-    const job = await prepare(bytes, key, orientation, effect !== 'none', worker);
+    // A watermark that cannot be had never stops the image itself from showing.
+    const wm = await watermarkFor(img.dataset.pixmixWatermark ?? opts.watermark, bytes, opts.watermarkBase, fetchOptions)
+      .catch((err) => { console.warn('[pixmix] watermark:', err.message); return null; });
+    const job = await prepare(bytes, key, orientation, effect !== 'none', worker, wm);
+    if (job.watermarkError) console.warn('[pixmix] watermark:', job.watermarkError);
 
     if (effect !== 'none') {
       const { width, height, o } = job;
@@ -116,6 +173,7 @@ export async function reveal(img, opts = {}) {
       img.before(canvas);
       img.style.display = 'none';
       await job.animate(work, { effect, duration, onProgress, present });
+      if (job.overlay) await fadeIn(work, job.overlay, Math.min(400, Math.max(150, duration / 4)), present);
       if (final === 'canvas') {
         img.remove();
         canvas.dataset.pixmixState = 'done';
@@ -141,21 +199,22 @@ export async function reveal(img, opts = {}) {
  * @returns {Promise<{width: number, height: number, o: number, type: string,
  *   restored: () => Uint8Array, animate?: Function}>}
  */
-async function prepare(bytes, key, orientation, animated, worker = true) {
-  const r = await computeAnywhere(bytes, key, { animated, worker });
+async function prepare(bytes, key, orientation, animated, worker = true, watermark = null) {
+  const r = await computeAnywhere(bytes, key, { animated, worker, watermark });
   const { width, height } = r.layout;
   const restored = () => r.restored;
+  const wm = { overlay: r.overlay ?? null, watermarkError: r.watermarkError };
   if (r.kind === 'pixels') {
     const o = await effectiveOrientation(r.exif, orientation, browserHonoursPngOrientation);
-    return { width, height, o, type: r.type, restored, animate: (work, opts) => animate(work, r, r.scrambled, opts) };
+    return { width, height, o, type: r.type, restored, ...wm, animate: (work, opts) => animate(work, r, r.scrambled, opts) };
   }
   let o = await effectiveOrientation(r.exif, orientation, async () => true);
-  if (!animated) return { width, height, o, type: r.type, restored };
+  if (!animated) return { width, height, o, type: r.type, restored, ...wm };
   // Browsers decode JPEGs already oriented; undo that to get the stored pixel grid.
   const [orig, scr] = await Promise.all([loadImage(r.restored, r.type), loadImage(r.scrambled, r.type)]);
   if (swapsAxes(o) && orig.naturalWidth === width) o = 1; // this browser did not apply it
   return {
-    width, height, o, type: r.type, restored,
+    width, height, o, type: r.type, restored, ...wm,
     animate: (work, opts) => animateJpeg(work, r.layout, toRaw(scr, width, height, o), toRaw(orig, width, height, o), opts),
   };
 }
@@ -335,6 +394,24 @@ function animateBlocks(ctx, layout, scrambledRGBA, duration, onProgress, present
     }
     present?.();
     onProgress?.(t);
+  });
+}
+
+/** Fades the watermark (drawn into the final file already) in over the finished animation. */
+function fadeIn(work, { x, y, width, height, rgba }, duration, present) {
+  const sheet = document.createElement('canvas');
+  sheet.width = width;
+  sheet.height = height;
+  sheet.getContext('2d').putImageData(new ImageData(rgba, width, height), 0, 0);
+  const ctx = work.getContext('2d');
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  const under = ctx.getImageData(x, y, width, height);
+  return frames(duration, (t) => {
+    ctx.putImageData(under, x, y);
+    ctx.globalAlpha = t;
+    ctx.drawImage(sheet, x, y);
+    ctx.globalAlpha = 1;
+    present?.();
   });
 }
 

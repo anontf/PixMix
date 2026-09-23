@@ -8,6 +8,8 @@ import { unscrambleJxlDetailed, reconstructJpeg } from '../formats/jxl/index.js'
 import { toRGBA8 } from '../formats/png/rgba.js';
 import { writeChunks } from '../formats/png/chunks.js';
 import { encodeRasterAsync } from '../formats/png/raster.js';
+import { readOrientation } from '../meta/exif.js';
+import { loadPainter } from '../watermark/load.js';
 
 /**
  * @typedef {object} PixelsResult  PNG, and JPEG XL on the pixel route
@@ -22,18 +24,27 @@ import { encodeRasterAsync } from '../formats/png/raster.js';
  * @property {Uint8Array} scrambled  the scrambled JPEG (the browser decodes both for frames)
  * @property {Uint8Array|null} exif  APP1 TIFF payload
  * @property {object} layout         perm, transforms, cols, rows, tileW, tileH, width, height
+ *
+ * Both may also have `overlay` ({x, y, width, height, rgba}: the watermark drawn into
+ * `restored`, for fading it in on the canvas) or `watermarkError` (it could not be drawn).
  */
 
-/** @returns {Promise<PixelsResult|JpegResult>} */
-export async function compute(bytes, key, { animated = true } = {}) {
+/**
+ * @param {{animated?: boolean, watermark?: object|'embedded'|null}} [opts]  watermark: a
+ *        compiled watermark to draw on the restored image, or 'embedded' for the file's own
+ * @returns {Promise<PixelsResult|JpegResult>}
+ */
+export async function compute(bytes, key, { animated = true, watermark = null } = {}) {
   const format = detectFormat(bytes);
   if (format === 'png') {
     const d = await unscramblePngDetailedAsync(bytes, { key });
+    const exif = d.img.chunks.find((c) => c.type === 'eXIf')?.data.slice() ?? null;
+    const w = await painting(watermark, d.watermark, d.layout, exif, (paint) => d.toPng(paint));
     return {
       kind: 'pixels',
       type: 'image/png',
-      restored: await d.toPng(),
-      exif: d.img.chunks.find((c) => c.type === 'eXIf')?.data.slice() ?? null,
+      ...w,
+      exif,
       layout: plainLayout(d.layout),
       ...(animated ? { scrambled: toRGBA8(d.img, d.img.pixels) } : {}),
     };
@@ -41,26 +52,31 @@ export async function compute(bytes, key, { animated = true } = {}) {
   if (format === 'jpeg') {
     const d = unscrambleJpegDetailed(bytes, { key });
     const app1 = d.segments.find((s) => s.marker === 0xe1 && s.data[0] === 0x45 && s.data[4] === 0 && s.data[5] === 0);
+    const exif = app1 ? app1.data.slice(6) : null;
     const { perm, transforms, cols, rows, tileW, tileH, width, height } = d.layout;
     return {
       kind: 'jpeg',
       type: 'image/jpeg',
-      restored: d.toJpeg(),
+      ...(await painting(watermark, d.watermark, d.layout, exif, (paint) => d.toJpeg(paint))),
       scrambled: bytes,
-      exif: app1 ? app1.data.slice(6) : null,
+      exif,
       layout: { perm, transforms, cols, rows, tileW, tileH, width, height },
     };
   }
   if (format === 'jxl') {
     // JPEG route: rebuild the scrambled JPEG and reveal that; visitors get the JPEG.
-    if (inspect(bytes).mode === 'mcu') return compute(await reconstructJpeg(bytes), key, { animated });
+    if (inspect(bytes).mode === 'mcu') return compute(await reconstructJpeg(bytes), key, { animated, watermark });
     // Pixel route: the <img> gets a PNG (an APNG for an animation), since most browsers
     // cannot display JPEG XL. The reveal animates frame 0.
     const d = await unscrambleJxlDetailed(bytes, { key, display: true });
+    const w = await painting(watermark, d.watermark, d.layout, null, (paint) => {
+      const image = d.paint(paint);
+      return rgbaPng(d.layout.width, d.layout.height, image.frames ?? [{ data: image.data }], image.plays);
+    });
     return {
       kind: 'pixels',
       type: 'image/png',
-      restored: await rgbaPng(d.layout.width, d.layout.height, d.image.frames ?? [{ data: d.pixels }], d.image.plays),
+      ...w,
       exif: null,
       layout: plainLayout(d.layout),
       ...(animated ? { scrambled: new Uint8ClampedArray(d.scrambled.buffer, d.scrambled.byteOffset, d.scrambled.length) } : {}),
@@ -69,11 +85,27 @@ export async function compute(bytes, key, { animated = true } = {}) {
   throw new PixmixError(`${format ? format.toUpperCase() : 'This format'} cannot be revealed`, 'UNSUPPORTED');
 }
 
+/**
+ * The restored file, with the watermark drawn when one is wanted. A watermark that cannot
+ * be drawn (it failed to validate, say) leaves the image as it is and says why.
+ */
+async function painting(requested, embedded, { width, height }, exif, write) {
+  const watermark = requested === 'embedded' ? embedded?.compiled ?? null : requested;
+  if (!watermark) return { restored: await write(null) };
+  try {
+    const painter = await loadPainter();
+    const restored = await write({ painter, watermark });
+    return { restored, overlay: painter.overlayFor(watermark, width, height, exif ? readOrientation(exif) : 1) };
+  } catch (err) {
+    return { restored: await write(null), watermarkError: err.message };
+  }
+}
+
 const plainLayout = ({ width, height, map, tiles }) => ({ width, height, map, tiles });
 
 /** Buffers worth transferring rather than copying. */
 export function transferables(r) {
-  const list = [r.restored, r.scrambled, r.layout.map, r.layout.perm, r.layout.transforms, r.layout.tiles?.perm]
+  const list = [r.restored, r.scrambled, r.layout.map, r.layout.perm, r.layout.transforms, r.layout.tiles?.perm, r.overlay?.rgba]
     .filter((a) => a && a.byteLength).map((a) => a.buffer);
   return [...new Set(list)];
 }

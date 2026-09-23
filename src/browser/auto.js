@@ -2,7 +2,9 @@
 //
 //   <script src="pixmix-decoder.min.js" data-key="site-key" data-effect="blocks"></script>
 //
-// Also: data-duration, data-selector, and data-worker="false" to decode on the main thread.
+// Also: data-duration, data-selector, data-worker="false" to decode on the main thread,
+// data-watermark (an id, a URL, or "none"; default: the one the file carries) and
+// data-watermark-base (where ids are looked up, default "watermarks/").
 //
 // Without data-key nothing runs automatically; call PixMix.revealAll({ key }) instead.
 
@@ -18,6 +20,8 @@ if (script?.dataset.key) {
     duration: script.dataset.duration ? Number(script.dataset.duration) : undefined,
     selector: script.dataset.selector,
     worker: script.dataset.worker === 'false' ? false : undefined, // data-worker="false"
+    watermark: script.dataset.watermark,
+    watermarkBase: script.dataset.watermarkBase,
   };
   for (const k of Object.keys(opts)) if (opts[k] === undefined) delete opts[k];
   const start = () => revealAll(opts);

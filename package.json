@@ -1,0 +1,28 @@
+{
+  "name": "pixmix",
+  "version": "0.1.0",
+  "description": "Keyed, reversible pixel scrambling that keeps images valid and their metadata intact",
+  "type": "module",
+  "license": "UNLICENSED",
+  "private": true,
+  "exports": {
+    ".": "./src/index.js",
+    "./encoder": "./src/encoder.js",
+    "./decoder": "./src/decoder.js",
+    "./browser": "./src/browser/index.js"
+  },
+  "files": ["src", "dist"],
+  "scripts": {
+    "build": "node scripts/build.js",
+    "test": "node --test test/*.test.js",
+    "serve": "npm run build && node server/server.js"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "fflate": "^0.8.2"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "pngjs": "^7.0.0"
+  }
+}

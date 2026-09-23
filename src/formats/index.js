@@ -1,0 +1,43 @@
+// Format detection and dispatch. New formats (JPEG, JXL) register in the ENCODERS /
+// DECODERS tables of encoder.js and decoder.js.
+
+import { PixmixError } from '../core/params.js';
+
+const SIGNATURES = [
+  ['png', [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]],
+  ['jpeg', [0xff, 0xd8, 0xff]],
+  ['jxl', [0xff, 0x0a]],
+  ['jxl', [0, 0, 0, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87, 0x0a]],
+  ['gif', [0x47, 0x49, 0x46, 0x38]],
+  ['webp', [0x52, 0x49, 0x46, 0x46, -1, -1, -1, -1, 0x57, 0x45, 0x42, 0x50]],
+  ['bmp', [0x42, 0x4d]],
+];
+
+/** @returns {string|null} */
+export function detectFormat(bytes) {
+  for (const [name, sig] of SIGNATURES) {
+    if (bytes.length >= sig.length && sig.every((b, i) => b < 0 || bytes[i] === b)) return name;
+  }
+  return null;
+}
+
+/** Accepts Uint8Array (incl. Node Buffer), ArrayBuffer or any ArrayBufferView. */
+export function toBytes(input) {
+  if (input instanceof Uint8Array) return input;
+  if (input instanceof ArrayBuffer) return new Uint8Array(input);
+  if (ArrayBuffer.isView(input)) return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+  throw new PixmixError('Expected image bytes (Uint8Array, Buffer or ArrayBuffer)');
+}
+
+/** Picks the handler for `bytes` from a {format: handler} table. */
+export function pick(table, bytes, targetFormat) {
+  const format = detectFormat(bytes);
+  if (!format) throw new PixmixError('Unrecognised image format', 'UNSUPPORTED');
+  const target = targetFormat ?? format;
+  if (target !== format) {
+    throw new PixmixError(`Converting ${format} to ${target} is not supported yet`, 'UNSUPPORTED');
+  }
+  const handler = table[format];
+  if (!handler) throw new PixmixError(`${format.toUpperCase()} is not supported yet`, 'UNSUPPORTED');
+  return handler;
+}

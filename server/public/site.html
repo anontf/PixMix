@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pixmix demo site</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>Demo site</h1>
+  <nav><a href="/">Lab</a><a href="/site.html" aria-current="page">Demo site</a></nav>
+  <label class="meta"><input type="checkbox" id="raw"> show without decoder</label>
+  <button id="replay">Replay</button>
+  <button id="clear">Clear gallery</button>
+</header>
+<main>
+  <p class="meta">
+    The server only ever sends scrambled PNGs (<code>/images/&lt;id&gt;.png</code>). The standalone
+    <code>pixmix-decoder.min.js</code> restores them as they scroll into view.
+  </p>
+  <div class="gallery" id="gallery"></div>
+</main>
+
+<script src="/dist/pixmix-decoder.min.js"></script>
+<script>
+const gallery = document.getElementById('gallery');
+const raw = document.getElementById('raw');
+
+async function render() {
+  const items = await (await fetch('/api/gallery')).json();
+  if (!items.length) {
+    gallery.innerHTML = '<div class="empty">Nothing here yet. Encode an image in the <a href="/">lab</a> and press “Publish to demo site”.</div>';
+    return;
+  }
+  gallery.replaceChildren(...items.map((it) => {
+    const fig = document.createElement('figure');
+    const img = new Image(it.width, it.height);
+    img.alt = it.name;
+    img.src = it.url;
+    if (!raw.checked) {
+      img.dataset.pixmix = '';
+      img.dataset.pixmixKey = it.key;
+      img.dataset.pixmixEffect = it.effect;
+    }
+    const cap = document.createElement('figcaption');
+    cap.textContent = `${it.name} · ${it.width}×${it.height} · ${it.mode}${it.block ? ' ' + it.block + 'px' : ''} · ${it.effect}`;
+    fig.append(img, cap);
+    return fig;
+  }));
+  if (!raw.checked) PixMix.revealAll({ duration: 1800 });
+}
+
+raw.addEventListener('change', render);
+document.getElementById('replay').addEventListener('click', render);
+document.getElementById('clear').addEventListener('click', async () => {
+  await fetch('/api/gallery', { method: 'DELETE' });
+  render();
+});
+render();
+</script>
+</body>
+</html>

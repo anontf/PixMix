@@ -7,8 +7,9 @@
 //   dist/pixmix-encoder.mjs       ESM, encoder for any server/runtime (Node, Deno, Bun, workers)
 //   dist/pixmix-encoder.cjs       CommonJS build of the encoder, for require()-based servers
 //   dist/pixmix-jxl.mjs           JPEG XL codec, loaded on demand by all of the above,
-//   dist/pixmix-jxl-{enc,dec}.wasm  with its WASM (libjxl encoder; jxl-oxide decoder, native/jxl)
-//   dist/pixmix-cjxl/             libjxl cjxl for JPEG -> JPEG XL recompression (servers only)
+//   dist/pixmix-jxl-{enc,dec}.wasm  with its WASM (libjxl encoder, native/libjxl; jxl-oxide
+//                                 decoder, native/jxl), and pixmix-jxl-enc-nosimd.wasm, the
+//                                 encoder for engines without WebAssembly SIMD
 //
 // Deploy the JPEG XL files next to whichever bundle you use (or call configureJxl), and
 // only if you need JPEG XL: nothing is fetched until a JPEG XL image shows up.
@@ -41,12 +42,8 @@ const targets = [
   { entryPoints: [`${root}src/browser/worker.js`], outfile: out('pixmix-worker.mjs'), format: 'esm', platform: 'browser', minify: true, ...chunk },
   {
     entryPoints: [`${root}src/formats/jxl/codec.js`], outfile: out('pixmix-jxl.mjs'), format: 'esm', platform: 'neutral',
-    mainFields: ['module', 'main'], minify: true,
-    external: ['module', 'fs', 'path', 'url', 'worker_threads', 'crypto'],
-    define: {
-      __PIXMIX_JXL_WASM__: JSON.stringify({ enc: './pixmix-jxl-enc.wasm', dec: './pixmix-jxl-dec.wasm' }),
-      __PIXMIX_CJXL__: '"./pixmix-cjxl/cjxl.cjs"',
-    },
+    minify: true,
+    define: { __PIXMIX_JXL_WASM__: JSON.stringify({ enc: './pixmix-jxl-enc.wasm', encNoSimd: './pixmix-jxl-enc-nosimd.wasm', dec: './pixmix-jxl-dec.wasm' }) },
   },
 ];
 
@@ -55,14 +52,11 @@ for (const t of targets) {
   await build({ ...common, ...t });
   await report(t.outfile);
 }
-await mkdir(out('pixmix-cjxl'), { recursive: true });
 for (const [from, to] of [
-  ['node_modules/@jsquash/jxl/codec/enc/jxl_enc.wasm', 'pixmix-jxl-enc.wasm'],
+  ['native/libjxl/pkg/pixmix_libjxl.wasm', 'pixmix-jxl-enc.wasm'],
+  ['native/libjxl/pkg/pixmix_libjxl_nosimd.wasm', 'pixmix-jxl-enc-nosimd.wasm'],
   ['native/jxl/pkg/pixmix_jxl_bg.wasm', 'pixmix-jxl-dec.wasm'],
-  // .cjs so it stays CommonJS even inside a "type": "module" package
-  ['node_modules/jxl-wasm/lib/cjxl.js', 'pixmix-cjxl/cjxl.cjs'],
-  ['node_modules/jxl-wasm/lib/cjxl.wasm', 'pixmix-cjxl/cjxl.wasm'],
-  ['node_modules/jxl-wasm/LICENSE', 'pixmix-cjxl/LICENSE'],
+  ['native/libjxl/pkg/THIRD_PARTY_LICENSES.txt', 'pixmix-jxl-enc.LICENSES.txt'], // libjxl, Highway, Brotli, skcms
 ]) {
   await copyFile(`${root}${from}`, out(to));
   await report(out(to));

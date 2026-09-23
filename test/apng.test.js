@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PNG } from 'pngjs';
-import { encode, decode, rekey, inspect, convert } from '../src/index.js';
+import { encode, decode, rekey, inspect, convert, encodeAsync, decodeAsync } from '../src/index.js';
+import { loadJxlCodec } from '../src/formats/jxl/load.js';
 import { readChunks, writeChunks } from '../src/formats/png/chunks.js';
 import { encodeRaster } from '../src/formats/png/raster.js';
 import { readPng } from '../src/formats/png/index.js';
@@ -96,8 +97,32 @@ test('APNG rekey and inspect', () => {
   assert.deepEqual([info.frames, info.plays, info.mode], [3, 3, 'block']);
 });
 
-test('APNG to other formats keeps the first frame and says so', () => {
+test('APNG to JPEG keeps the first frame and says so', () => {
   const src = makeApng({ width: 30, height: 20, frames: FRAMES });
   const r = convert(src, { format: 'jpeg' });
   assert.ok(r.dropped.includes('animation (first frame kept)'));
 });
+
+/** What a viewer shows for FRAMES (blend source, dispose none): frames drawn over each other. */
+function composited(width, height, frames) {
+  const canvas = new Uint8Array(width * height * 4);
+  return frames.map((f) => {
+    for (let y = 0; y < f.h; y++) canvas.set(f.rgba.subarray(y * f.w * 4, (y + 1) * f.w * 4), ((f.y + y) * width + f.x) * 4);
+    return Buffer.from(canvas);
+  });
+}
+
+for (const defaultInAnimation of [true, false]) {
+  test(`APNG -> JPEG XL is an animation of the frames it shows (default image ${defaultInAnimation ? 'in' : 'outside'} it)`, async () => {
+    const src = makeApng({ width: 30, height: 20, frames: FRAMES, defaultInAnimation, plays: 2 });
+    let report;
+    const s = await encodeAsync(src, { key: 'k', format: 'jxl', mode: 'block', block: 4, onConvert: (r) => { report = r; } });
+    assert.ok(report.transferred.includes('animation'));
+    assert.ok(!report.dropped.some((d) => d.startsWith('animation')), report.dropped.join());
+    assert.deepEqual([inspect(s).animated, inspect(s).plays], [true, 2]);
+    const anim = await (await loadJxlCodec()).decodeAnimation(await decodeAsync(s, { key: 'k' }));
+    const want = composited(30, 20, defaultInAnimation ? FRAMES : FRAMES.slice(1));
+    assert.deepEqual(anim.frames.map((f) => Buffer.from(f.data)), want);
+    assert.deepEqual(anim.frames.map((f) => f.delay), want.map(() => [100, 1000]));
+  });
+}

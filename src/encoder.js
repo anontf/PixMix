@@ -6,7 +6,6 @@ import { scrambleJpeg, rekeyJpeg, inspectJpeg } from './formats/jpeg/index.js';
 import {
   scrambleJxl, scrambleJxlPixels, scrambleJpegToJxl, rekeyJxl, inspectJxl, reencodeNotes, hasJpegData, reconstructJpeg,
 } from './formats/jxl/index.js';
-import { loadJxlCodec } from './formats/jxl/load.js';
 import { readJxl, readJxlHeader } from './formats/jxl/container.js';
 import { convert, convertAsync, decodeForJxl, targetFormat, OUTPUT_FORMATS } from './convert/index.js';
 import { PixmixError } from './core/params.js';
@@ -38,7 +37,7 @@ const needsAsync = (what) => new PixmixError(`JPEG XL ${what} is async; use ${wh
  *           when pixmix can write it (PNG, JPEG, JPEG XL), otherwise PNG
  * @property {'pixel'|'block'|'mcu'} [mode]  PNG: pixel (default) or block. JPEG: always mcu.
  *           JPEG XL: pixel/block (lossless pixels), or mcu, the JPEG route, which is the
- *           default when the source is a JPEG (or a JPEG XL holding one) and Node can run cjxl
+ *           default when the source is a JPEG (or a JPEG XL holding one)
  * @property {number} [block=8]        block mode tile size
  * @property {number} [effort]         JPEG XL encoder effort 1-9 (default 2 in pixel mode, else 7)
  * @property {boolean} [transforms=true]  JPEG: also flip/rotate each MCU (lossless)
@@ -104,18 +103,13 @@ export async function encodeAsync(input, opts) {
 /**
  * For JPEG XL output: the JPEG to take the JPEG route with, or null for the pixel route.
  * The route is used when asked for (mode mcu), or by default when the source is a JPEG or a
- * recompressed-JPEG JXL and this runtime can run cjxl.
+ * recompressed-JPEG JXL.
  */
 async function jpegForJxl(bytes, from, { mode, limits }) {
   if (mode && mode !== 'mcu') return null;
   const isJpegSource = from === 'jpeg' || (from === 'jxl' && hasJpegData(bytes, limits));
   if (!isJpegSource) {
     if (mode === 'mcu') throw new PixmixError('Mode "mcu" needs a JPEG source (a JPEG, or a JPEG XL made from one)', 'BAD_OPTION');
-    return null;
-  }
-  const codec = await loadJxlCodec();
-  if (!codec.canTranscode()) {
-    if (mode === 'mcu') throw new PixmixError('The JPEG route needs Node (to run libjxl cjxl); use mode "pixel" or "block" here', 'UNSUPPORTED');
     return null;
   }
   if (from === 'jpeg') return { jpeg: bytes, decoder: 'none', notes: [] };

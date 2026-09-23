@@ -21,6 +21,10 @@ const u32 = (...v) => { const b = new Uint8Array(v.length * 4); const dv = new D
 const cat = (...p) => { const o = new Uint8Array(p.reduce((n, x) => n + x.length, 0)); let i = 0; for (const x of p) { o.set(x, i); i += x.length; } return o; };
 const ascii = (s) => Uint8Array.from(s, (c) => c.charCodeAt(0));
 const isLimit = (re) => (err) => err.name === 'PixmixError' && err.code === 'LIMIT' && (!re || re.test(err.message));
+const rejectsLimit = (promise, re) => assert.rejects(promise, (err) => {
+  assert.ok(isLimit(re)(err), `${err.name} ${err.code}: ${err.message}`);
+  return true;
+});
 
 /** A PNG with the given IHDR size (grey 8-bit) and whatever IDAT payload. */
 function png(width, height, idat = deflateSync(new Uint8Array(height * (width + 1))), extra = []) {
@@ -163,6 +167,29 @@ test('JPEG XL: header size is checked before the decoder runs', async () => {
   await assert.rejects(decodeAsync(scrambled, { key: 'k', limits: { maxPixels: 100 } }), isLimit());
   // The WASM decoder enforces the limit itself too (a caller could skip the JS check).
   await assert.rejects(codec.decode(small, { limits: { maxPixels: 100 } }), isLimit(/24x16.*maxPixels/));
+});
+
+test('JPEG XL: animations are checked both ways (animated output from GIF, and decoding)', async () => {
+  const buf = new Uint8Array(4096);
+  const gw = new GifWriter(buf, 8, 8, { loop: 0, palette: [0, 0xffffff] });
+  for (let i = 0; i < 5; i++) gw.addFrame(0, 0, 8, 8, new Uint8Array(64).fill(i & 1), { delay: 5 });
+  const gif = buf.slice(0, gw.end());
+  await rejectsLimit(convertAsync(gif, { format: 'jxl', limits: { maxFrames: 4 } }), /5 frames.*maxFrames/);
+  await rejectsLimit(encodeAsync(gif, { key: 'k', format: 'jxl', limits: { maxTotalPixels: 300 } }), /maxTotalPixels/);
+  const jxl = (await convertAsync(gif, { format: 'jxl' })).bytes;
+  assert.equal(inspect(jxl).animated, true);
+  const scrambled = await encodeAsync(jxl, { key: 'k', effort: 1 });
+  // The frame count is only known to the decoder, which checks it in WASM.
+  await rejectsLimit(decodeAsync(scrambled, { key: 'k', limits: { maxFrames: 4 } }), /5 frames.*maxFrames/);
+  await rejectsLimit(convertAsync(jxl, { format: 'png', limits: { maxTotalPixels: 300 } }), /maxTotalPixels/);
+  assert.ok(await decodeAsync(scrambled, { key: 'k', limits: { maxFrames: 5 } }));
+});
+
+test('JPEG XL encoder (libjxl) errors are PixmixErrors', async () => {
+  const codec = await loadJxlCodec();
+  await assert.rejects(codec.transcodeJpeg(new Uint8Array(10)), (err) => err.name === 'PixmixError' && err.code === 'JXL_ENCODE');
+  await assert.rejects(codec.encode({ width: 0, height: 0, data: new Uint8Array(0) }), (err) => err.name === 'PixmixError' && err.code === 'JXL_ENCODE');
+  assert.ok((await codec.encode({ width: 2, height: 2, data: new Uint8Array(16).fill(255) })).length > 0); // still works after
 });
 
 test('JPEG XL: brob boxes are capped by maxMetadataBytes', async () => {

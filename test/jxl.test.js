@@ -21,10 +21,10 @@ function rgba(w, h, alpha = false) {
   return d;
 }
 
-/** A container JXL with metadata boxes, like cjxl would write. */
+/** A container JXL with metadata boxes, like cjxl writes. */
 async function sample({ w = 45, h = 29, lossy = false, boxes = [] } = {}) {
   const data = rgba(w, h, true);
-  const cs = await codec.encode({ width: w, height: h, data }, lossy ? { lossless: false, quality: 80 } : {});
+  const cs = await codec.encode({ width: w, height: h, data }, lossy ? { distance: 2 } : {});
   return { bytes: writeJxl(boxes, cs), data };
 }
 
@@ -188,4 +188,74 @@ test('inspect describes JPEG-route files properly', async () => {
   const jxl = await encodeAsync(new Uint8Array(await photo(64, 48)), { key: 'k', format: 'jxl', transforms: false });
   const info = inspect(jxl);
   assert.deepEqual([info.mode, info.block, info.transforms], ['mcu', null, false]);
+});
+
+test('JPEG route: EXIF and XMP become boxes, as cjxl does', async () => {
+  const xmp = '<x:xmpmeta xmlns:x="adobe:ns:meta/"/>';
+  const app1 = Buffer.concat([Buffer.from([0xff, 0xe1, 0, 0]), Buffer.from('http://ns.adobe.com/xap/1.0/\0'), Buffer.from(xmp)]);
+  app1.writeUInt16BE(app1.length - 2, 2);
+  const src = Buffer.from(await photo(64, 48));
+  const jpg = new Uint8Array(Buffer.concat([src.subarray(0, 2), app1, src.subarray(2)]));
+  const jxl = await encodeAsync(jpg, { key: 'k', format: 'jxl' });
+  const boxes = readJxl(jxl).boxes;
+  assert.deepEqual(boxes.map((b) => b.type).filter((t) => ['Exif', 'xml ', 'jbrd', 'pmIx'].includes(t)).sort(), ['Exif', 'jbrd', 'pmIx', 'xml ']);
+  assert.equal(Buffer.from(boxes.find((b) => b.type === 'xml ').data).toString(), xmp);
+  assert.ok(Buffer.from(boxes.find((b) => b.type === 'Exif').data).toString('latin1').includes('pixmix'));
+  assert.deepEqual(inspect(jxl).metadata, ['exif', 'xmp']);
+});
+
+// --- colour profiles and 16-bit samples ------------------------------------------------
+
+test('an ICC profile travels into JPEG XL, and the samples stay exactly as stored', async () => {
+  const png = await sharp(Buffer.from(rgba(40, 24)), { raw: { width: 40, height: 24, channels: 4 } }).withIccProfile('p3').png().toBuffer();
+  const { icc } = await sharp(png).metadata();
+  const stored = PNG.sync.read(png).data;
+  let report;
+  const s = await encodeAsync(png, { key: 'k', format: 'jxl', onConvert: (r) => { report = r; } });
+  assert.ok(report.transferred.includes('ICC profile'), report.dropped.join());
+  assert.equal(inspect(s).srgb, false);
+  const own = async (jxl) => codec.decode(jxl, { srgb: false });
+  const restored = await decodeAsync(s, { key: 'k' });
+  assert.ok(Buffer.from((await own(restored)).data).equals(stored), 'exact stored samples, no sRGB conversion');
+  assert.ok(Buffer.from((await own(restored)).icc).equals(icc), 'same profile');
+  // JXL -> JXL keeps it (no "converted to sRGB" any more), and so does JXL -> PNG.
+  const again = await encodeAsync(restored, { key: 'k2', mode: 'block', block: 4, onConvert: (r) => { report = r; } });
+  assert.deepEqual(report.dropped, []);
+  const back = await own(await decodeAsync(again, { key: 'k2' }));
+  assert.ok(Buffer.from(back.data).equals(stored));
+  assert.ok(Buffer.from(back.icc).equals(icc));
+  assert.ok((await convertAsync(restored, { format: 'png' })).transferred.includes('ICC profile'));
+});
+
+test('a profile JPEG XL cannot carry for the pixels is dropped and reported', async () => {
+  // A (header-only) GRAY profile on a colour PNG.
+  const gray = new Uint8Array(132);
+  gray.set(new TextEncoder().encode('GRAY'), 16);
+  const { readChunks, writeChunks } = await import('../src/formats/png/chunks.js');
+  const { zlibSync } = await import('fflate');
+  const chunks = readChunks(PNG.sync.write(Object.assign(new PNG({ width: 16, height: 8 }), { data: Buffer.from(rgba(16, 8)) })));
+  chunks.splice(1, 0, { type: 'iCCP', data: new Uint8Array([120, 0, 0, ...zlibSync(gray)]) });
+  let report;
+  await encodeAsync(writeChunks(chunks), { key: 'k', format: 'jxl', onConvert: (r) => { report = r; } });
+  assert.ok(report.dropped.includes('ICC profile (GRAY profile on a colour image)'), report.dropped.join());
+});
+
+test('16-bit JPEG XL stays 16-bit through scramble, restore and rekey, exactly', async () => {
+  const w = 33, h = 17;
+  const d = new Uint16Array(w * h * 4);
+  for (let i = 0; i < d.length; i++) d[i] = (i * 2749 + 17) & 0xffff;
+  const jxl = await codec.encode({ width: w, height: h, depth: 16, data: d }); // level 10: a container
+  assert.equal(inspect(jxl).bitDepth, 16);
+  const samples = async (b) => (await codec.decode(b, { high: true })).data;
+  assert.deepEqual(await samples(jxl), d);
+  for (const opts of [{ mode: 'pixel' }, { mode: 'block', block: 4 }]) {
+    let report;
+    const s = await encodeAsync(jxl, { key: 'k', ...opts, onConvert: (r) => { report = r; } });
+    assert.deepEqual(report.dropped, []);
+    assert.equal(inspect(s).bitDepth, 16);
+    assert.notDeepEqual(await samples(s), d);
+    assert.deepEqual(await samples(await decodeAsync(s, { key: 'k' })), d, `${opts.mode}: exact`);
+    const r = await rekeyAsync(s, { from: 'k', to: 'k2' });
+    assert.deepEqual(await samples(await decodeAsync(r, { key: 'k2' })), d, `${opts.mode}: exact after rekey`);
+  }
 });

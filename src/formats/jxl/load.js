@@ -14,7 +14,8 @@ let pending = null;
 /**
  * Points pixmix at the JPEG XL codec module (and optionally its .wasm files) when they are
  * not served next to the pixmix bundle.
- * @param {{moduleUrl?: string, encoderWasm?: string|Uint8Array, decoderWasm?: string|Uint8Array}} opts
+ * @param {{moduleUrl?: string, encoderWasm?: string|Uint8Array, encoderWasmNoSimd?: string|Uint8Array,
+ *   decoderWasm?: string|Uint8Array}} opts  encoderWasmNoSimd: for engines without WebAssembly SIMD
  */
 export async function configureJxl({ moduleUrl: url, ...wasm } = {}) {
   if (url) { moduleUrl = url; pending = null; }

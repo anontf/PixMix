@@ -1,19 +1,19 @@
 // JPEG XL in, JPEG XL out, two ways:
 //
-// - pixel route (mode pixel/block): pixels are decoded (8-bit sRGB RGBA), moved exactly
-//   like PNG pixels, and encoded again LOSSLESSLY, so the key gives back exactly the pixels
-//   the input decoded to. Metadata boxes (Exif, xml, jumb, brob, unknown) are copied through.
+// - pixel route (mode pixel/block): pixels are decoded (8- or 16-bit RGBA in the image's own
+//   colour space, every frame of an animation), moved exactly like PNG pixels, and encoded
+//   again LOSSLESSLY with the same ICC profile, so the key gives back exactly the pixels the
+//   input decoded to. Like APNG, every animation frame gets its own permutation (the frame
+//   index is part of the seed). Metadata boxes (Exif, xml, jumb, brob, unknown) are copied.
 // - JPEG route (mode mcu): for JPEG sources. The JPEG is scrambled in the DCT domain (see
 //   formats/jpeg) and then losslessly recompressed into JPEG XL, which stays lossy-small;
-//   decoding reconstructs that JPEG bit for bit and unscrambles it. Recompressing needs
-//   libjxl's cjxl, so creating these files (and restoring them to JPEG XL) is Node-only;
-//   browsers can still reveal them, as the original JPEG.
+//   decoding reconstructs that JPEG bit for bit and unscrambles it.
 //
 // The scramble parameters go in a `pmIx` box (for the JPEG route, also in the JPEG's APP15
 // segment, inside the reconstruction data). Everything here is async: the codec is WASM
 // loaded on first use.
 
-import { readJxl, writeJxl, readJxlHeader, isJxl } from './container.js';
+import { readJxl, writeJxl, wrapCodestream, readJxlHeader, isJxl } from './container.js';
 import { loadJxlCodec } from './load.js';
 import { computeLayout, applyMap } from '../../core/layout.js';
 import { makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError } from '../../core/params.js';
@@ -67,13 +67,14 @@ function withOffset(tiff) {
   return d;
 }
 
-/** What re-encoding a JXL input from its decoded pixels changes, for the report. */
+const highPrecision = (header) => header.bits > 8 || header.float;
+
+/** What re-encoding a JXL input losslessly from its decoded pixels changes, for the report. */
 export function reencodeNotes(header) {
   const notes = [];
   if (header.lossy) notes.push('lossy compression (re-encoded losslessly from the decoded pixels; the file grows)');
-  if (header.animated) notes.push('animation (first frame kept)');
-  if (header.bits > 8 || header.float) notes.push(`${header.float ? 'floating-point' : `${header.bits}-bit`} precision (reduced to 8-bit)`);
-  if (header.srgb === false) notes.push('colour space (converted to sRGB)');
+  if (highPrecision(header) && header.animated) notes.push(`${header.float ? 'floating-point' : `${header.bits}-bit`} precision (reduced to 8-bit; animations are 8-bit)`);
+  else if (header.float || header.bits > 16) notes.push(`${header.float ? 'floating-point' : `${header.bits}-bit`} precision (reduced to 16-bit)`);
   return notes;
 }
 
@@ -89,36 +90,90 @@ function readMarkerBox(boxes) {
   return box ? readMarker(box.data) : null;
 }
 
-function layoutFor(key, params, width, height, expectedCheck) {
-  const layout = computeLayout(key, params, width, height);
-  if (expectedCheck && !checksEqual(layout.check, expectedCheck)) throw new WrongKeyError();
-  return layout;
+/**
+ * @typedef {object} JxlImage  what the pixel route scrambles and encodes
+ * @property {number} width @property {number} height
+ * @property {8|16} depth
+ * @property {Uint8Array|Uint16Array} data   RGBA (frame 0 of an animation)
+ * @property {Uint8Array|null} [icc]  colour profile of the samples (none = sRGB)
+ * @property {{data: Uint8Array, delay: [number, number]}[]} [frames]  animation: every
+ *           frame, full canvas, 8-bit
+ * @property {number} [plays]  0 = forever
+ */
+
+/**
+ * Decodes for re-encoding: frames of an animation, 16 bits when there are more than 8, and
+ * the samples as stored, in the image's own colour space (with its ICC profile unless that
+ * is sRGB). `display` asks for what a browser canvas wants instead: 8-bit sRGB.
+ * @returns {Promise<JxlImage>}
+ */
+export async function decodeJxlImage(bytes, { display = false, limits } = {}) {
+  const header = readJxlHeader(readJxl(bytes, limits).codestream, limits);
+  const codec = await loadJxlCodec();
+  // Never convert an sRGB image: asking for sRGB would still turn grey into RGB.
+  const srgb = display && header.srgb !== true;
+  const icc = (profile) => (srgb || header.srgb === true ? null : profile);
+  if (header.animated) {
+    const a = await codec.decodeAnimation(bytes, { srgb, icc: header.srgb !== true, limits });
+    if (a.frames.length > 1) {
+      return { width: a.width, height: a.height, depth: 8, data: a.frames[0].data, icc: icc(a.icc), frames: a.frames, plays: a.plays };
+    }
+  }
+  const image = await codec.decode(bytes, { srgb, high: !display && highPrecision(header), limits });
+  return { ...image, icc: icc(image.icc) };
+}
+
+// Frame i's permutation has index i in its seed; frame 0's key check goes in the marker.
+// Layouts are computed one frame at a time, since each holds a map as large as the image.
+function mapFrames(key, params, image, direction, expectedCheck) {
+  const { width, height } = image;
+  const move = (data, i) => {
+    const layout = computeLayout(key, params, width, height, i);
+    if (i === 0 && expectedCheck && !checksEqual(layout.check, expectedCheck)) throw new WrongKeyError();
+    return { layout, data: mapPixels(data, layout.map, direction) };
+  };
+  if (!image.frames) {
+    const { layout, data } = move(image.data, 0);
+    return { layout, image: { ...image, data } };
+  }
+  let first;
+  const frames = image.frames.map((f, i) => {
+    const moved = move(f.data, i);
+    first ??= moved.layout;
+    return { ...f, data: moved.data };
+  });
+  return { layout: first, image: { ...image, data: frames[0].data, frames } };
+}
+
+/** applyMap for 8-bit (4 bytes a pixel) or 16-bit (8 bytes) RGBA. */
+function mapPixels(data, map, direction) {
+  if (!(data instanceof Uint16Array)) return applyMap(data, map, 4, direction);
+  const moved = applyMap(new Uint8Array(data.buffer, data.byteOffset, data.byteLength), map, 8, direction);
+  return new Uint16Array(moved.buffer, moved.byteOffset, moved.length / 2);
 }
 
 // Noise from pixel mode gains nothing from a slow effort; tiles still compress well.
 const effortFor = (params, effort) => effort ?? (params.mode === 'pixel' ? 2 : 7);
 
 /**
- * Scrambles already-decoded RGBA and writes a JXL around it.
- * @param {{width: number, height: number, data: Uint8Array}} image
+ * Scrambles already-decoded pixels and writes a JXL around them.
+ * @param {JxlImage} image
  * @param {import('./container.js').Box[]} boxes metadata boxes to include
  */
 export async function scrambleJxlPixels(image, boxes, { key, mode, block, salt, effort } = {}) {
   if (mode === 'mcu') throw new PixmixError('Mode "mcu" needs a JPEG source', 'BAD_OPTION');
   const params = makeParams({ mode, block, salt });
-  const layout = layoutFor(key, params, image.width, image.height);
-  const pixels = applyMap(image.data, layout.map, 4, 'scramble');
+  const scrambled = mapFrames(key, params, image, 'scramble');
   const codec = await loadJxlCodec();
-  const codestream = await codec.encode({ width: image.width, height: image.height, data: pixels }, { effort: effortFor(params, effort) });
-  return writeJxl([...boxes, { type: MARKER_BOX, data: writeMarker(params, layout.check) }], codestream);
+  const codestream = await codec.encode(scrambled.image, { effort: effortFor(params, effort) });
+  return wrapCodestream([...boxes, { type: MARKER_BOX, data: writeMarker(params, scrambled.layout.check) }], codestream);
 }
 
 export async function scrambleJxl(bytes, opts = {}) {
   const { limits } = opts;
   const { boxes } = readChecked(bytes, limits);
   if (readMarkerBox(boxes)) throw new PixmixError('Image is already scrambled (decode it first, or use rekey)', 'ALREADY_SCRAMBLED');
-  const image = await (await loadJxlCodec()).decode(bytes, { limits });
-  return scrambleJxlPixels(image, sanitizeBoxes(boxes, opts).boxes, opts);
+  return scrambleJxlPixels(await decodeJxlImage(bytes, { limits }), sanitizeBoxes(boxes, opts).boxes, opts);
 }
 
 // --- JPEG route -------------------------------------------------------------------
@@ -142,7 +197,7 @@ export async function scrambledJpegOf(bytes, limits) {
 async function toJxlWithMarker(scrambledJpeg) {
   const codec = await loadJxlCodec();
   const { boxes, codestream } = readJxl(await codec.transcodeJpeg(scrambledJpeg));
-  const kept = boxes.filter((b) => !STRUCTURE.has(b.type)); // jbrd, Exif, xml from cjxl
+  const kept = boxes.filter((b) => !STRUCTURE.has(b.type)); // jbrd, Exif, xml from libjxl
   return writeJxl([...kept, { type: MARKER_BOX, data: jpegMarkerBytes(scrambledJpeg) }], codestream);
 }
 
@@ -157,11 +212,13 @@ export async function scrambleJpegToJxl(jpeg, { key, transforms, salt, limits } 
 // --- both routes -------------------------------------------------------------------
 
 /**
- * Decodes and checks the key. Pixel route: `pixels` / `scrambled` are the restored and
- * scrambled RGBA and `toJxl` re-encodes losslessly. JPEG route: `jpeg` is the unscrambled
- * JPEG's detail (see formats/jpeg) and `toJxl` recompresses it (Node only).
+ * Decodes and checks the key. Pixel route: `pixels` / `scrambled` are frame 0's restored
+ * and scrambled RGBA, `image` the whole restored image (every frame), and `toJxl`
+ * re-encodes it losslessly. With `display`, pixels are 8-bit sRGB for a canvas (and `toJxl`
+ * is not offered). JPEG route: `jpeg` is the unscrambled JPEG's detail (see formats/jpeg)
+ * and `toJxl` recompresses it.
  */
-export async function unscrambleJxlDetailed(bytes, { key, effort, limits } = {}) {
+export async function unscrambleJxlDetailed(bytes, { key, effort, display = false, limits } = {}) {
   const { boxes } = readChecked(bytes, limits);
   const marker = readMarkerBox(boxes);
   if (!marker) throw new PixmixError('Image carries no pixmix marker', 'NOT_SCRAMBLED');
@@ -171,17 +228,17 @@ export async function unscrambleJxlDetailed(bytes, { key, effort, limits } = {})
     const jpeg = unscrambleJpegDetailed(scrambledJpeg, { key, limits });
     return { route: 'jpeg', params: marker.params, jpeg, toJxl: () => codec.transcodeJpeg(jpeg.toJpeg()) };
   }
-  const image = await codec.decode(bytes, { limits });
-  const layout = layoutFor(key, marker.params, image.width, image.height, marker.check);
-  const pixels = applyMap(image.data, layout.map, 4, 'unscramble');
+  const scrambled = await decodeJxlImage(bytes, { display, limits });
+  const { layout, image } = mapFrames(key, marker.params, scrambled, 'unscramble', marker.check);
   const kept = boxes.filter((b) => !STRUCTURE.has(b.type));
   return {
     route: 'pixels',
     layout,
     params: marker.params,
-    scrambled: image.data,
-    pixels,
-    toJxl: async () => writeJxl(kept, await codec.encode({ width: image.width, height: image.height, data: pixels }, { effort: effort ?? 7 })),
+    scrambled: scrambled.data,
+    pixels: image.data,
+    image,
+    toJxl: display ? null : async () => wrapCodestream(kept, await codec.encode(image, { effort: effort ?? 7 })),
   };
 }
 
@@ -199,11 +256,9 @@ export async function rekeyJxl(bytes, { from, to, mode, block, salt, effort, tra
     return toJxlWithMarker(rekeyJpeg(jpeg, { from, to, transforms, salt, progressive: false, limits }));
   }
   if (mode === 'mcu') throw new PixmixError('Mode "mcu" needs a JPEG XL that holds a JPEG', 'BAD_OPTION');
-  const image = await (await loadJxlCodec()).decode(bytes, { limits });
-  const old = layoutFor(from, marker.params, image.width, image.height, marker.check);
-  const plain = { ...image, data: applyMap(image.data, old.map, 4, 'unscramble') };
+  const { image } = mapFrames(from, marker.params, await decodeJxlImage(bytes, { limits }), 'unscramble', marker.check);
   const kept = boxes.filter((b) => !STRUCTURE.has(b.type));
-  return scrambleJxlPixels(plain, kept, {
+  return scrambleJxlPixels(image, kept, {
     key: to, salt, effort,
     mode: mode ?? marker.params.mode,
     block: block ?? (marker.params.block || undefined),
@@ -224,6 +279,7 @@ export function inspectJxl(bytes, limits) {
     bitDepth: header.bits,
     alpha: header.alpha,
     animated: header.animated,
+    ...(header.animated && header.loops !== undefined ? { plays: header.loops } : {}),
     orientation: header.orientation,
     srgb: header.srgb,
     scrambled: !!marker,

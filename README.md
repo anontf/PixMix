@@ -24,7 +24,7 @@ browser use case the key ships to the visitor.
 ```sh
 npm install
 npm test            # PngSuite and JPEG round trips, conversion, CLI, browser reveal (fake DOM)
-npm run test:browser  # the same in real Chromium: decoder, worker, lab, demo site (see below)
+npm run test:browser  # the same in real Chromium and WebKit: decoder, worker, lab, demo site (see below)
 npm run fuzz        # the long fuzz run (see "Fuzzing")
 npm run serve       # builds dist/ and starts http://127.0.0.1:8080
 npm run serve:lan   # the same, reachable from other machines on the network (HOST=0.0.0.0)
@@ -33,7 +33,8 @@ npm run serve:lan   # the same, reachable from other machines on the network (HO
 The dev server has no authentication: anyone who can reach it can encode, decode and publish
 to the demo gallery. Only use `serve:lan` on a network you trust.
 
-- **Lab** (`/`): load an image in any format, or a generated PNG/JPEG/WebP sample.
+- **Lab** (`/`): load an image in any format, or a generated PNG/JPEG/WebP sample (a PNG
+  where the browser can't encode WebP, as in Safari).
   - Encode it on the server or in the browser, and see what metadata was kept or dropped.
   - Watch it decode with each animation, compare chunks, rekey, try a wrong key.
 - **Demo site** (`/site.html`): images published from the lab, served scrambled and
@@ -72,7 +73,6 @@ lists every option.
 | `dist/pixmix-encoder.mjs` | ESM, platform-neutral | Node, Deno, Bun, workers, browsers |
 | `dist/pixmix-encoder.cjs` | CommonJS | `require()`-based servers |
 | `dist/pixmix-jxl.mjs` + `pixmix-jxl-{enc,dec}.wasm` | ESM + WASM | JPEG XL support, loaded on demand |
-| `dist/pixmix-cjxl/` | CommonJS + WASM | JPEG → JPEG XL recompression, servers only |
 
 The decoder bundle contains no encoding code; the encoder bundle has no DOM code.
 
@@ -82,13 +82,19 @@ A decoder loaded from another origin (a CDN) starts the worker through a same-or
 `blob:` module, which needs CORS on the CDN.
 
 JPEG XL support is optional:
-- Copy the three `pixmix-jxl*` files next to whichever bundle you deploy, or call
-  `configureJxl({ moduleUrl, encoderWasm, decoderWasm })`.
+- Copy the `pixmix-jxl*` files next to whichever bundle you deploy, or call
+  `configureJxl({ moduleUrl, encoderWasm, encoderWasmNoSimd, decoderWasm })`.
+  (`pixmix-jxl-enc.LICENSES.txt` holds the encoder's third-party licences.)
 - Nothing is fetched until a JPEG XL image shows up.
-- A browser only ever needs the decoder WASM (1.8 MB, about 650 KB compressed). The
-  1.3 MB encoder is fetched only for `decodeAsync()` of a JPEG XL file, which returns JPEG
-  XL.
-- `pixmix-cjxl/` is only for servers that write JPEG-route files; websites never need it.
+- Revealing images only needs the decoder WASM (1.8 MB; 580 KB gzipped, 420 KB with
+  Brotli). The encoder WASM is fetched only to write JPEG XL: encoding, including the JPEG
+  route, which works in browsers too, and `decodeAsync()` of a JPEG XL file, which returns
+  JPEG XL.
+- The encoder comes in two builds, and each engine fetches only the one it can run:
+  `pixmix-jxl-enc.wasm` uses WebAssembly SIMD (2.3 MB; 880 KB gzipped, 670 KB with
+  Brotli); `pixmix-jxl-enc-nosimd.wasm` (2.4 MB; 925 KB gzipped, 690 KB with Brotli) is for
+  engines without SIMD, such as some WebKit builds. pixmix checks with
+  `WebAssembly.validate` on a tiny SIMD module.
 
 ## Encoder (servers)
 
@@ -111,7 +117,7 @@ Options:
 - `mode`, `block`: `pixel`, or `block` with a tile size of 2–4096.
   - PNG and JPEG XL use them; JPEG is always `mcu`.
   - JPEG XL can also be `mcu`, the JPEG route. That's the default when the source is a
-    JPEG, or a JPEG XL made from one, and the encoder runs in Node.
+    JPEG, or a JPEG XL made from one.
 - `effort`: JPEG XL encoder effort, 1–9. Defaults to 2 in pixel mode and 7 in block mode.
 - `level`: PNG only, the zlib level.
 - `transforms`: JPEG and JPEG-route JPEG XL, default `true`. Also flips and rotates each
@@ -190,12 +196,22 @@ the limits to every upload, with its 64 MiB body limit as `maxInputBytes`, and a
 - **Animated WebP and JPEG XL → PNG** give an APNG too, with every frame, delays and loop
   count:
   - WebP through `sharpDecoder`, or through `browserDecoder` in browsers with WebCodecs'
-    `ImageDecoder`.
+    `ImageDecoder`. Elsewhere `browserDecoder` keeps the first frame and reports the
+    animation as dropped. The loop count is read from the file, since engines disagree on
+    what `repetitionCount` means for WebP.
   - JPEG XL through the built-in decoder.
-- **Other formats:** converting an animation to JPEG or JPEG XL keeps the first frame, and
-  the report says so (neither writer does animation).
+- **Any animation → JPEG XL** (APNG, GIF, WebP, JPEG XL) gives an animated JPEG XL:
+  - Frames are full-canvas (APNG frames are composited following their dispose and blend
+    operations; a default image outside the animation is left out), delays and the loop
+    count are kept.
+  - Every frame is scrambled with its own permutation, with the frame index in the seed,
+    exactly as in APNG. A zero delay becomes one tick, since JPEG XL would merge the frame
+    into the next one.
+  - Animations are 8-bit.
+- **JPEG:** converting an animation to JPEG keeps the first frame, and the report says so.
 - **In the browser,** the reveal animates frame 0, then the `<img>` gets the restored
-  APNG, which plays normally.
+  APNG (for an animated JPEG XL too, since most browsers can't show JPEG XL), which plays
+  normally.
 
 ### Embedded previews
 
@@ -231,7 +247,7 @@ Where each kind of metadata ends up:
 | Metadata | PNG | JPEG | JPEG XL |
 | --- | --- | --- | --- |
 | EXIF | `eXIf` | APP1 `Exif` | `Exif` box |
-| ICC profile | `iCCP` | APP2 `ICC_PROFILE`, split across segments | dropped (encoder writes sRGB only) |
+| ICC profile | `iCCP` | APP2 `ICC_PROFILE`, split across segments | in the codestream |
 | XMP | `iTXt XML:com.adobe.xmp` | APP1 XMP | `xml ` box |
 | Density | `pHYs` | JFIF APP0 | dropped (no field) |
 | Comments | `tEXt Comment` | COM | dropped (no field) |
@@ -241,9 +257,10 @@ the EXIF) and aren't converted to sRGB (the ICC profile travels with the image).
 
 Some things are dropped, and the report says so:
 - animation frames after the first;
-- CMYK and other non-RGB/grey profiles;
+- CMYK and other non-RGB/grey profiles, and grey profiles on colour images;
 - extended XMP;
-- precision above 8 bits when writing JPEG or JPEG XL (PNG keeps 16 bits);
+- precision above 8 bits when writing JPEG (PNG and JPEG XL keep 16 bits), and in
+  animations;
 - PNG text chunks other than comments, and gamma without an ICC profile, when writing JPEG;
 - transparency when writing JPEG (flattened onto `background`).
 
@@ -251,10 +268,11 @@ A PNG gets the smallest colour type that loses nothing: grey, palette (1–8 bit
 RGBA. Palette output also compresses far better once the pixels are scrambled. A JPEG is
 written as a single component when the image is grey.
 
-Sources deeper than 8 bits become 16-bit PNGs:
-- 16-bit TIFF/PNG/AVIF/HEIF through sharp, and 10/12/16-bit or float JPEG XL.
-- If every sample is exactly an 8-bit value, the PNG is 8-bit, since that loses nothing.
+Sources deeper than 8 bits become 16-bit PNGs or JPEG XLs:
+- 16-bit PNG, 16-bit TIFF/PNG/AVIF/HEIF through sharp, and 10/12/16-bit or float JPEG XL.
+- If every sample is exactly an 8-bit value, the output is 8-bit, since that loses nothing.
 - Animations are 8-bit.
+- A 16-bit lossless JPEG XL needs codestream level 10, so it carries a `jxll` box.
 
 ## Decoder (websites)
 
@@ -274,9 +292,10 @@ const { bytes: shown, type } = await PixMix.restoreForDisplay(bytes, { key });
 
 `restoreForDisplay` returns what an `<img>` can show:
 - PNG and JPEG as they are;
-- a JPEG XL as a PNG of its pixels, or as its JPEG on the JPEG route.
+- a JPEG XL as a PNG of its pixels (an APNG when it is animated), or as its JPEG on the
+  JPEG route.
 
-It needs neither the JPEG XL encoder nor `cjxl`.
+It needs only the JPEG XL decoder, not the encoder.
 
 - Effects:
   - `dissolve`, `scan`.
@@ -312,31 +331,32 @@ There are two routes.
 a JPEG XL made by recompressing one (it has a `jbrd` box):
 - The JPEG is scrambled in the DCT domain exactly as in JPEG → JPEG. Nothing is
   requantised.
-- It's then losslessly recompressed into JPEG XL by libjxl's `cjxl`, run in a child process.
-  So the file stays as small as a lossy JPEG XL; a 12 MP photo is 28% smaller than its JPEG.
+- It's then losslessly recompressed into JPEG XL by libjxl (`JxlEncoderAddJPEGFrame` with
+  reconstruction data, in WASM). So the file stays as small as a lossy JPEG XL; a 12 MP
+  photo is 28% smaller than its JPEG. Like `cjxl`, the JPEG's EXIF, XMP and JUMBF become
+  `Exif`, `xml ` and `jumb` boxes.
 - Decoding rebuilds that JPEG bit for bit from the JPEG XL, unscrambles it, and either
-  recompresses it (Node) or shows it (browsers get the original JPEG).
-- Speed at 12 MP: about 1.2 s to encode, 1.0 s to reveal in a browser, 1.5 s to restore to
+  recompresses it (`decodeAsync`) or shows it (the reveal gives the `<img>` the original
+  JPEG).
+- Speed at 12 MP: about 1.2 s to encode, 1.0 s to reveal in a browser, 1.7 s to restore to
   JPEG XL.
-- Writing these files needs Node. In a browser, JPEG input falls back to the pixel route
-  unless you ask for `mcu`, which then gives a clear error.
+- It works everywhere, browsers included, since the encoder is plain WASM.
 - Reconstruction uses jxl-oxide. jxl-oxide 0.12 can't rebuild some *progressive* JPEGs from
   third-party JPEG XL files. Those fall back to the pixel route; pixmix's own JPEGs are
   always baseline.
 
 **Pixel route** (`mode: 'pixel' | 'block'`), for everything else:
-- Decode JPEG XL with pixmix → the exact pixels the input decodes to, as 8-bit sRGB.
-- Scramble in `pixel` or `block` mode.
-- Encode losslessly with libjxl.
+- Decode JPEG XL with pixmix → the exact samples the input decodes to: 8- or 16-bit, in
+  its own colour space (never converted), every frame of an animation.
+- Scramble in `pixel` or `block` mode (each animation frame with its own permutation).
+- Encode losslessly with libjxl, with the same ICC profile (or sRGB), bit depth, frames,
+  delays and loop count. Grey and opaque images are stored with fewer channels.
 
-So the key always gives back exactly those pixels. What the report lists under `dropped`
+So the key always gives back exactly those samples. What the report lists under `dropped`
 when re-encoding a JPEG XL input on the pixel route:
 - **Lossy input** that isn't a recompressed JPEG (VarDCT/XYB) is stored losslessly from its
   decoded pixels, so the file grows.
-- **Colour space:** anything other than sRGB is converted to sRGB. The bundled encoder
-  can't tag another colour space.
-- **Precision:** above 8 bits is reduced to 8, and animation keeps the first frame. The
-  encoder is 8-bit and single-frame; convert to PNG to keep either.
+- **Precision:** float or more than 16 bits is stored as 16-bit; animations are 8-bit.
 - **Boxes that would be stale or leak the image:**
   - `jbrd` (JPEG reconstruction data, no longer matching the pixels);
   - `jhgm` (an HDR gain map, a second image);
@@ -345,20 +365,51 @@ when re-encoding a JPEG XL input on the pixel route:
   `Exif`, `xml `, `jumb`, Brotli-compressed `brob` boxes and unknown boxes are copied
   unchanged. EXIF thumbnails are stripped as for the other formats.
 
-The codec has three parts:
-- **libjxl's encoder** (the single-threaded build from `@jsquash/jxl`) for lossless encoding.
-- **libjxl's `cjxl`** (from `jxl-wasm`, libjxl 0.7) for JPEG recompression, on servers only.
+The codec has two parts, both pixmix's own WASM bindings:
+- **libjxl 0.12's encoder** (`native/libjxl`) for lossless encoding and JPEG
+  recompression. A small C layer exposes:
+  - lossless 8- or 16-bit grey, grey+alpha, RGB or RGBA, tagged with an ICC profile or
+    as sRGB;
+  - animations (full-canvas frames, per-frame durations, loop count);
+  - lossless JPEG recompression with reconstruction data, in a container;
+  - an effort setting.
+
+  It's built single-threaded, twice: with WebAssembly SIMD (Node and most browsers) and
+  without (engines that can't compile SIMD, such as Playwright's WebKit). Both runs are
+  lossless, so they give back the same pixels. Without SIMD, 2 MP block mode is about 15%
+  slower and the JPEG route about 50% slower; pixel mode is about the same.
 - **pixmix's own jxl-oxide binding** (`native/jxl`) for decoding and JPEG reconstruction.
   - It returns raw 8- or 16-bit pixels and the ICC profile, converting colour with `moxcms`,
     a pure-Rust colour-management library.
   - It can also return every keyframe of an animation.
-  - Neither published option would do. `@jsquash/jxl`'s decoder isn't bit-exact: it
-    colour-converts even sRGB images and turns (4,255,0) into (3,255,0). The
+  - Neither published option would do. `@jsquash/jxl`'s libjxl decoder isn't bit-exact:
+    it colour-converts even sRGB images and turns (4,255,0) into (3,255,0). The
     `jxl-oxide-wasm` package can't reconstruct JPEGs. A test guards the exactness.
 
-In the browser, most engines can't display JPEG XL. So the pixel route decodes it in WASM,
-animates like PNG, and gives the `<img>` a lossless PNG of the restored pixels. The JPEG
-route shows the restored JPEG.
+In the browser, most engines can't display JPEG XL. So the pixel route decodes it in WASM
+(as 8-bit sRGB), animates frame 0 like PNG, and gives the `<img>` a lossless PNG of the
+restored pixels, or an APNG of every frame for an animation. The JPEG route shows the
+restored JPEG. Safari could show JPEG XL itself, but gets the PNG too, so every engine
+shows the same exact pixels.
+
+#### Rebuilding the encoder WASM
+
+`native/libjxl/pkg` (ES module glue, the SIMD and non-SIMD `.wasm` and the third-party
+licences) is committed, so this is only needed after changing `native/libjxl/binding.c` or
+the pinned versions:
+
+```sh
+./scripts/build-libjxl-wasm.sh              # Linux x86-64; needs curl, tar and python3
+```
+
+It downloads pinned versions of Emscripten (6.0.10), CMake and Ninja, the libjxl 0.12.0
+release tarball (checked against its SHA-256) and the dependency commits that release's
+`deps.sh` pins (Brotli, Highway, skcms), all into `~/.cache/pixmix-libjxl`
+(`PIXMIX_LIBJXL_WORK` overrides it), never into the repository. Source paths are mapped
+to neutral prefixes and debug info is left out, so the binary carries no local paths (the
+script checks); both builds are byte-for-byte reproducible, and share one glue module
+(the script checks that too). `-Os` is the default: `-O3` (`BUILD_OPT=-O3`) makes the SIMD
+WASM 3% larger (2.44 MB instead of 2.38 MB) and was no faster in the benchmarks below.
 
 #### Rebuilding the decoder WASM
 
@@ -433,12 +484,26 @@ The permutation stream is pinned by a test. Any change to it must bump the versi
 - JPEG XL, JPEG route: see above. It's fast because nothing is DCT'd or entropy-optimised
   twice.
 - JPEG XL, pixel route (single-threaded WASM):
-  - Pixel mode at effort 2: 2 MP encodes in 0.5 s and 12 MP in 3.3 s.
-  - Block mode at effort 7: 5.4 s and 29 s, but the result is 20% smaller than PNG block
-    mode.
+  - Pixel mode at effort 2: 2 MP encodes in 0.7 s and 12 MP in 4.3 s.
+  - Block mode at effort 7 is slower (a few seconds at 2 MP, half a minute at 12 MP on a
+    hard, noisy image), but the result is about 20% smaller than PNG block mode.
   - Decoding 12 MP takes 5–9 s.
-  - Lower `effort` trades size for speed: at 2 MP, effort 5 gives 0.92 MB in 3.0 s,
-    against 0.78 MB in 4.4 s at effort 7.
+  - Lower `effort` trades size for speed: at 2 MP, effort 5 takes about half the time of
+    effort 7 for a 50% larger file.
+
+Encode times with libjxl 0.12 against the encoders it replaced (`@jsquash/jxl` for pixels,
+`jxl-wasm`'s `cjxl` 0.7 for the JPEG route), measured in Node on the same synthetic,
+noisy photo-like images (so block mode is slower here than on real photos):
+
+| Encode | 2 MP before | 2 MP now | 12 MP before | 12 MP now |
+| --- | --- | --- | --- | --- |
+| pixel mode (effort 2) | 0.58 s, 6.61 MB | 0.66 s, 6.41 MB | 5.3 s, 39.7 MB | 4.3 s, 38.5 MB |
+| block 16 (effort 7) | 20.5 s, 1.66 MB | 4.6 s, 1.75 MB | 66 s, 9.57 MB | 35 s, 10.25 MB |
+| JPEG route | 0.77 s | 0.16 s | 1.44 s | 1.24 s |
+| JPEG route, restore to JPEG XL | 0.85 s | 0.23 s | 1.83 s | 1.73 s |
+
+The JPEG route's files are the same size as before. Block mode is 2–4 times faster at
+effort 7 and 5–7% larger (higher efforts close that gap only slowly).
 
 ## Fuzzing
 
@@ -471,22 +536,37 @@ failing inputs. Every bug it has found has a regression test in
 
 ## Browser tests
 
-`npm run test:browser` builds `dist/` and drives headless Chromium through Playwright
-(`npx playwright install chromium` once). It covers:
+`npm run test:browser` builds `dist/` and drives headless browsers through Playwright
+(`npx playwright install chromium webkit` once). It covers:
 - the `<script>` decoder: every format and effect, with the final bytes checked in Node and
   the rendering compared with the original's;
 - the Web Worker, and the main-thread fallback (`data-worker="false"`, CSP
   `worker-src 'none'`);
 - a decoder loaded from another origin, a wrong key, EXIF rotation;
-- animated WebP through `ImageDecoder`;
+- animated WebP through `ImageDecoder`, and the first-frame fallback without it;
+- the encoder in the page: JPEG → JPEG XL on the JPEG route, animated and 16-bit JPEG XL;
 - the lab (every input/output/mode, encoded on the server and in the browser) and the demo
   site.
 
 Console errors fail a test.
 
-If Chromium can't start because the host lacks its shared libraries, either install them
-system-wide (`sudo npx playwright install-deps`), or unpack them somewhere and set:
-- `PIXMIX_BROWSER_LIBS` to that library directory (it's added to `LD_LIBRARY_PATH`);
+Every test runs once per engine, grouped under its name (`chromium`, `webkit`).
+- `PIXMIX_BROWSERS=chromium,webkit` picks the engines. The default is all of them,
+  Firefox included; an engine that can't start is skipped, with the browser's error.
+- WebKit is Playwright's WPE build, not Safari. It shares Safari's engine, but its image
+  decoding and WebCodecs go through GStreamer, and it encodes WebP (Safari doesn't).
+
+If a browser can't start because the host lacks its shared libraries, either install them
+system-wide (`sudo npx playwright install-deps`), or unpack them somewhere (`apt-get
+download` + `dpkg -x`) and set:
+- `PIXMIX_BROWSER_LIBS` to the library directories, colon-separated. They're added to
+  `LD_LIBRARY_PATH`, and Playwright's dependency check (which ignores them) is skipped.
+  For WebKit the harness also:
+  - runs a copy of Playwright's launcher that keeps them;
+  - points glvnd and GStreamer at the unpacked `share/glvnd/egl_vendor.d` and
+    `gstreamer-1.0` plugins next to them.
+  WebKit also needs Mesa's EGL (`libegl-mesa0`, `mesa-libgallium`) and GStreamer's base
+  plugins; without them its web process crashes on animated images.
 - `FONTCONFIG_FILE` if the host has no fonts.
 
 Firefox isn't covered yet: Playwright's Firefox needs a newer NSS than some distributions
@@ -506,18 +586,20 @@ ship.
   - Browser reveal, CLI, server and lab support.
 - [x] Phase 5: APNG in/out (per-frame permutations), animated GIF → APNG, decoding in a
   Web Worker with a main-thread fallback
-- [x] Phase 6: real-browser test suite (Chromium); animated WebP / JPEG XL → APNG; 16-bit
+- [x] Phase 6: real-browser test suite (Chromium, WebKit); animated WebP / JPEG XL → APNG; 16-bit
   input kept in PNG; progressive JPEGs stay progressive
-- [ ] Newer libjxl for recompression (the only prebuilt WASM `cjxl` is 0.7 and Node-only)
+- [x] Phase 7: pixmix's own libjxl 0.12 WASM encoder: JPEG recompression in browsers too;
+  JPEG XL output keeps ICC profiles, 16-bit samples and animations
 - [ ] Firefox in the browser suite
-- [ ] Animated and >8-bit JPEG XL output (needs a JPEG XL encoder beyond `@jsquash/jxl`'s)
 
 ## Third-party code
 
 Everything is bundled or loaded under permissive licences:
 - fflate (MIT), jpeg-js (BSD-3-Clause), omggif (MIT).
-- `@jsquash/jxl` (Apache-2.0; libjxl is BSD-3-Clause).
-- `jxl-wasm` (ISC; libjxl 0.7).
+- libjxl (BSD-3-Clause, with its patent grant), built into the encoder WASM with
+  Highway (BSD-3-Clause / Apache-2.0), Brotli (MIT) and skcms (BSD-3-Clause); the texts
+  are in `native/libjxl/pkg/THIRD_PARTY_LICENSES.txt` (copied to
+  `dist/pixmix-jxl-enc.LICENSES.txt`).
 - jxl-oxide and its crates (MIT or Apache-2.0), moxcms (BSD-3-Clause or Apache-2.0),
   brotli-decompressor (BSD-3-Clause/MIT).
 - sharp is an optional peer (Apache-2.0).

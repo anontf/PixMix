@@ -183,9 +183,14 @@ $('sample').addEventListener('click', async () => {
   g.fillStyle = '#fff'; g.font = 'bold 96px system-ui'; g.fillText('pixmix', 48, 130);
   g.font = '28px system-ui'; g.fillText('scrambled, valid, reversible', 52, 176);
   const type = $('sampleType').value;
-  const png = new Uint8Array(await (await c.convertToBlob({ type: type === 'jxl' ? 'image/png' : type, quality: 0.9 })).arrayBuffer());
+  const want = type === 'jxl' ? 'image/png' : type;
+  const blob = await c.convertToBlob({ type: want, quality: 0.9 });
+  const png = new Uint8Array(await blob.arrayBuffer());
   const bytes = type === 'jxl' ? (await Enc.convertAsync(png, { format: 'jxl' })).bytes : png;
-  loadOriginal(bytes, `sample.${type === 'jxl' ? 'jxl' : type.split('/')[1]}`, ' · generated sample');
+  // Browsers that can't encode a type (Safari and WebP) hand back a PNG instead.
+  const got = Enc.detectFormat(bytes);
+  const note = blob.type && blob.type !== want ? ` · this browser can't encode ${want.split('/')[1].toUpperCase()}, so it's a PNG` : '';
+  loadOriginal(bytes, `sample.${EXT[got] ?? got}`, ` · generated sample${note}`);
 });
 
 async function serverCall(path, params, bytes) {
@@ -199,7 +204,7 @@ function encodeOpts() {
   const o = { key: $('key').value, format: outputFormat() };
   if (o.format !== 'jpeg') {
     // "auto" leaves the choice to pixmix: pixel for PNG; for JPEG XL the JPEG route when
-    // the source is a JPEG and the encoder runs on the server, else pixel.
+    // the source is a JPEG (on the server and in the browser alike), else pixel.
     if ($('mode').value) o.mode = $('mode').value;
     if (o.mode === 'block') o.block = Number($('block').value);
     if (o.format === 'jxl') {
@@ -303,8 +308,8 @@ async function rgba(bytes) {
 
 async function verify() {
   const key = $('decKey').value || activeKey;
-  // A JPEG-route JPEG XL restores to JPEG XL only with cjxl (servers); in the browser,
-  // compare the JPEG inside it with the (sanitised) original JPEG instead.
+  // A JPEG-route JPEG XL restores to a JPEG XL holding the JPEG: compare that JPEG (what
+  // the <img> shows) with the (sanitised) original JPEG.
   const info = Enc.inspect(scrambled);
   const jpegRoute = info.format === 'jxl' && info.mode === 'mcu';
   const restored = jpegRoute ? (await Dec.restoreForDisplay(scrambled, { key })).bytes : await Dec.decodeAsync(scrambled, { key });
@@ -327,7 +332,7 @@ async function verify() {
 }
 
 // PNG chunks or JPEG segments; image data and pixmix markers are the "coding" parts.
-const CODING = new Set(['IDAT', 'pmIx', 'DHT', 'SOS', 'DRI', 'APP15', 'jxlc', 'jxlp', 'ftyp']);
+const CODING = new Set(['IDAT', 'pmIx', 'DHT', 'SOS', 'DRI', 'APP15', 'jxlc', 'jxlp', 'jxll', 'ftyp']);
 const structure = (b) => { const i = Enc.inspect(b); return i.chunks ?? i.segments ?? i.boxes; };
 
 function renderChunks(before, after, converted) {

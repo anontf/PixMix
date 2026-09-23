@@ -101,7 +101,7 @@ export async function runFuzz({
       s.worker = new Worker(WORKER, {
         workerData: { fixtures, seed, srcUrl },
         resourceLimits: { maxOldGenerationSizeMb: heapLimitMb },
-        stdout: true, // decoders that print (cjxl's runner, libvips warnings) stay quiet
+        stdout: true, // decoders that print (libvips warnings, WASM codecs) stay quiet
         stderr: true,
       });
       s.worker.stdout.resume();

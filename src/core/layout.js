@@ -103,6 +103,13 @@ export function applyMap(src, map, bpp, direction) {
     const d = new Uint16Array(dst.buffer, 0, n);
     if (fwd) for (let i = 0; i < n; i++) d[i] = s[map[i]];
     else for (let i = 0; i < n; i++) d[map[i]] = s[i];
+  } else if (bpp === 8 && src.byteOffset % 4 === 0) {
+    const s = new Uint32Array(src.buffer, src.byteOffset, n * 2);
+    const d = new Uint32Array(dst.buffer, 0, n * 2);
+    for (let i = 0; i < n; i++) {
+      const a = (fwd ? map[i] : i) * 2, b = (fwd ? i : map[i]) * 2;
+      d[b] = s[a]; d[b + 1] = s[a + 1];
+    }
   } else if (bpp === 3) {
     for (let i = 0; i < n; i++) {
       const a = (fwd ? map[i] : i) * 3;

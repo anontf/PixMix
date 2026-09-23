@@ -56,12 +56,13 @@ export async function compute(bytes, key, { animated = true, limits } = {}) {
   if (format === 'jxl') {
     // JPEG route: rebuild the scrambled JPEG and reveal that; visitors get the JPEG.
     if (inspect(bytes, { limits }).mode === 'mcu') return compute(await scrambledJpegOf(bytes, limits), key, { animated, limits });
-    // Pixel route: the <img> gets a PNG, since most browsers cannot display JPEG XL.
-    const d = await unscrambleJxlDetailed(bytes, { key, limits });
+    // Pixel route: the <img> gets a PNG (an APNG for an animation), since most browsers
+    // cannot display JPEG XL. The reveal animates frame 0.
+    const d = await unscrambleJxlDetailed(bytes, { key, display: true, limits });
     return {
       kind: 'pixels',
       type: 'image/png',
-      restored: await rgbaPng(d.layout.width, d.layout.height, d.pixels),
+      restored: await rgbaPng(d.layout.width, d.layout.height, d.image.frames ?? [{ data: d.pixels }], d.image.plays),
       exif: null,
       layout: plainLayout(d.layout),
       ...(animated ? { scrambled: new Uint8ClampedArray(d.scrambled.buffer, d.scrambled.byteOffset, d.scrambled.length) } : {}),
@@ -79,13 +80,38 @@ export function transferables(r) {
   return [...new Set(list)];
 }
 
-async function rgbaPng(width, height, rgba) {
+/** 8-bit RGBA frames as a PNG, or as an APNG (full-canvas frames, delays [num, den]). */
+async function rgbaPng(width, height, frames, plays = 0) {
+  const u32 = (...values) => {
+    const b = new Uint8Array(values.length * 4);
+    values.forEach((v, i) => new DataView(b.buffer).setUint32(i * 4, v));
+    return b;
+  };
   const ihdr = new Uint8Array(13);
-  const dv = new DataView(ihdr.buffer);
-  dv.setUint32(0, width);
-  dv.setUint32(4, height);
+  ihdr.set(u32(width, height));
   ihdr[8] = 8;
   ihdr[9] = 6;
-  const idat = await encodeRasterAsync({ width, height, depth: 8, colorType: 6, interlace: 0 }, rgba);
-  return writeChunks([{ type: 'IHDR', data: ihdr }, { type: 'IDAT', data: idat }, { type: 'IEND', data: new Uint8Array(0) }]);
+  const header = { width, height, depth: 8, colorType: 6, interlace: 0 };
+  const chunks = [{ type: 'IHDR', data: ihdr }];
+  if (frames.length > 1) chunks.push({ type: 'acTL', data: u32(frames.length, plays) });
+  let seq = 0;
+  for (const [i, f] of frames.entries()) {
+    const idat = await encodeRasterAsync(header, f.data);
+    if (frames.length > 1) {
+      const fctl = new Uint8Array(26);
+      fctl.set(u32(seq++, width, height, 0, 0));
+      new DataView(fctl.buffer).setUint16(20, Math.min(f.delay[0], 65535));
+      new DataView(fctl.buffer).setUint16(22, f.delay[1]);
+      chunks.push({ type: 'fcTL', data: fctl });
+    }
+    if (i === 0) chunks.push({ type: 'IDAT', data: idat });
+    else {
+      const fdat = new Uint8Array(4 + idat.length);
+      fdat.set(u32(seq++));
+      fdat.set(idat, 4);
+      chunks.push({ type: 'fdAT', data: fdat });
+    }
+  }
+  chunks.push({ type: 'IEND', data: new Uint8Array(0) });
+  return writeChunks(chunks);
 }

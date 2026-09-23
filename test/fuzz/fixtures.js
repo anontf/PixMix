@@ -6,7 +6,7 @@
 import { readFileSync } from 'node:fs';
 import sharp from 'sharp';
 import { GifWriter } from 'omggif';
-import { encode, encodeAsync, convert } from '../../src/index.js';
+import { encode, encodeAsync, convert, convertAsync } from '../../src/index.js';
 import { sharpDecoder } from '../../src/plugins/sharp.js';
 import { loadJxlCodec } from '../../src/formats/jxl/load.js';
 import { writeJxl } from '../../src/formats/jxl/container.js';
@@ -178,12 +178,27 @@ export async function buildFixtures() {
   add('jxl:brob-exif', writeJxl([{ type: 'brob', data: cat(ascii('Exif'), brotliCompressSync(cat(new Uint8Array(4), tiff))) }], cs), { weight: 0.5 });
   add('jxl:bare', cs, { weight: 0.5 });
   add('jxl:container', jxl);
-  add('jxl:lossy', writeJxl([], await codec.encode({ width: 16, height: 8, data: rgba(16, 8, 5) }, { lossless: false, quality: 70, effort: 1 })), { weight: 0.5 });
-  add('jxl:animated', await codec.runCjxl(gif({ animated: true }), 'gif', ['--distance=0', '--effort=1']), { weight: 0.5 });
+  add('jxl:lossy', writeJxl([], await codec.encode({ width: 16, height: 8, data: rgba(16, 8, 5) }, { distance: 1.5, effort: 1 })), { weight: 0.5 });
   add('jxl:scrambled-pixel', await encodeAsync(jxl, { key: KEY, salt: SALT, mode: 'pixel', effort: 1 }), { scrambled: true, weight: 2 });
   add('jxl:scrambled-block', await encodeAsync(jxl, { key: KEY, salt: SALT, mode: 'block', block: 4, effort: 1 }), { scrambled: true });
-  add('jxl:jpeg-route', await codec.transcodeJpeg(baseline), { weight: 0.3 });
-  add('jxl:scrambled-jpeg-route', await encodeAsync(baseline, { key: KEY, salt: SALT, format: 'jxl' }), { scrambled: true, weight: 0.5 });
+  // libjxl's other outputs: animation, 16-bit, an ICC profile (each plain and scrambled).
+  const toJxl = async (bytes) => (await convertAsync(bytes, { format: 'jxl' })).bytes;
+  const animJxl = await toJxl(agif);
+  const deepJxl = await toJxl(readFileSync(new URL('../fixtures/pngsuite/basn6a16.png', import.meta.url)));
+  const p3 = new Uint8Array(await raw(14, 10).withIccProfile('p3').png().toBuffer());
+  const iccJxl = await toJxl(p3);
+  add('jxl:animated', animJxl, { weight: 0.7 });
+  add('jxl:16-bit', deepJxl, { weight: 0.7 });
+  add('jxl:icc', iccJxl, { weight: 0.7 });
+  add('jxl:scrambled-animated', await encodeAsync(animJxl, { key: KEY, salt: SALT, mode: 'block', block: 3, effort: 1 }), { scrambled: true });
+  add('jxl:scrambled-16-bit', await encodeAsync(deepJxl, { key: KEY, salt: SALT, mode: 'pixel', effort: 1 }), { scrambled: true, weight: 0.7 });
+  add('jxl:scrambled-icc', await encodeAsync(iccJxl, { key: KEY, salt: SALT, mode: 'pixel', effort: 1 }), { scrambled: true, weight: 0.7 });
+  add('png:icc-p3', p3, { weight: 0.5 });
+  // JPEG route: recompressed JPEGs, now in-process (baseline, progressive, 4:4:4, grey).
+  add('jxl:jpeg-route', await codec.transcodeJpeg(baseline), { weight: 0.5 });
+  add('jxl:jpeg-route-progressive', await codec.transcodeJpeg(progressive), { weight: 0.5 });
+  add('jxl:scrambled-jpeg-route', await encodeAsync(baseline, { key: KEY, salt: SALT, format: 'jxl' }), { scrambled: true, weight: 1 });
+  add('jxl:scrambled-jpeg-route-444', await encodeAsync(p444, { key: KEY, salt: SALT, format: 'jxl' }), { scrambled: true, weight: 0.5 });
 
   // Formats only a plugin reads.
   add('webp:lossy', await raw(22, 14).webp({ quality: 70 }).toBuffer());

@@ -77,11 +77,14 @@ function parseSof(marker, data, limits) {
   checkPixels(width, height, limits);
   const n = data[5];
   if (!n || n > 4) throw new PixmixError(`JPEG with ${n} components is not supported`, 'UNSUPPORTED');
+  if (data.length < 6 + 3 * n) throw new PixmixError('Truncated JPEG frame header', 'BAD_JPEG');
   const raw = [];
   for (let i = 0; i < n; i++) {
     const o = 6 + i * 3;
     raw.push({ id: data[o], h: data[o + 1] >> 4, v: data[o + 1] & 15, tq: data[o + 2] });
   }
+  // Sampling factors are 1-4 (B.2.2); a 0 made the MCU grid infinite.
+  if (raw.some((c) => c.h < 1 || c.h > 4 || c.v < 1 || c.v > 4)) throw new PixmixError('Invalid JPEG sampling factors', 'BAD_JPEG');
   // A single-component frame is never interleaved: its MCU is one block, whatever the
   // sampling factors say.
   if (n === 1) { raw[0].h = 1; raw[0].v = 1; }

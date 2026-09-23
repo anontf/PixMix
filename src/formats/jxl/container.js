@@ -30,7 +30,8 @@ export function readJxl(bytes, limits) {
     let size = dv.getUint32(pos);
     const type = fourcc(bytes, pos + 4);
     let head = 8;
-    if (size === 1) {
+    if (size === 1) { // 64-bit size, which must be there too
+      if (pos + 16 > bytes.length) throw new PixmixError('Truncated JPEG XL box', 'BAD_JXL');
       size = Number(dv.getBigUint64(pos + 8));
       head = 16;
     } else if (size === 0) size = bytes.length - pos;

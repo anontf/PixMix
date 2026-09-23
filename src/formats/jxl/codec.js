@@ -126,9 +126,9 @@ export async function reconstructJpeg(bytes, { limits } = {}) {
 }
 
 /**
- * Runs a call into the decoder, turning whatever it throws into a PixmixError: its own
- * errors are strings ("LIMIT: …" for a limit), and a Rust panic or running out of WASM
- * memory aborts the call as a bare RuntimeError, whose message the panic hook kept.
+ * Runs a call into the decoder, turning what it throws into a PixmixError: its own errors
+ * are strings ("LIMIT: …" for a limit), and a Rust panic or running out of WASM memory
+ * aborts the call as a bare RuntimeError, whose message the panic hook kept.
  * After a trap the instance is dropped, and the next call starts a fresh one.
  * (jxl-oxide 0.12 panics reconstructing some progressive JPEGs; pixmix's own are baseline.)
  */
@@ -142,10 +142,9 @@ function guard(fn) {
       decoder = null;
       throw new PixmixError(`JPEG XL decoder failed: ${panic || err.message}`, 'BAD_JXL');
     }
-    if (err instanceof PixmixError) throw err;
-    const message = String(err?.message ?? err);
-    if (message.startsWith('LIMIT: ')) throw new PixmixError(message.slice(7), 'LIMIT');
-    throw new PixmixError(`JPEG XL decoder failed: ${message}`, 'BAD_JXL');
+    if (typeof err !== 'string') throw err; // not from the decoder: a bug on this side
+    if (err.startsWith('LIMIT: ')) throw new PixmixError(err.slice(7), 'LIMIT');
+    throw new PixmixError(`JPEG XL decoder failed: ${err}`, 'BAD_JXL');
   }
 }
 

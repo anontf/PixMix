@@ -132,6 +132,13 @@ export async function reconstructJpeg(bytes, limits) {
   return (await loadJxlCodec()).reconstructJpeg(bytes, { limits });
 }
 
+/** The scrambled JPEG inside a JPEG-route file, which cannot do without it. */
+export async function scrambledJpegOf(bytes, limits) {
+  const jpeg = await reconstructJpeg(bytes, limits);
+  if (!jpeg) throw new PixmixError('JPEG XL file lost its JPEG reconstruction data', 'BAD_JXL');
+  return jpeg;
+}
+
 async function toJxlWithMarker(scrambledJpeg) {
   const codec = await loadJxlCodec();
   const { boxes, codestream } = readJxl(await codec.transcodeJpeg(scrambledJpeg));
@@ -160,8 +167,7 @@ export async function unscrambleJxlDetailed(bytes, { key, effort, limits } = {})
   if (!marker) throw new PixmixError('Image carries no pixmix marker', 'NOT_SCRAMBLED');
   const codec = await loadJxlCodec();
   if (marker.params.mode === 'mcu') {
-    const scrambledJpeg = await reconstructJpeg(bytes, limits);
-    if (!scrambledJpeg) throw new PixmixError('JPEG XL file lost its JPEG reconstruction data', 'BAD_JXL');
+    const scrambledJpeg = await scrambledJpegOf(bytes, limits);
     const jpeg = unscrambleJpegDetailed(scrambledJpeg, { key, limits });
     return { route: 'jpeg', params: marker.params, jpeg, toJxl: () => codec.transcodeJpeg(jpeg.toJpeg()) };
   }
@@ -189,7 +195,7 @@ export async function rekeyJxl(bytes, { from, to, mode, block, salt, effort, tra
   if (!marker) throw new PixmixError('Image carries no pixmix marker', 'NOT_SCRAMBLED');
   if (marker.params.mode === 'mcu') {
     if (mode && mode !== 'mcu') throw new PixmixError('This JPEG XL holds a scrambled JPEG; it can only be re-keyed in mode "mcu"', 'BAD_OPTION');
-    const jpeg = await reconstructJpeg(bytes, limits);
+    const jpeg = await scrambledJpegOf(bytes, limits);
     return toJxlWithMarker(rekeyJpeg(jpeg, { from, to, transforms, salt, progressive: false, limits }));
   }
   if (mode === 'mcu') throw new PixmixError('Mode "mcu" needs a JPEG XL that holds a JPEG', 'BAD_OPTION');

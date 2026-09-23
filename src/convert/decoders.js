@@ -12,6 +12,7 @@
 
 import decodeJpeg from 'jpeg-js/lib/decoder.js';
 import { GifReader } from 'omggif';
+import { blitFrame, clearRect } from './gif.js';
 import { PixmixError } from '../core/params.js';
 import { resolveLimits, checkPixels, checkFrames } from '../core/limits.js';
 import { readPng } from '../formats/png/index.js';
@@ -79,9 +80,10 @@ export const gifDecoder = {
       const f = reader.frameInfo(i);
       checkPixels(f.width, f.height, limits, `GIF frame ${i}`);
     }
-    if (n <= 1) {
+    if (!n) throw new PixmixError('GIF has no image', 'BAD_GIF');
+    if (n === 1) {
       const data = new Uint8Array(width * height * 4);
-      reader.decodeAndBlitFrameRGBA(0, data);
+      blitFrame(reader, bytes, 0, data, width, height);
       return { width, height, data, metadata: { dropped: [] } };
     }
     // Composite every frame onto the full canvas, following GIF disposal, so each becomes a
@@ -91,12 +93,11 @@ export const gifDecoder = {
     for (let i = 0; i < n; i++) {
       const info = reader.frameInfo(i);
       const saved = info.disposal === 3 ? canvas.slice() : null;
-      reader.decodeAndBlitFrameRGBA(i, canvas);
+      blitFrame(reader, bytes, i, canvas, width, height);
       // Browsers play delays of 0 or 1 (1/100 s) at 10; do the same so timing matches.
       frames.push({ data: canvas.slice(), delay: info.delay <= 1 ? 10 : info.delay });
-      if (info.disposal === 2) {
-        for (let y = info.y; y < info.y + info.height; y++) canvas.fill(0, (y * width + info.x) * 4, (y * width + info.x + info.width) * 4);
-      } else if (saved) canvas.set(saved);
+      if (info.disposal === 2) clearRect(canvas, width, height, info);
+      else if (saved) canvas.set(saved);
     }
     const loops = reader.loopCount(); // 0 = forever; null = no loop extension, play once
     return {

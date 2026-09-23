@@ -43,6 +43,8 @@ function parsePng(bytes, limits) {
   const chunks = readChunks(bytes, limits);
   const ihdr = parseIhdr(chunks[0].data);
   checkPixels(ihdr.width, ihdr.height, limits);
+  // Without a palette there is nothing to show (the browser reveal would look one up).
+  if (ihdr.colorType === 3 && !chunks.some((c) => c.type === 'PLTE')) throw new PixmixError('Palette PNG without a PLTE chunk', 'BAD_PNG');
   const frames = parseFrames(chunks, ihdr);
   if (frames.length > 1) checkFrames(frames.length, frames.reduce((n, f) => n + f.width * f.height, 0), limits);
   return { chunks, ihdr, frames, animated: chunks.some((c) => c.type === 'acTL'), pixelBytes: pixelBytesOf(ihdr) };
@@ -68,6 +70,8 @@ function parseFrames(chunks, ihdr) {
       pending = null;
     } else if (c.type === 'fdAT') {
       if (c.data.length < 4) throw new PixmixError('Bad APNG fdAT chunk', 'BAD_PNG');
+      // Frame 0 is always the IDAT image, sized by IHDR; an fdAT frame cannot stand in for it.
+      if (!frames.length) throw new PixmixError('APNG frame data before the IDAT image', 'BAD_PNG');
       if (pending) {
         current = { width: pending.width, height: pending.height, chunkIndexes: [], parts: [] };
         frames.push(current);

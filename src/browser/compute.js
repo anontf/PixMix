@@ -4,7 +4,7 @@
 import { detectFormat, inspect, PixmixError } from '../decoder.js';
 import { unscramblePngDetailedAsync } from '../formats/png/index.js';
 import { unscrambleJpegDetailed } from '../formats/jpeg/index.js';
-import { unscrambleJxlDetailed, reconstructJpeg } from '../formats/jxl/index.js';
+import { unscrambleJxlDetailed, scrambledJpegOf } from '../formats/jxl/index.js';
 import { toRGBA8 } from '../formats/png/rgba.js';
 import { writeChunks } from '../formats/png/chunks.js';
 import { encodeRasterAsync } from '../formats/png/raster.js';
@@ -55,7 +55,7 @@ export async function compute(bytes, key, { animated = true, limits } = {}) {
   }
   if (format === 'jxl') {
     // JPEG route: rebuild the scrambled JPEG and reveal that; visitors get the JPEG.
-    if (inspect(bytes, { limits }).mode === 'mcu') return compute(await reconstructJpeg(bytes, limits), key, { animated, limits });
+    if (inspect(bytes, { limits }).mode === 'mcu') return compute(await scrambledJpegOf(bytes, limits), key, { animated, limits });
     // Pixel route: the <img> gets a PNG, since most browsers cannot display JPEG XL.
     const d = await unscrambleJxlDetailed(bytes, { key, limits });
     return {

@@ -21,7 +21,7 @@ import { readSegments, writeSegments, startsWith, M } from '../formats/jpeg/mark
 import { readJxl, writeJxl, readJxlHeader } from '../formats/jxl/container.js';
 import { loadJxlCodec } from '../formats/jxl/load.js';
 import { exifTiff, unwrapBrob } from './jxl.js';
-import { stripIrbThumbnails } from './thumbnails.js';
+import { stripIrbThumbnailSegments, stripMakerNotePreviews } from './thumbnails.js';
 import { parseExif, writeExif, encodeEntry, settableTag, orientationOf } from './tiff.js';
 import { tagName } from './exif-tags.js';
 import { XmpPacket, emptyPacket } from './xmp.js';
@@ -88,6 +88,13 @@ function transformExif(tiff, p, ctx) {
   if (tiff && !strip && !sets.length && !touches(p, 'exif') && !ctx.stripThumbnails) return { tiff, changed: false };
   let exif = null;
   let changed = false;
+  // JPEG previews inside the MakerNote are zeroed in place (it stays opaque otherwise).
+  const previews = ctx.stripThumbnails || p.groups.has('thumbnail');
+  const zeroed = tiff && !strip && previews ? stripMakerNotePreviews(tiff) : null;
+  if (zeroed) {
+    tiff = zeroed;
+    r.removed.push(`MakerNote preview (${p.groups.has('thumbnail') ? 'thumbnail' : 'embedded preview'})`);
+  }
   if (tiff) {
     try {
       exif = parseExif(tiff);
@@ -138,7 +145,7 @@ function transformExif(tiff, p, ctx) {
     r.set.push(`EXIF ${info.name}`);
     changed = true;
   }
-  if (!changed) return { tiff, changed: false };
+  if (!changed) return { tiff, changed: !!zeroed };
   if (exif.warnings.length) note(r, `EXIF: dropped what could not be read (${list(exif.warnings)})`);
   if (!ifdEntries().some(([, l]) => l.length)) return { tiff: null, changed: true };
   const written = writeExif(exif);
@@ -523,6 +530,16 @@ function applyJpeg(bytes, p, ctx) {
   // Other APPn segments, Photoshop/IPTC among them.
   const iptcReplace = Object.fromEntries(convenience(p, 'iptc'));
   const dropCopies = touches(p, 'exif') || touches(p, 'xmp');
+  // Photoshop thumbnails, over every APP13 segment (a resource can continue in the next one).
+  const irb = info.map((x, i) => (x.label === 'APP13 Photoshop' ? i : -1)).filter((i) => i >= 0);
+  const irbData = new Map();
+  if (irb.length && p.groups.has('thumbnail') && p.kinds.other !== 'strip' && !removal(p, 'other', 'APP13')) {
+    const s = stripIrbThumbnailSegments(irb.map((i) => segments[i].data));
+    if (s) {
+      irb.forEach((i, k) => { if (k < s.length) irbData.set(i, s[k]); else drop(i); });
+      r.removed.push('Photoshop thumbnail (thumbnail)');
+    }
+  }
   info.forEach((x, i) => {
     if (x.kind !== 'other' || !out[i]) return;
     const reason = p.kinds.other === 'strip' ? 'other'
@@ -530,11 +547,7 @@ function applyJpeg(bytes, p, ctx) {
         ?? (x.label === 'APP2 MPF' && p.groups.has('thumbnail') ? 'thumbnail' : null);
     if (reason) { r.removed.push(`${x.label} (${reason})`); drop(i); return; }
     if (x.label !== 'APP13 Photoshop') return;
-    let data = segments[i].data;
-    if (p.groups.has('thumbnail')) {
-      const s = stripIrbThumbnails(data);
-      if (s) { data = s; r.removed.push('Photoshop thumbnail (thumbnail)'); }
-    }
+    let data = irbData.get(i) ?? segments[i].data;
     if (touches(p, 'iptc') || Object.keys(iptcReplace).length) {
       const edited = editIptc(data, (name) => !!removal(p, 'iptc', name), iptcReplace);
       if (!edited) { r.removed.push('APP13 Photoshop (unreadable IPTC)'); drop(i); return; }

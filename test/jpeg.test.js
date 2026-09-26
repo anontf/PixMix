@@ -220,3 +220,43 @@ test('progressive JPEGs stay progressive through scramble and restore; option ov
   const png = convert(new Uint8Array(await fromRaw(40, 30).png().toBuffer()), { format: 'jpeg', progressive: true }).bytes;
   assert.equal(inspect(png).progressive, true);
 });
+
+test('an uncompressed EXIF thumbnail in several strips is zeroed, not only unlinked', async () => {
+  const base = await fromRaw(48, 32).jpeg().toBuffer();
+  // IFD0 { Orientation } -> IFD1 { StripOffsets x3, StripByteCounts x3 } -> 3 strips of 16 bytes
+  const ifd1 = 26, arrays = ifd1 + 2 + 2 * 12 + 4, pix = arrays + 24;
+  const t = Buffer.alloc(pix + 48);
+  t.write('II', 0, 'latin1'); t.writeUInt16LE(42, 2); t.writeUInt32LE(8, 4);
+  t.writeUInt16LE(1, 8); t.writeUInt16LE(0x0112, 10); t.writeUInt16LE(3, 12); t.writeUInt32LE(1, 14); t.writeUInt16LE(1, 18);
+  t.writeUInt32LE(ifd1, 22);
+  t.writeUInt16LE(2, ifd1);
+  t.writeUInt16LE(0x0111, ifd1 + 2); t.writeUInt16LE(4, ifd1 + 4); t.writeUInt32LE(3, ifd1 + 6); t.writeUInt32LE(arrays, ifd1 + 10);
+  t.writeUInt16LE(0x0117, ifd1 + 14); t.writeUInt16LE(3, ifd1 + 16); t.writeUInt32LE(3, ifd1 + 18); t.writeUInt32LE(arrays + 12, ifd1 + 22);
+  for (let k = 0; k < 3; k++) { t.writeUInt32LE(pix + 16 * k, arrays + 4 * k); t.writeUInt16LE(16, arrays + 12 + 2 * k); }
+  t.fill(0xcd, pix);
+  const src = new Uint8Array(Buffer.concat([Buffer.from([0xff, 0xd8]), seg(0xe1, Buffer.concat([Buffer.from('Exif\0\0', 'latin1'), t])), base.subarray(2)]));
+  let report;
+  const scrambled = encode(src, { key: 'k', onConvert: (r) => { report = r; } });
+  assert.deepEqual(report.dropped, ['EXIF thumbnail']);
+  const exif = Buffer.from(readSegments(scrambled).segments.find((s) => s.marker === 0xe1).data.subarray(6));
+  assert.equal(exif.length, t.length);
+  assert.ok(!exif.includes(Buffer.alloc(4, 0xcd)), 'every strip zeroed');
+});
+
+test('keepThumbnails: data after the image is reported as dropped, and the MPF index to it goes too', async () => {
+  const base = await fromRaw(48, 32).jpeg().toBuffer();
+  const second = await fromRaw(16, 16).jpeg().toBuffer();
+  const src = new Uint8Array(Buffer.concat([Buffer.from([0xff, 0xd8]), seg(0xe2, Buffer.from('MPF\0MM\0\0', 'latin1')), base.subarray(2), second]));
+  let report;
+  const scrambled = encode(src, { key: 'k', keepThumbnails: true, onConvert: (r) => { report = r; } });
+  assert.deepEqual(report.dropped, [
+    'MPF index (the images it lists after the end of the image cannot be kept)',
+    `${second.length} bytes after the image (e.g. secondary images, motion-photo video)`,
+  ]);
+  assert.ok(!Buffer.from(scrambled).toString('latin1').includes('MPF\0'));
+  assert.equal(readSegments(scrambled).trailing.length, 0);
+  // Nothing to report: the file stays as it is.
+  const plain = convert(new Uint8Array(base), { keepThumbnails: true });
+  assert.deepEqual(plain.dropped, []);
+  assert.equal(plain.bytes.length, base.length);
+});

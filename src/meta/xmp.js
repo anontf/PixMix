@@ -37,6 +37,8 @@ export const NAMESPACES = {
   pdf: 'http://ns.adobe.com/pdf/1.3/',
   GPano: 'http://ns.google.com/photos/1.0/panorama/',
   lr: 'http://ns.adobe.com/lightroom/1.0/',
+  GImage: 'http://ns.google.com/photos/1.0/image/',
+  GDepth: 'http://ns.google.com/photos/1.0/depthmap/',
 };
 const PREFIX_OF = new Map(Object.entries(NAMESPACES).map(([p, u]) => [u, p]));
 

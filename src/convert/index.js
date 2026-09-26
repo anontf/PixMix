@@ -6,7 +6,7 @@
 
 import { detectFormat, toBytes } from '../formats/index.js';
 import { PixmixError } from '../core/params.js';
-import { withLimits, checkPixels, checkFrames } from '../core/limits.js';
+import { withLimits, checkPixels, checkFrames, resolveLimits } from '../core/limits.js';
 import { readJpegMetadata } from '../meta/jpeg.js';
 import { readWebpMetadata } from '../meta/webp.js';
 import { readJxlMetadata } from '../meta/jxl.js';
@@ -14,7 +14,8 @@ import { readJxl, writeJxl, wrapCodestream, readJxlHeader } from '../formats/jxl
 import { sanitizeBoxes } from '../formats/jxl/index.js';
 import { iccSpace, iccFits } from '../formats/jxl/icc.js';
 import { loadJxlCodec } from '../formats/jxl/load.js';
-import { stripExifThumbnail } from '../meta/thumbnails.js';
+import { stripExifPreviews, stripXmpPreviews } from '../meta/thumbnails.js';
+import { readPngText } from '../meta/read.js';
 import { readChunks, writeChunks } from '../formats/png/chunks.js';
 import { sanitizeJpeg } from '../formats/jpeg/index.js';
 import { buildPng } from './png-build.js';
@@ -240,7 +241,7 @@ function prepare(bytes, { format, decoders = [], keepThumbnails = false, limits 
   if (!from) throw new PixmixError('Unrecognised image format', 'UNSUPPORTED');
   const target = targetFormat(from, format);
   if (from === target) {
-    const { bytes: out, dropped } = keepThumbnails ? { bytes, dropped: [] } : sanitize(from, bytes, limits);
+    const { bytes: out, dropped } = sanitize(from, bytes, limits, keepThumbnails);
     return { done: { bytes: out, format: target, from, decoder: 'none', transferred: ['all metadata'], dropped } };
   }
   // Plugins first, so a caller can override a built-in (e.g. sharp for faster JPEG).
@@ -274,8 +275,12 @@ function mergedMeta(bytes, from, decoded, keepThumbnails, limits) {
   for (const k of Object.keys(extracted)) if (extracted[k] === undefined) meta[k] = fromDecoder[k];
   meta.dropped = [...(extracted.dropped ?? []), ...(fromDecoder.dropped ?? [])];
   if (meta.exif && !keepThumbnails) {
-    const stripped = stripExifThumbnail(meta.exif);
-    if (stripped) { meta.exif = stripped; meta.dropped.push('EXIF thumbnail'); }
+    const stripped = stripExifPreviews(meta.exif);
+    if (stripped) { meta.exif = stripped.tiff; meta.dropped.push(...stripped.dropped); }
+  }
+  if (meta.xmp && !keepThumbnails) {
+    const stripped = stripXmpPreviews(meta.xmp);
+    if (stripped) { meta.xmp = stripped.text ?? undefined; meta.dropped.push(...stripped.dropped); }
   }
   return meta;
 }
@@ -290,18 +295,41 @@ function finish(bytes, { from, target, decoder }, decoded, { keepThumbnails = fa
   return { bytes: built.bytes, format: target, from, decoder: decoder.name, transferred: built.transferred, dropped: [...new Set(built.dropped)], notes: sizeNotes(bytes, from, target) };
 }
 
-function sanitize(format, bytes, limits) {
-  if (format === 'jpeg') return sanitizeJpeg(bytes, limits);
+function sanitize(format, bytes, limits, keepThumbnails) {
+  if (format === 'jpeg') return sanitizeJpeg(bytes, limits, { keepThumbnails });
+  if (keepThumbnails) return { bytes, dropped: [] };
   if (format === 'jxl') {
     const { boxes, codestream } = readJxl(bytes, limits);
     const clean = sanitizeBoxes(boxes, { limits });
     return { bytes: writeJxl(clean.boxes, codestream), dropped: clean.dropped };
   }
-  // PNG: only an EXIF thumbnail can leak; everything else stays byte for byte.
+  // PNG: only EXIF and XMP previews can leak; everything else stays byte for byte.
   const chunks = readChunks(bytes, limits);
+  const dropped = [];
+  let changed = false;
   const i = chunks.findIndex((c) => c.type === 'eXIf');
-  const stripped = i >= 0 ? stripExifThumbnail(chunks[i].data) : null;
-  if (!stripped) return { bytes, dropped: [] };
-  chunks[i] = { type: 'eXIf', data: stripped };
-  return { bytes: writeChunks(chunks), dropped: ['EXIF thumbnail'] };
+  const exif = i >= 0 ? stripExifPreviews(chunks[i].data) : null;
+  if (exif) { chunks[i] = { type: 'eXIf', data: exif.tiff }; dropped.push(...exif.dropped); changed = true; }
+  const { maxMetadataBytes } = resolveLimits(limits);
+  for (let k = 0; k < chunks.length; k++) {
+    const c = chunks[k];
+    if (!['iTXt', 'tEXt', 'zTXt'].includes(c.type) || !startsWithKeyword(c.data, 'XML:com.adobe.xmp')) continue;
+    const text = readPngText(c.type, c.data, maxMetadataBytes)?.text;
+    const xmp = text ? stripXmpPreviews(text) : null;
+    if (!xmp) continue;
+    chunks[k] = xmp.text === null ? null : { type: 'iTXt', data: xmpChunk(xmp.text) };
+    for (const d of xmp.dropped) if (!dropped.includes(d)) dropped.push(d);
+    changed = true;
+  }
+  if (!changed) return { bytes, dropped: [] };
+  return { bytes: writeChunks(chunks.filter(Boolean)), dropped };
 }
+
+const startsWithKeyword = (data, k) => data.length > k.length && data[k.length] === 0 && [...k].every((ch, i) => data[i] === ch.charCodeAt(0));
+const xmpChunk = (text) => {
+  const k = Uint8Array.from('XML:com.adobe.xmp', (c) => c.charCodeAt(0)), t = new TextEncoder().encode(text);
+  const out = new Uint8Array(k.length + 5 + t.length);
+  out.set(k);
+  out.set(t, k.length + 5);
+  return out;
+};

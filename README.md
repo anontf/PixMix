@@ -234,15 +234,23 @@ the limits to every upload, with its 64 MiB body limit as `maxInputBytes`, and a
 
 Several places inside an image file can hold a small copy of the picture, and that copy
 would show the unscrambled image to anyone who looks:
-- EXIF IFD1 thumbnails (JPEG and PNG);
+- EXIF IFD1 thumbnails (JPEG or uncompressed strips), in JPEG, PNG and JPEG XL;
+- JPEG previews inside the EXIF MakerNote (Olympus, Pentax, older Nikon and others);
+- XMP thumbnails (`xmp:Thumbnails`) and Google's original and depth images (`GImage:Data`,
+  `GDepth:Data`), in the XMP packet or in JPEG extended XMP;
 - JFIF and JFXX thumbnails;
-- Photoshop thumbnail resources;
+- Photoshop thumbnail resources, also when the resources continue over several APP13
+  segments;
 - MPF secondary images, motion-photo video and anything else after the JPEG's end marker.
 
-The encoder removes all of these by default and lists them under `dropped`. EXIF
-thumbnails are zeroed in place so every other EXIF offset stays valid. Pass
-`keepThumbnails: true` to keep them (trailing data after the end marker can't be kept
-either way).
+The encoder removes all of these by default, on every route (same format, converted, JPEG
+XL boxes including Brotli-compressed ones), and lists them under `dropped`. EXIF
+thumbnails and MakerNote previews are zeroed in place so every other offset stays valid;
+only complete, well-formed JPEG streams inside a MakerNote are touched. XMP previews are
+removed from the packet and the rest is written back as it was; extended XMP holding one
+goes entirely. Pass `keepThumbnails: true` to keep them. Data after the end marker can't be
+kept either way, so it is still dropped (and reported), and so is the MPF index pointing
+to it.
 
 ### Input formats and metadata
 

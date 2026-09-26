@@ -27,7 +27,9 @@ import {
 import { checkPixels } from '../../core/limits.js';
 import { readJpegMetadata } from '../../meta/jpeg.js';
 import { readOrientation } from '../../meta/exif.js';
-import { stripExifThumbnail, stripIrbThumbnails, stripJfifThumbnail } from '../../meta/thumbnails.js';
+import {
+  stripExifPreviews, stripXmpPreviews, extendedXmpPreviews, stripIrbThumbnailSegments, stripJfifThumbnail,
+} from '../../meta/thumbnails.js';
 import { FLAG_STASH } from '../../core/params.js';
 import { encodeWatermark, decodeWatermark, restoreJpegStash } from '../../watermark/embed.js';
 import { stashJpeg } from '../../watermark/paint.js';
@@ -160,39 +162,69 @@ const markerPayload = (params, check) => {
 
 /**
  * Removes embedded previews and extra images that would show the unscrambled picture:
- * EXIF/JFIF/JFXX/Photoshop thumbnails, and MPF data or anything else after EOI (secondary
- * images, motion-photo video). The entropy-coded data is untouched.
+ * EXIF/JFIF/JFXX/Photoshop thumbnails, MakerNote and XMP previews (extended XMP included),
+ * and MPF data or anything else after EOI (secondary images, motion-photo video). The
+ * entropy-coded data is untouched. With `keepThumbnails` the previews stay, but data after
+ * EOI still goes (the scrambled file cannot keep it) and so does the MPF index to it.
  * @returns {{bytes: Uint8Array, dropped: string[]}}
  */
-export function sanitizeJpeg(bytes, limits) {
+export function sanitizeJpeg(bytes, limits, { keepThumbnails = false } = {}) {
   const { segments, trailing } = readSegments(bytes, limits);
   const dropped = [];
-  const out = [];
-  for (const seg of segments) {
+  const out = segments.slice();
+  const trailingNote = trailing.length ? `${trailing.length} bytes after the image (e.g. secondary images, motion-photo video)` : null;
+  if (keepThumbnails) {
+    const mpf = segments.filter((seg) => seg.marker === M.APP2 && startsWith(seg.data, 'MPF\0')).length;
+    if (!mpf && !trailingNote) return { bytes, dropped };
+    if (mpf) dropped.push('MPF index (the images it lists after the end of the image cannot be kept)');
+    if (trailingNote) dropped.push(trailingNote);
+    return { bytes: writeSegments(segments.filter((seg) => !(seg.marker === M.APP2 && startsWith(seg.data, 'MPF\0')))), dropped };
+  }
+  const note = (s) => { if (!dropped.includes(s)) dropped.push(s); };
+  const irb = [], ext = [];
+  segments.forEach((seg, i) => {
     let data = seg.data;
-    if (seg.marker === M.APP0 && startsWith(data, 'JFXX\0')) { dropped.push('JFXX thumbnail'); continue; }
-    if (seg.marker === M.APP2 && startsWith(data, 'MPF\0')) { dropped.push('MPF index (secondary images)'); continue; }
+    if (seg.marker === M.APP0 && startsWith(data, 'JFXX\0')) { note('JFXX thumbnail'); out[i] = null; return; }
+    if (seg.marker === M.APP2 && startsWith(data, 'MPF\0')) { note('MPF index (secondary images)'); out[i] = null; return; }
     if (seg.marker === M.APP0) {
       const s = stripJfifThumbnail(data);
-      if (s) { data = s; dropped.push('JFIF thumbnail'); }
+      if (s) { data = s; note('JFIF thumbnail'); }
     } else if (seg.marker === M.APP1 && startsWith(data, 'Exif\0\0')) {
-      const s = stripExifThumbnail(data.subarray(6));
+      const s = stripExifPreviews(data.subarray(6));
       if (s) {
-        data = new Uint8Array(6 + s.length);
+        data = new Uint8Array(6 + s.tiff.length);
         data.set(seg.data.subarray(0, 6));
-        data.set(s, 6);
-        dropped.push('EXIF thumbnail');
+        data.set(s.tiff, 6);
+        s.dropped.forEach(note);
       }
-    } else if (seg.marker === M.APP13) {
-      const s = stripIrbThumbnails(data);
-      if (s) { data = s; dropped.push('Photoshop thumbnail'); }
-    }
-    out.push(data === seg.data ? seg : { ...seg, data });
+    } else if (seg.marker === M.APP1 && startsWith(data, XMP_SIG)) {
+      const s = stripXmpPreviews(new TextDecoder().decode(data.subarray(XMP_SIG.length)));
+      if (s) {
+        s.dropped.forEach(note);
+        if (s.text === null) { out[i] = null; return; }
+        data = concat(data.subarray(0, XMP_SIG.length), new TextEncoder().encode(s.text));
+      }
+    } else if (seg.marker === M.APP1 && startsWith(data, XMP_EXT_SIG)) ext.push(i);
+    else if (seg.marker === M.APP13 && startsWith(data, 'Photoshop 3.0\0')) irb.push(i);
+    if (data !== seg.data) out[i] = { ...seg, data };
+  });
+  const irbOut = stripIrbThumbnailSegments(irb.map((i) => segments[i].data));
+  if (irbOut) {
+    irb.forEach((i, k) => { out[i] = k < irbOut.length ? { ...segments[i], data: irbOut[k] } : null; });
+    note('Photoshop thumbnail');
   }
-  if (trailing.length) dropped.push(`${trailing.length} bytes after the image (e.g. secondary images, motion-photo video)`);
+  const extDrop = extendedXmpPreviews(ext.map((i) => segments[i].data));
+  if (extDrop.size) {
+    for (const k of extDrop) out[ext[k]] = null;
+    note(`extended XMP (${extDrop.size} segment${extDrop.size > 1 ? 's' : ''}: it holds a preview image)`);
+  }
+  if (trailingNote) dropped.push(trailingNote);
   if (!dropped.length) return { bytes, dropped };
-  return { bytes: writeSegments(out), dropped };
+  return { bytes: writeSegments(out.filter(Boolean)), dropped };
 }
+
+const XMP_SIG = 'http://ns.adobe.com/xap/1.0/\0';
+const XMP_EXT_SIG = 'http://ns.adobe.com/xmp/extension/\0';
 
 // 'auto' keeps the source's structure: progressive stays progressive, baseline baseline.
 const isProgressive = (frame, progressive) => (progressive === 'auto' || progressive === undefined ? frame.marker === M.SOF2 : !!progressive);

@@ -19,7 +19,8 @@
 </header>
 <main>
   <p class="meta">
-    The server only ever sends scrambled PNGs (<code>/images/&lt;id&gt;.png</code>). The standalone
+    The server only ever sends scrambled images: PNG, JPEG or JPEG XL, as they were published
+    (<code>/images/&lt;id&gt;.png</code>, <code>.jpg</code>, <code>.jxl</code>). The standalone
     <code>pixmix-decoder.min.js</code> restores them as they scroll into view.
   </p>
   <div class="gallery" id="gallery"></div>
@@ -39,7 +40,9 @@ async function render() {
   }
   gallery.replaceChildren(...items.map((it) => {
     const fig = document.createElement('figure');
-    const img = new Image(it.width, it.height);
+    // The size it is shown at: EXIF orientations 5-8 turn the stored image a quarter turn.
+    const [w, h] = it.orientation >= 5 ? [it.height, it.width] : [it.width, it.height];
+    const img = new Image(w, h);
     img.alt = it.name;
     img.src = it.url;
     if (!raw.checked) {
@@ -49,8 +52,11 @@ async function render() {
       if (it.watermark && wm.value === 'auto') img.dataset.pixmixWatermark = it.watermark; // picked when publishing
     }
     const cap = document.createElement('figcaption');
-    cap.textContent = `${it.name} · ${it.width}×${it.height} · ${it.mode}${it.block ? ' ' + it.block + 'px' : ''} · ${it.effect}` +
+    const caption = (w, h) => `${it.name} · ${w}×${h} · ${it.mode}${it.block ? ' ' + it.block + 'px' : ''} · ${it.effect}` +
       `${it.carries ? ` · carries ${it.carries}` : ''}${it.visibleWatermark ? ' · visible watermark' : ''}`;
+    cap.textContent = caption(w, h);
+    // Once loaded, the size this browser actually shows (some ignore a PNG's EXIF orientation).
+    img.addEventListener('load', () => { if (img.naturalWidth) cap.textContent = caption(img.naturalWidth, img.naturalHeight); });
     fig.append(img, cap);
     return fig;
   }));

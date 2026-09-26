@@ -210,5 +210,13 @@ test('static files: HEAD, content types; gallery images only under their own ext
   assert.match(url, /\.png$/);
   assert.equal((await fetch(base + url)).status, 200);
   assert.equal((await fetch(base + url.replace(/\.png$/, '.jpg'))).status, 404);
+});
+
+test('the demo site gallery lists each image with its EXIF orientation', { skip }, async () => {
+  const jpeg = new Uint8Array(await sharp({ create: { width: 64, height: 32, channels: 3, background: '#406080' } }).withMetadata({ orientation: 6 }).jpeg().toBuffer());
+  const scrambled = (await call('/api/encode?key=k', { method: 'POST', body: jpeg, json: false })).body;
+  assert.equal((await call('/api/gallery?key=k&name=rot', { method: 'POST', body: scrambled })).status, 201);
+  const item = (await call('/api/gallery')).body.find((g) => g.name === 'rot');
+  assert.deepEqual([item.width, item.height, item.orientation], [64, 32, 6], 'stored size; the page shows it 32×64');
   await call('/api/gallery', { method: 'DELETE' });
 });

@@ -20,7 +20,7 @@ let current = null; // the lab's image, as an ImageBitmap
 async function api(path, { method = 'GET', body } = {}) {
   const res = await fetch(path, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body && JSON.stringify(body) });
   const out = await res.json();
-  if (!res.ok) throw new Error(out.error);
+  if (!res.ok) throw Object.assign(new Error(out.error), { status: res.status });
   return out;
 }
 
@@ -40,7 +40,31 @@ async function refresh(select) {
     if ([...el.options].some((o) => o.value === keep)) el.value = keep;
   }
   if (select) $('wmPick').value = select;
-  if (!def && list.length) load(list[0].id);
+  if (!def && list.length) await load(list[0].id);
+  else syncPick();
+}
+
+/**
+ * The picker names what is being edited: the saved watermark, or an extra "not saved" entry
+ * for a new one, a copy, or a saved one given another id (Save creates that one).
+ */
+function syncPick() {
+  const pick = $('wmPick');
+  pick.querySelector('option[data-unsaved]')?.remove();
+  if (!def) return;
+  if (savedId && savedId === def.id) { pick.value = savedId; return; }
+  const o = new Option(`${def.name} (${def.id}) · not saved`, '');
+  o.dataset.unsaved = '1';
+  pick.add(o, 0);
+  pick.value = '';
+}
+
+/** "not saved" with what Save will do, or the file it was loaded from. */
+function showSaved() {
+  if (savedId === def.id) return status(`watermarks/${def.id}.json`);
+  const taken = list.some((w) => w.id === def.id);
+  status(taken ? `not saved: watermarks/${def.id}.json already exists (Save asks before replacing it)`
+    : savedId ? `not saved: Save creates watermarks/${def.id}.json (${savedId} stays)` : 'not saved', 'bad');
 }
 
 function load(id) {
@@ -48,12 +72,12 @@ function load(id) {
   if (!w) return;
   def = structuredClone(w);
   savedId = id;
-  $('wmPick').value = id;
+  syncPick();
   render();
-  preview();
+  return preview();
 }
 
-$('wmPick').addEventListener('change', () => load($('wmPick').value));
+$('wmPick').addEventListener('change', () => load($('wmPick').value)); // (the unsaved entry: stays)
 $('wmNew').addEventListener('click', () => {
   def = { id: freeId('new-watermark'), name: 'New watermark', text: 'Vivi', font: fonts[0], stroke: { color: '#000000', width: 0.08 } };
   savedId = null;
@@ -63,29 +87,54 @@ $('wmCopy').addEventListener('click', () => {
   if (!def) return;
   def = { ...structuredClone(def), id: freeId(`${def.id}-copy`), name: `${def.name} (copy)` };
   savedId = null;
+  syncPick();
   render();
   preview();
 });
 $('wmDelete').addEventListener('click', async () => {
-  if (!savedId || !confirm(`Delete watermarks/${savedId}.json?`)) return;
+  if (!def) return;
+  if (!savedId) return status(`${def.id} is not saved yet: there is no file to delete (pick a saved watermark to leave it)`, 'bad');
+  const what = savedId === def.id ? `watermarks/${savedId}.json` : `watermarks/${savedId}.json (the file this was loaded from; ${def.id} is not saved)`;
+  if (!confirm(`Delete ${what}?`)) return;
   try {
-    await api(`/api/watermarks/${savedId}`, { method: 'DELETE' });
-    status(`deleted ${savedId}`, 'ok');
+    const id = savedId;
+    await api(`/api/watermarks/${id}`, { method: 'DELETE' });
     def = null; savedId = null;
     await refresh();
+    status(`deleted ${id}`, 'ok');
   } catch (err) { status(err.message, 'bad'); }
 });
 $('wmSave').addEventListener('click', async () => {
   if (!def) return;
+  const id = def.id, from = savedId;
+  const put = () => api(`/api/watermarks/${encodeURIComponent(id)}`, { method: 'PUT', body: def });
   try {
-    const { definition } = await api(`/api/watermarks/${encodeURIComponent(def.id)}`, { method: 'PUT', body: def });
-    def = definition;
+    let out;
+    if (from === id) out = await put();
+    else if (list.some((w) => w.id === id)) {
+      // Another watermark's id: replace that file only when asked to.
+      if (!confirm(`watermarks/${id}.json already exists. Replace it with this one?`)) return refused(id);
+      out = await put();
+    } else {
+      // New, a copy, or a saved one under another id: create only, so that another
+      // watermark's file is never replaced without asking.
+      try {
+        out = await api('/api/watermarks', { method: 'POST', body: def });
+      } catch (err) {
+        if (err.status !== 409) throw err; // (saved meanwhile, from elsewhere)
+        if (!confirm(`watermarks/${id}.json already exists. Replace it with this one?`)) return refused(id);
+        out = await put();
+      }
+    }
+    def = out.definition;
     savedId = def.id;
-    status(`saved watermarks/${def.id}.json`, 'ok');
     await refresh(def.id);
     render();
+    status(`saved watermarks/${def.id}.json${from && from !== def.id ? ` (${from} stays)` : ''}`, 'ok');
   } catch (err) { status(err.message, 'bad'); }
 });
+
+const refused = (id) => status(`not saved: watermarks/${id}.json already exists (give this one another id)`, 'bad');
 
 function freeId(base) {
   let id = base, n = 2;
@@ -343,12 +392,15 @@ function changed(rebuild = false) {
 
 async function normaliseThen(after) {
   const mine = ++seq;
+  const sent = JSON.stringify(def);
   try {
     const r = await api('/api/watermarks/preview', { method: 'POST', body: def });
-    if (mine !== seq) return;
+    // Edited while this was on its way (the next preview is queued): keep the edit.
+    if (mine !== seq || JSON.stringify(def) !== sent) return;
     def = r.definition;
     compiled = r.compiled;
-    status(savedId === def.id ? `watermarks/${def.id}.json` : 'not saved', savedId === def.id ? '' : 'bad');
+    showSaved();
+    syncPick();
     after?.();
     draw();
   } catch (err) {
@@ -373,6 +425,7 @@ function photo(g, w, h) {
 
 document.addEventListener('lab:image', async (e) => {
   try {
+    if (!e.detail) throw new Error('no image');
     const bytes = Enc.detectFormat(e.detail) === 'jxl' ? (await Enc.convertAsync(e.detail, { format: 'png' })).bytes : e.detail;
     current = await createImageBitmap(new Blob([bytes]));
   } catch { current = null; }
@@ -386,6 +439,8 @@ function draw() {
   const c = $('wmCanvas');
   const g = c.getContext('2d');
   const bg = $('wmBg').value;
+  // "current image" before one is loaded (or when it can't be decoded): the light background, said so.
+  const fallback = bg === 'current' && !current ? 'no image loaded above, so on the light background · ' : '';
   if (bg === 'current' && current) {
     c.width = current.width; c.height = current.height;
     g.drawImage(current, 0, 0);
@@ -402,7 +457,7 @@ function draw() {
   const ms = performance.now() - t0;
   const z = $('wmZoomCanvas');
   if (!patch) {
-    $('wmInfo').textContent = `hidden on ${c.width}×${c.height}: smaller than fit.minSize`;
+    $('wmInfo').textContent = `${fallback}hidden on ${c.width}×${c.height}: smaller than fit.minSize`;
     z.width = z.height = 1;
     return;
   }
@@ -418,7 +473,7 @@ function draw() {
   const zg = z.getContext('2d');
   zg.imageSmoothingEnabled = false;
   zg.drawImage(c, sx, sy, sw, sh, 0, 0, sw * k, sh * k);
-  $('wmInfo').innerHTML = `<b>${c.width}×${c.height}</b> · size <b>${place.em.toFixed(1)} px</b> · ${patch.width}×${patch.height} px at ${patch.x},${patch.y} · rendered in ${ms.toFixed(1)} ms`;
+  $('wmInfo').innerHTML = `${fallback}<b>${c.width}×${c.height}</b> · size <b>${place.em.toFixed(1)} px</b> · ${patch.width}×${patch.height} px at ${patch.x},${patch.y} · rendered in ${ms.toFixed(1)} ms`;
 }
 
 refresh().catch((err) => status(err.message, 'bad'));

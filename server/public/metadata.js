@@ -18,7 +18,7 @@ let image = null; // the lab's image
 async function api(path, { method = 'GET', body } = {}) {
   const res = await fetch(path, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body && JSON.stringify(body) });
   const out = await res.json();
-  if (!res.ok) throw new Error(out.error);
+  if (!res.ok) throw Object.assign(new Error(out.error), { status: res.status });
   return out;
 }
 
@@ -45,6 +45,30 @@ async function refresh(select) {
   if (select) pick.value = select;
   if (!profile && list.length) load(list[0].id);
   else if (!list.length && !profile) newProfile();
+  else syncPick();
+}
+
+/**
+ * The picker names what is being edited: the saved profile, or an extra "not saved" entry
+ * for a new one, a copy, or a saved one given another id (Save creates that one).
+ */
+function syncPick() {
+  const pick = $('mdPick');
+  pick.querySelector('option[data-unsaved]')?.remove();
+  if (!profile) return;
+  if (savedId && savedId === profile.id) { pick.value = savedId; return; }
+  const o = new Option(`${profile.name ?? profile.id} (${profile.id}) · not saved`, '');
+  o.dataset.unsaved = '1';
+  pick.add(o, 0);
+  pick.value = '';
+}
+
+/** "not saved" with what Save will do, or the file it was loaded from. */
+function showSaved(edited = false) {
+  if (savedId === profile.id) return status(`metadata-profiles/${profile.id}.json${edited ? ' (edited)' : ''}`, edited ? 'bad' : '');
+  const taken = list.some((p) => p.id === profile.id);
+  status(taken ? `not saved: metadata-profiles/${profile.id}.json already exists (Save asks before replacing it)`
+    : savedId ? `not saved: Save creates metadata-profiles/${profile.id}.json (${savedId} stays)` : 'not saved', 'bad');
 }
 
 function load(id) {
@@ -52,10 +76,12 @@ function load(id) {
   if (!p) return;
   profile = structuredClone(p);
   savedId = id;
-  $('mdPick').value = id;
+  syncPick();
   render();
   preview();
 }
+
+const refused = (id) => status(`not saved: metadata-profiles/${id}.json already exists (give this one another id)`, 'bad');
 
 function freeId(base) {
   let id = base, n = 2;
@@ -66,6 +92,7 @@ function freeId(base) {
 function newProfile() {
   profile = { id: freeId('new-profile'), name: 'New profile', preset: 'web', set: { copyright: 'Vivi' } };
   savedId = null;
+  syncPick();
   render();
   preview();
 }
@@ -76,11 +103,15 @@ $('mdCopy').addEventListener('click', () => {
   if (!profile) return;
   profile = { ...structuredClone(profile), id: freeId(`${profile.id}-copy`), name: `${profile.name ?? profile.id} (copy)` };
   savedId = null;
+  syncPick();
   render();
   preview();
 });
 $('mdDelete').addEventListener('click', async () => {
-  if (!savedId || !confirm(`Delete metadata-profiles/${savedId}.json?`)) return;
+  if (!profile) return;
+  if (!savedId) return status(`${profile.id} is not saved yet: there is no file to delete (pick a saved profile to leave it)`, 'bad');
+  const what = savedId === profile.id ? `metadata-profiles/${savedId}.json` : `metadata-profiles/${savedId}.json (the file this was loaded from; ${profile.id} is not saved)`;
+  if (!confirm(`Delete ${what}?`)) return;
   try {
     const id = savedId;
     await api(`/api/metadata-profiles/${id}`, { method: 'DELETE' });
@@ -91,12 +122,31 @@ $('mdDelete').addEventListener('click', async () => {
 });
 $('mdSave').addEventListener('click', async () => {
   if (!profile) return;
+  const id = profile.id, from = savedId;
+  const put = () => api(`/api/metadata-profiles/${encodeURIComponent(id)}`, { method: 'PUT', body: profile });
   try {
-    profile = await api(`/api/metadata-profiles/${encodeURIComponent(profile.id)}`, { method: 'PUT', body: profile });
+    let out;
+    if (from === id) out = await put();
+    else if (list.some((p) => p.id === id)) {
+      // Another profile's id: replace that file only when asked to.
+      if (!confirm(`metadata-profiles/${id}.json already exists. Replace it with this one?`)) return refused(id);
+      out = await put();
+    } else {
+      // New, a copy, or a saved one under another id: create only, so that another
+      // profile's file is never replaced without asking.
+      try {
+        out = await api('/api/metadata-profiles', { method: 'POST', body: profile });
+      } catch (err) {
+        if (err.status !== 409) throw err; // (saved meanwhile, from elsewhere)
+        if (!confirm(`metadata-profiles/${id}.json already exists. Replace it with this one?`)) return refused(id);
+        out = await put();
+      }
+    }
+    profile = out;
     savedId = profile.id;
     await refresh(profile.id);
     render();
-    status(`saved metadata-profiles/${profile.id}.json`, 'ok');
+    status(`saved metadata-profiles/${profile.id}.json${from && from !== profile.id ? ` (${from} stays)` : ''}`, 'ok');
   } catch (err) { status(err.message, 'bad'); }
 });
 
@@ -178,7 +228,8 @@ function render() {
     input('set.text', 'PNG text: Keyword=value', toLines(s.text), 'textarea', 'md-lines'),
     input('set.xmpPacket', 'replace the whole XMP packet', s.xmpPacket ?? '', 'textarea', 'md-lines'));
   $('mdJson').value = JSON.stringify(p, null, 2);
-  status(savedId === p.id ? `metadata-profiles/${p.id}.json` : 'not saved', savedId === p.id ? '' : 'bad');
+  showSaved();
+  syncPick();
 }
 
 function label(text, el) {
@@ -223,7 +274,8 @@ function changed() {
     try {
       profile = Enc.normalizeProfile(fromForm());
       $('mdJson').value = JSON.stringify(profile, null, 2);
-      status(savedId === profile.id ? `metadata-profiles/${profile.id}.json (edited)` : 'not saved', 'bad');
+      showSaved(true);
+      syncPick();
       preview();
     } catch (err) { status(err.message, 'bad'); }
   }, 150);
@@ -265,8 +317,12 @@ function rows(m) {
 let seq = 0;
 async function preview() {
   if (!profile) return;
-  if (!image) { $('mdDiff').replaceChildren(); return; }
   const mine = ++seq;
+  if (!image) {
+    $('mdDiff').replaceChildren();
+    $('mdReport').textContent = 'Load an image above to see what the profile does to its metadata.';
+    return;
+  }
   const decoders = [Enc.browserDecoder()];
   try {
     // What encoding does: the input as it will be scrambled, without and with the policy.

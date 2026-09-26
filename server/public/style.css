@@ -71,6 +71,16 @@ tr.added td { color: var(--accent); }
 .wm-form textarea, .wm-preview textarea { font: 12px ui-monospace, monospace; color: var(--ink); background: var(--bg);
   border: 1px solid var(--line); border-radius: 6px; padding: 6px; width: 100%; }
 .wm-form textarea { width: 220px; }
+/* Explicit sizes: WebKit shrinks text fields in these grid labels to their min-content (~20 px). */
+.wm-form input[type=text] { width: 168px; }
+.wm-form textarea { min-height: 44px; resize: vertical; }
+.wm-preview textarea { min-height: 16em; resize: vertical; }
+/* Our own disclosure marker: not every engine draws one for <summary>. */
+summary { cursor: pointer; list-style: none; }
+summary::-webkit-details-marker { display: none; }
+summary::before { content: ''; display: inline-block; margin-right: 6px; vertical-align: 1px;
+  border: 4px solid transparent; border-left: 6px solid currentColor; border-right: 0; transition: transform .1s; }
+details[open] > summary::before { transform: rotate(90deg); }
 .wm-paint, .wm-inline, .wm-orn { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: end; }
 .wm-orn { border-top: 1px dashed var(--line); padding-top: 8px; width: 100%; }
 .wm-anchors { display: grid; grid-template-columns: repeat(3, 18px); gap: 3px; }

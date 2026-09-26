@@ -40,6 +40,9 @@ to the demo gallery. Only use `serve:lan` on a network you trust.
   - Create and edit watermarks, with a live preview, and save them to `watermarks/`.
   - Create and edit metadata profiles, with the image's metadata before and after, and save
     them to `metadata-profiles/`; pick one when encoding and when decoding.
+  - In both editors, Save only replaces the file that was loaded: a new one, a duplicate or
+    a renamed one is saved under its own id (the original stays), and an id that is already
+    taken asks before replacing that file.
 - **Demo site** (`/site.html`): images published from the lab, served scrambled and
   revealed by the standalone `<script>` decoder as they scroll into view.
 

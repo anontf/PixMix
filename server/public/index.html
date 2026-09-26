@@ -23,9 +23,9 @@
       <select id="format"><option value="">same as input</option><option value="png">PNG</option><option value="jpeg">JPEG</option><option value="jxl">JPEG XL</option></select>
     </label>
     <label class="png-only">Mode
-      <select id="mode"><option value="">auto</option><option value="pixel">pixel</option><option value="block">block</option><option value="mcu" class="jxl-only">mcu (JPEG route)</option></select>
+      <select id="mode"><option value="">auto</option><option value="pixel">pixel</option><option value="block">block</option><option value="mcu" id="modeMcu" title="JPEG XL from a JPEG source only">mcu (JPEG route)</option></select>
     </label>
-    <label class="png-only">Block <input type="number" id="block" value="16" min="2" max="512"></label>
+    <label class="png-only">Block <input type="number" id="block" value="16" min="2" max="4096"></label>
     <label class="mcu-opts">JPEG MCUs
       <select id="transforms"><option value="1">shuffle + flip/rotate</option><option value="0">shuffle only</option></select>
     </label>
@@ -148,10 +148,20 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => `&#${c.charCodeAt(0)};`);
 const TYPES = { png: 'image/png', jpeg: 'image/jpeg', jxl: 'image/jxl' };
 const EXT = { png: 'png', jpeg: 'jpg', jxl: 'jxl' };
 const typeOf = (bytes) => TYPES[Enc.detectFormat(bytes)] ?? '';
-const blobUrl = (bytes, type = typeOf(bytes)) => URL.createObjectURL(new Blob([bytes], { type }));
+// Object URLs by use: making the next one for a slot revokes the one it replaces.
+const urls = new Map();
+function blobUrl(slot, bytes, type = typeOf(bytes)) {
+  if (urls.has(slot)) URL.revokeObjectURL(urls.get(slot));
+  const url = URL.createObjectURL(new Blob([bytes], { type }));
+  urls.set(slot, url);
+  return url;
+}
 const browserDecoders = [Enc.browserDecoder()];
 let original = null, originalName = 'sample', scrambled = null, activeKey = null;
 let reference = null; // original as PNG: the input itself, or its conversion
+// Bumped by every new image, encode, rekey and decode: a job that finds it changed after an
+// await is stale and leaves the page alone.
+let job = 0;
 
 function showImage(stageId, bytes, type = typeOf(bytes) || `image/${Enc.detectFormat(bytes)}`) {
   const img = new Image();
@@ -159,8 +169,8 @@ function showImage(stageId, bytes, type = typeOf(bytes) || `image/${Enc.detectFo
   // Most browsers cannot display JPEG XL: decode it with pixmix's codec and show a PNG.
   if (Enc.detectFormat(bytes) === 'jxl') {
     img.title = 'JPEG XL, decoded by the pixmix codec for display';
-    jxlToPng(bytes).then((png) => { img.src = blobUrl(png, 'image/png'); }, (err) => { img.alt = err.message; });
-  } else img.src = blobUrl(bytes, type);
+    jxlToPng(bytes).then((png) => { if (img.isConnected) img.src = blobUrl(stageId, png, 'image/png'); }, (err) => { img.alt = err.message; });
+  } else img.src = blobUrl(stageId, bytes, type);
   return img;
 }
 
@@ -169,21 +179,31 @@ async function jxlToPng(bytes) {
 }
 
 async function loadOriginal(bytes, name, note = '') {
-  original = bytes;
-  originalName = name;
-  document.dispatchEvent(new CustomEvent('lab:image', { detail: bytes })); // the watermark editor previews on it
+  job++;
+  // Whatever came from the previous image goes, even when this one turns out unusable.
   scrambled = null;
   reference = null;
-  showImage('origStage', bytes);
+  activeKey = null;
+  for (const id of ['scrStage', 'decStage']) $(id).replaceChildren();
+  for (const id of ['scrMeta', 'decMeta', 'scrSize', 'decTime', 'chunks', 'pubMeta']) $(id).textContent = '';
+  $('bar').style.width = '0';
+  for (const id of ['encode', 'replay', 'rekey', 'publish']) $(id).disabled = true;
   $('origSize').textContent = kib(bytes.length);
   let info;
   try {
     info = Enc.inspect(bytes);
   } catch (err) {
-    $('origMeta').innerHTML = `<span class="bad">${esc(err.message)}</span>`;
-    $('encode').disabled = true;
+    original = null;
+    $('origStage').replaceChildren();
+    $('origMeta').innerHTML = `<span class="bad">${esc(name)}: ${esc(err.message)}</span>`;
+    document.dispatchEvent(new CustomEvent('lab:image', { detail: null }));
+    syncOptions();
     return;
   }
+  original = bytes;
+  originalName = name;
+  document.dispatchEvent(new CustomEvent('lab:image', { detail: bytes })); // the editors preview on it
+  showImage('origStage', bytes);
   const parts = [`<b>${info.format.toUpperCase()}</b>`];
   if (info.width) parts.push(`${info.width}×${info.height}`);
   if (info.format === 'png') {
@@ -200,10 +220,7 @@ async function loadOriginal(bytes, name, note = '') {
     parts.push(`metadata: ${info.metadata.join(', ') || 'none'}${info.orientation > 1 ? ` · orientation ${info.orientation}` : ''}`);
   }
   $('origMeta').innerHTML = parts.join(' · ') + note;
-  for (const id of ['scrStage', 'decStage']) $(id).replaceChildren();
-  for (const id of ['scrMeta', 'decMeta', 'scrSize', 'decTime', 'chunks', 'pubMeta']) $(id).textContent = '';
   $('encode').disabled = false;
-  for (const id of ['replay', 'rekey', 'publish']) $(id).disabled = true;
   syncOptions();
 }
 
@@ -212,14 +229,27 @@ function outputFormat() {
   const from = original ? Enc.detectFormat(original) : 'png';
   return $('format').value || (Enc.OUTPUT_FORMATS.includes(from) ? from : 'png');
 }
+// A JPEG source: a JPEG, or a JPEG XL made from one (it keeps the JPEG's reconstruction data).
+function jpegSource() {
+  if (!original) return false;
+  const from = Enc.detectFormat(original);
+  return from === 'jpeg' || (from === 'jxl' && Enc.inspect(original).boxes.some((b) => b.type === 'jbrd'));
+}
 function syncOptions() {
   const f = outputFormat();
   for (const el of document.querySelectorAll('.png-only')) el.hidden = f === 'jpeg';
   for (const el of document.querySelectorAll('.jpeg-only')) el.hidden = f !== 'jpeg';
   for (const el of document.querySelectorAll('.jxl-only')) el.hidden = f !== 'jxl';
-  for (const el of document.querySelectorAll('.mcu-opts')) el.hidden = f === 'png';
+  // "mcu" is the JPEG route: JPEG XL output from a JPEG source only. A choice that no longer
+  // applies goes back to auto rather than staying selected while hidden.
+  $('modeMcu').hidden = !(f === 'jxl' && jpegSource());
+  if ($('mode').selectedOptions[0]?.hidden) $('mode').value = '';
+  // The JPEG MCU options: JPEG output, or JPEG XL output that takes the JPEG route.
+  const route = f === 'jxl' && jpegSource() && ['', 'mcu'].includes($('mode').value);
+  for (const el of document.querySelectorAll('.mcu-opts')) el.hidden = !(f === 'jpeg' || route);
 }
 $('format').addEventListener('change', syncOptions);
+$('mode').addEventListener('change', syncOptions);
 
 $('file').addEventListener('change', async (e) => {
   const file = e.target.files[0];
@@ -307,24 +337,30 @@ async function policyFor(value) {
 }
 
 $('encode').addEventListener('click', async () => {
+  if (!original) return;
+  const mine = ++job;
+  const input = original;
   const opts = encodeOpts();
   const where = $('where').value;
   const t0 = performance.now();
-  let report;
+  let report, out, ref;
   try {
     const wm = await withWatermarks(opts, where);
     if (where === 'server') {
-      ({ bytes: scrambled, report } = await serverCall('/api/encode', toQuery(wm), original));
+      ({ bytes: out, report } = await serverCall('/api/encode', toQuery(wm), input));
     } else {
-      scrambled = await Enc.encodeAsync(original, { ...wm, decoders: browserDecoders, onConvert: (r) => { report = r; } });
+      out = await Enc.encodeAsync(input, { ...wm, decoders: browserDecoders, onConvert: (r) => { report = r; } });
     }
     // Reference for verification: the input as the encoder saw it before scrambling
     // (sanitised, or converted, with the metadata policy applied), recomputed in the browser.
-    reference = report?.bytes ?? (await Enc.convertAsync(original, { ...opts, metadata: await policyFor($('encMetadata').value), decoders: browserDecoders })).bytes;
+    ref = report?.bytes ?? (await Enc.convertAsync(input, { ...opts, metadata: await policyFor($('encMetadata').value), decoders: browserDecoders })).bytes;
   } catch (err) {
-    $('scrMeta').innerHTML = `<span class="bad">${esc(err.message)}</span>`;
+    if (mine === job) $('scrMeta').innerHTML = `<span class="bad">${esc(err.message)}</span>`;
     return;
   }
+  if (mine !== job) return;
+  scrambled = out;
+  reference = ref;
   activeKey = opts.key;
   showScrambled(`encoded on ${where} in ${ms(performance.now() - t0)}`, report);
   await runDecode();
@@ -359,43 +395,47 @@ function showScrambled(note, report) {
   const mode = info.format === 'jpeg' ? `mcu ${info.mcu}${info.transforms ? ' + flips' : ''}` : `${info.mode}${info.block ? ` ${info.block}px` : ''}`;
   const wms = [info.watermark ? `carries <b>${esc(info.watermark.id)}</b>${info.watermark.embedded ? '' : ' (id)'}` : '', info.visibleWatermark ? 'visible watermark' : ''].filter(Boolean);
   $('scrMeta').innerHTML = `${note} · <b>${info.format.toUpperCase()}</b> · mode <b>${mode}</b> · ${wms.length ? `${wms.join(' · ')} · ` : ''}` +
-    `<a download="scrambled.${EXT[info.format]}" href="${blobUrl(scrambled)}">download</a>${describe(report)}`;
+    `<a download="scrambled.${EXT[info.format]}" href="${blobUrl('scrambledDownload', scrambled)}">download</a>${describe(report)}`;
   renderChunks(structure(reference), structure(scrambled), Enc.detectFormat(original) !== info.format);
   for (const id of ['replay', 'rekey', 'publish']) $(id).disabled = false;
 }
 
 async function runDecode() {
-  const url = blobUrl(scrambled);
+  const mine = ++job;
+  // What this decode checks against, fixed now: a new image or encode may replace them.
+  const snap = { scrambled, original, reference, key: $('decKey').value || activeKey, live: () => mine === job };
+  const url = blobUrl('decStage', scrambled);
   const img = new Image();
   img.src = url;
   img.dataset.pixmixSrc = url;
   $('decStage').replaceChildren(img);
   $('decMeta').textContent = 'decoding…';
   $('bar').style.width = '0';
-  const key = $('decKey').value || activeKey;
   const t0 = performance.now();
   try {
     await Dec.reveal(img, {
-      key,
+      key: snap.key,
       effect: $('effect').value,
       duration: Number($('duration').value),
       worker: $('worker').checked,
       watermark: $('decWm').value === 'auto' ? undefined : $('decWm').value === 'none' ? false : $('decWm').value,
       metadata: await policyFor($('decMetadata').value),
-      onProgress: (p) => { $('bar').style.width = `${p * 100}%`; },
+      onProgress: (p) => { if (mine === job) $('bar').style.width = `${p * 100}%`; },
     });
   } catch (err) {
-    $('decMeta').innerHTML = `<span class="bad">${esc(err.name)}: ${esc(err.message)}</span>`;
+    if (mine === job) $('decMeta').innerHTML = `<span class="bad">${esc(err.name)}: ${esc(err.message)}</span>`;
     return;
   }
+  if (mine !== job) return;
   $('decTime').textContent = ms(performance.now() - t0);
   try {
-    const drawn = $('decWm').value === 'none' ? null : $('decWm').value === 'auto' ? Enc.inspect(scrambled).watermark?.id : $('decWm').value;
+    const drawn = $('decWm').value === 'none' ? null : $('decWm').value === 'auto' ? Enc.inspect(snap.scrambled).watermark?.id : $('decWm').value;
     const md = $('decMetadata').value;
-    $('decMeta').innerHTML = await verify() + (drawn ? ` · watermark <b>${esc(drawn)}</b> drawn on the shown image (the check above is the exact restore)` : '')
+    const html = await verify(snap) + (drawn ? ` · watermark <b>${esc(drawn)}</b> drawn on the shown image (the check above is the exact restore)` : '')
       + (md ? ` · restored with metadata <b>${esc(md)}</b>` : '');
+    if (mine === job) $('decMeta').innerHTML = html;
   } catch (err) {
-    $('decMeta').innerHTML = `<span class="bad">verification failed: ${esc(err.message)}</span>`;
+    if (mine === job) $('decMeta').innerHTML = `<span class="bad">verification failed: ${esc(err.message)}</span>`;
   }
 }
 
@@ -410,8 +450,7 @@ async function rgba(bytes) {
   return g.getImageData(0, 0, bmp.width, bmp.height).data;
 }
 
-async function verify() {
-  const key = $('decKey').value || activeKey;
+async function verify({ scrambled, original, reference, key, live }) {
   // A JPEG-route JPEG XL restores to a JPEG XL holding the JPEG: compare that JPEG (what
   // the <img> shows) with the (sanitised) original JPEG.
   const info = Enc.inspect(scrambled);
@@ -435,11 +474,11 @@ async function verify() {
     : `<span class="bad">≈ ${diff} samples differ (max Δ ${maxDelta}) from the ${vs}: server and browser decoded the lossy source differently</span>`;
   return `${pixelsLine} · ${sameMeta ? '<span class="ok">✓ metadata chunks identical</span>' : '<span class="bad">✗ chunks differ</span>'}` +
     `${jpegRoute ? ' · JPEG route: compared the JPEG inside' : ''}` +
-    ` · restored ${kib(restored.length)} · <a download="restored.${EXT[Enc.detectFormat(restored)]}" href="${blobUrl(restored)}">download</a>`;
+    ` · restored ${kib(restored.length)} · <a download="restored.${EXT[Enc.detectFormat(restored)]}" href="${live() ? blobUrl('restoredDownload', restored) : ''}">download</a>`; // (a stale one keeps the current link)
 }
 
 // PNG chunks or JPEG segments; image data and pixmix markers are the "coding" parts.
-const CODING = new Set(['IDAT', 'pmIx', 'DHT', 'SOS', 'DRI', 'APP15', 'jxlc', 'jxlp', 'jxll', 'ftyp']);
+const CODING = new Set(['IDAT', 'fdAT', 'pmIx', 'DHT', 'SOS', 'DRI', 'APP15', 'jxlc', 'jxlp', 'jxll', 'ftyp']);
 const structure = (b) => { const i = Enc.inspect(b); return i.chunks ?? i.segments ?? i.boxes; };
 
 function renderChunks(before, after, converted) {
@@ -466,25 +505,31 @@ function renderChunks(before, after, converted) {
     `${converted ? ' The left column is the input after conversion, with its metadata mapped to the new format.' : ''}</p>`;
 }
 
-$('replay').addEventListener('click', runDecode);
+$('replay').addEventListener('click', () => { if (scrambled) runDecode(); });
 
 $('rekey').addEventListener('click', async () => {
   const to = $('newKey').value;
+  if (!scrambled) return;
   if (!to) return $('newKey').focus();
+  const mine = ++job;
+  const input = scrambled;
   const opts = { from: activeKey, to };
-  const info = Enc.inspect(scrambled);
+  const info = Enc.inspect(input);
   if (info.mode === 'mcu') opts.transforms = $('transforms').value === '1';
   else {
     opts.mode = $('mode').value || info.mode;
     if (opts.mode === 'block') opts.block = Number($('block').value);
   }
   const t0 = performance.now();
+  let out;
   try {
-    scrambled = $('where').value === 'server' ? (await serverCall('/api/rekey', toQuery(opts), scrambled)).bytes : await Enc.rekeyAsync(scrambled, opts);
+    out = $('where').value === 'server' ? (await serverCall('/api/rekey', toQuery(opts), input)).bytes : await Enc.rekeyAsync(input, opts);
   } catch (err) {
-    $('scrMeta').innerHTML = `<span class="bad">${esc(err.message)}</span>`;
+    if (mine === job) $('scrMeta').innerHTML = `<span class="bad">${esc(err.message)}</span>`;
     return;
   }
+  if (mine !== job) return;
+  scrambled = out;
   activeKey = to;
   $('key').value = to;
   $('newKey').value = '';
@@ -493,6 +538,7 @@ $('rekey').addEventListener('click', async () => {
 });
 
 $('publish').addEventListener('click', async () => {
+  if (!scrambled) return;
   // (the demo site reveals it with the watermark picked for decoding, unless it overrides)
   const q = new URLSearchParams({ key: activeKey, effect: $('effect').value, name: originalName, watermark: $('decWm').value === 'auto' ? '' : $('decWm').value });
   const res = await fetch(`/api/gallery?${q}`, { method: 'POST', body: scrambled });

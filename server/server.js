@@ -222,8 +222,8 @@ function checkNotReserved(id) {
   if (RESERVED_IDS.has(id)) throw httpError(400, `"${id}" is reserved and cannot be a watermark id`);
 }
 
-const pick = ({ format, width, height, mode, block, watermark, visibleWatermark }) => ({
-  format, width, height, mode, block, carries: watermark?.id ?? null, visibleWatermark,
+const pick = ({ format, width, height, orientation, mode, block, watermark, visibleWatermark }) => ({
+  format, width, height, orientation: orientation ?? 1, mode, block, carries: watermark?.id ?? null, visibleWatermark,
 });
 const urlFor = (id, bytes) => `/images/${id}.${IMAGE[detectFormat(bytes)][1]}`;
 

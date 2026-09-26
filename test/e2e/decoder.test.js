@@ -14,6 +14,8 @@ import { readPng } from '../../src/formats/png/index.js';
 import { toRGBA8 } from '../../src/formats/png/rgba.js';
 import { readSegments } from '../../src/formats/jpeg/markers.js';
 import { decodeFrame } from '../../src/formats/jpeg/decode.js';
+import { assembleJpeg } from '../../src/formats/jpeg/encode.js';
+import { encodePixels } from '../../src/formats/jpeg/fdct.js';
 import { loadJxlCodec } from '../../src/formats/jxl/load.js';
 import { watermarkStore } from '../../src/watermark/store.js';
 import { startServer, launch, engines, openPage, revealed, rendered, decoderPage } from './harness.js';
@@ -31,6 +33,32 @@ async function photo(w, h, jpegOpts) {
   }
   const s = sharp(raw, { raw: { width: w, height: h, channels: 3 } });
   return new Uint8Array(await (jpegOpts ? s.jpeg(jpegOpts) : s.png()).toBuffer());
+}
+
+/**
+ * A JPEG with every component sampled 2x2 (12 blocks per MCU, so one scan per component)
+ * and partial edge MCUs, with an EXIF orientation.
+ */
+function enlargedSource(w, h, orientation) {
+  const data = new Uint8Array(w * h * 4);
+  for (let i = 0; i < w * h; i++) {
+    const x = i % w, y = Math.floor(i / w);
+    data.set([(x * 255) / w, (y * 255) / h, ((x ^ y) * 3) & 255, 255], i * 4);
+  }
+  const { frame, dqt } = encodePixels({ width: w, height: h, data }, { subsampling: '4:4:4' });
+  const mcusX = Math.ceil(w / 16), mcusY = Math.ceil(h / 16);
+  const sof = frame.sof.slice();
+  for (let i = 0; i < 3; i++) sof[7 + i * 3] = 0x22;
+  const components = frame.components.map((c) => {
+    const blocksW = mcusX * 2, blocksH = mcusY * 2;
+    const coefs = new Int16Array(blocksW * blocksH * 64);
+    for (let by = 0; by < c.realH; by++) coefs.set(c.coefs.subarray(by * c.blocksW * 64, (by * c.blocksW + c.realW) * 64), by * blocksW * 64);
+    return { ...c, h: 2, v: 2, blocksW, blocksH, coefs };
+  });
+  // EXIF: II, IFD0 with Orientation only.
+  const exif = Buffer.from('Exif\0\0II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\0\0\0\0\0\0\0\0', 'latin1');
+  exif[6 + 8 + 2 + 8] = orientation;
+  return assembleJpeg([{ marker: 0xe1, data: new Uint8Array(exif) }, dqt], { ...frame, sof, hmax: 2, vmax: 2, mcusX, mcusY, components });
 }
 
 const F = {};
@@ -243,6 +271,47 @@ for (const { name: engine, skip } of await engines()) describe(engine, { skip },
     assert.deepEqual(errors, []);
     await p.close();
   });
+
+  // A JPEG with more than 10 blocks per MCU and partial edge MCUs is scrambled enlarged to
+  // whole MCUs; the reveal must show (and end on) the original size, also when rotated.
+  // `here`: no OffscreenCanvas and no worker, so the page decodes the frames itself.
+  for (const [orientation, here] of [[1, false], [6, false], [6, true]]) {
+    test(`enlarged scrambled JPEG (orientation ${orientation}${here ? ', frames decoded by the page' : ''}): animation and final image at the original size`, async () => {
+      const src = enlargedSource(152, 88, orientation);
+      const s = encode(src, { key: 'k' });
+      assert.deepEqual([inspect(s).storedWidth, inspect(s).storedHeight], [160, 96]);
+      let html = decoderPage({ src: '/s.jpg', effect: 'dissolve', duration: 6000, extra: here ? 'data-worker="false"' : '' });
+      if (here) html = html.replace('<body>', '<body><script>delete globalThis.OffscreenCanvas;</script>');
+      const { page: p, errors } = await page(html, { '/s.jpg': s, '/orig.jpg': src });
+      const swap = orientation === 6;
+      const canvas = await p.waitForSelector('canvas', { timeout: 20000 });
+      // A rotated canvas is filled on the first animation frame.
+      await p.waitForFunction(() => {
+        const c = document.querySelector('canvas');
+        return c && c.getContext('2d').getImageData(0, 0, 1, 1).data[3] > 0;
+      }, null, { timeout: 20000 });
+      const first = await canvas.evaluate((c) => [c.width, c.height, Array.from(c.getContext('2d').getImageData(0, 0, c.width, c.height).data)]);
+      assert.deepEqual(first.slice(0, 2), swap ? [88, 152] : [152, 88], 'canvas at the original size');
+      // It starts from the scrambled image's original area: the stored grid's top left,
+      // which a 90° rotation puts at the right of the displayed (enlarged) image.
+      const shown = await rendered(p, '/s.jpg');
+      const [dw, cw, ch] = [swap ? 96 : 160, first[0], first[1]];
+      const dx = swap ? 96 - 88 : 0;
+      let off = 0;
+      for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+        const a = (y * cw + x) * 4, b = (y * dw + x + dx) * 4;
+        if (Math.abs(first[2][a] - shown[b]) + Math.abs(first[2][a + 1] - shown[b + 1]) > 6) off++;
+      }
+      assert.ok(off < cw * ch * 0.1, `${off} of ${cw * ch} pixels differ from the scrambled image`);
+      const r = await revealed(p);
+      assert.equal(r.state, 'done');
+      assert.ok(sameCoefs(new Uint8Array(r.bytes), src), 'the original JPEG');
+      assert.deepEqual(r.natural, swap ? [88, 152] : [152, 88]);
+      assert.deepEqual(await rendered(p, r.src), await rendered(p, '/orig.jpg'));
+      assert.deepEqual(errors, []);
+      await p.close();
+    });
+  }
 
   // Without WebCodecs' ImageDecoder (hidden here, or absent from the engine) the documented
   // fallback is the first frame, with the animation reported as dropped.

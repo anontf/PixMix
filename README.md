@@ -866,11 +866,22 @@ clean. Two defaults: `vivi-web` (the `web` preset with Vivi as artist and copyri
        padding blocks either.
      - The JPEG inside a JPEG-route JPEG XL is always baseline (see jxl-oxide above).
    - The same limit applies to MCUs of more than 10 blocks, which only non-interleaved
-     scans can code: with partial edge MCUs such files are refused (`UNSUPPORTED`).
+     scans can code. With partial edge MCUs, the scrambled file's frame is enlarged to
+     whole MCUs instead, so it shows up to 15 pixels wider and taller than the original
+     (other software reads it at that size). Marker flag bit 1 says so, an APP15
+     `pixmix-sz\0` segment (`u16 height | u16 width`) holds the original size, and
+     restoring gives the original size back, exactly. Rekeying keeps the enlarged form; a
+     visible watermark is placed on the original area. `inspect` reports the original
+     `width`/`height` and the stored `storedWidth`/`storedHeight`; the browser reveal shows
+     the original size throughout.
+   - The JPEG XL JPEG route cannot carry any file with more than 10 blocks per MCU
+     (jxl-oxide fails to rebuild its non-interleaved scans), so JPEG XL output of such a
+     JPEG takes the pixel route.
 
 Marker v1: `u8 version | u8 mode | u16 block | u8 saltLen | salt | u8[4] check`. Marker v2
-adds `u8 flags` (bit 0: a visible watermark's stash is in the file); it's only written when a
-flag is set, and the permutation is the same as v1's.
+adds `u8 flags` (bit 0: a visible watermark's stash is in the file; bit 1: the JPEG frame is
+enlarged to whole MCUs, see above); it's only written when a flag is set, so versions that
+don't know a flag refuse the file, and the permutation is the same as v1's.
 - In `mcu` mode, `block` holds flags: bit 0 = transforms, bit 1 = restore as progressive.
 - APNG frames mix their index into the seed; it's 0 for still images.
 The permutation stream is pinned by a test. Any change to it must bump the version.

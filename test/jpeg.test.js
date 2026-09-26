@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import sharp from 'sharp';
-import { encode, decode, rekey, inspect, convert, WrongKeyError } from '../src/index.js';
+import { encode, encodeAsync, decode, decodeAsync, rekey, inspect, convert, convertAsync, WrongKeyError } from '../src/index.js';
+import { watermarkStore } from '../src/watermark/index.js';
+import { readMarker } from '../src/core/params.js';
 import { readSegments, writeSegments, M } from '../src/formats/jpeg/markers.js';
 import { decodeFrame } from '../src/formats/jpeg/decode.js';
 import { assembleJpeg, encodeScan } from '../src/formats/jpeg/encode.js';
@@ -301,11 +303,88 @@ test('more than 10 blocks per MCU: one scan per component, which libjpeg reads',
       assert.ok(ref.equals(await pixels(decode(rekey(scrambled, { from: 'k', to: 'j' }), { key: 'j' }))));
     }
   }
-  // With partial edge MCUs such scans cannot hold what scrambling moves into the padding.
-  const odd = sampled2x2(40, 24);
-  const src = assembleJpeg([odd.dqt], odd.frame);
-  await pixels(src);
-  assert.throws(() => encode(src, { key: 'k' }), (err) => err.code === 'UNSUPPORTED');
+});
+
+const markerOf = (b) => readSegments(b).segments.find((s) => s.marker === M.APP15 && Buffer.from(s.data.subarray(0, 7)).toString('latin1') === 'pixmix\0').data.subarray(7);
+const isSize = (s) => s.marker === M.APP15 && Buffer.from(s.data.subarray(0, 10)).toString('latin1') === 'pixmix-sz\0';
+const sizeSegment = (b) => readSegments(b).segments.find(isSize);
+
+test('more than 10 blocks per MCU with partial edge MCUs: scrambled enlarged, restored at the original size', async () => {
+  for (const [w, h] of [[40, 24], [37, 21], [64, 21]]) {
+    const { frame, dqt } = sampled2x2(w, h);
+    const src = assembleJpeg([dqt], frame);
+    const ref = await pixels(src);
+    const W = Math.ceil(w / 16) * 16, H = Math.ceil(h / 16) * 16;
+    for (const progressive of [false, true]) {
+      const scrambled = encode(src, { key: 'k', progressive });
+      // Other decoders read the scrambled file, at the enlarged size.
+      const meta = await sharp(scrambled).metadata();
+      assert.deepEqual([meta.width, meta.height], [W, H], `${w}x${h}: stored size`);
+      const info = inspect(scrambled);
+      assert.equal(info.progressive, progressive, 'no padding left: progressive is possible');
+      assert.deepEqual([info.width, info.height, info.storedWidth, info.storedHeight], [w, h, W, H]);
+      assert.equal(markerOf(scrambled)[0], 2, 'marker v2');
+      assert.equal(markerOf(scrambled).at(-1), 2, 'flag: enlarged');
+      const restored = decode(scrambled, { key: 'k' });
+      assert.ok(sameCoefs(restored, src), `${w}x${h}: coefficients`);
+      assert.ok(ref.equals(await pixels(restored)), `${w}x${h}: libjpeg pixels`);
+      assert.equal(inspect(restored).progressive, progressive);
+      assert.equal(inspect(restored).storedWidth, undefined);
+      assert.equal(sizeSegment(restored), undefined, 'no pixmix segment left');
+      // Rekeying keeps the enlarged form, and still restores exactly.
+      const again = rekey(scrambled, { from: 'k', to: 'j' });
+      assert.equal((await sharp(again).metadata()).width, W);
+      assert.ok(ref.equals(await pixels(decode(again, { key: 'j' }))));
+      assert.throws(() => decode(scrambled, { key: 'j' }), WrongKeyError);
+    }
+  }
+  // Frames that fit whole MCUs, and other layouts, are written as before: no flag.
+  for (const src of [assembleJpeg([sampled2x2(64, 48).dqt], sampled2x2(64, 48).frame), new Uint8Array(await fromRaw(37, 23).jpeg().toBuffer())]) {
+    const scrambled = encode(src, { key: 'k' });
+    assert.equal(markerOf(scrambled)[0], 1);
+    assert.equal(sizeSegment(scrambled), undefined);
+    assert.equal(inspect(scrambled).storedWidth, undefined);
+  }
+});
+
+test('enlarged scrambled JPEGs: visible watermarks within the original area; JPEG XL output', async () => {
+  const { frame, dqt } = sampled2x2(200, 120);
+  const src = assembleJpeg([dqt], frame);
+  const ref = await pixels(src);
+  const win = await watermarkStore(new URL('../watermarks/', import.meta.url).pathname).compiled('vivi-window');
+  const s = encode(src, { key: 'k', visibleWatermark: win });
+  const info = inspect(s);
+  assert.equal(info.visibleWatermark, true);
+  assert.deepEqual([info.width, info.storedWidth], [200, 208]);
+  assert.equal(markerOf(s).at(-1), 3, 'flags: stash and enlarged');
+  // The watermark sits on the part that is restored: the added edge matches a plain scramble.
+  const plain = rekey(s, { from: 'k', to: 'k', visibleWatermark: null, salt: readMarker(markerOf(s)).params.salt });
+  const [a, b] = await Promise.all([pixels(s), pixels(plain)]);
+  assert.ok(!a.equals(b));
+  for (let y = 0; y < 128; y++) for (let x = 200; x < 208; x++) assert.equal(a[(y * 208 + x) * 3], b[(y * 208 + x) * 3], 'right edge untouched');
+  assert.ok(ref.equals(await pixels(decode(s, { key: 'k' }))));
+  assert.ok(ref.equals(await pixels(decode(rekey(s, { from: 'k', to: 'j' }), { key: 'j' }))));
+  // JPEG XL: libjxl/jxl-oxide cannot carry such a JPEG on the JPEG route; the pixel route takes over.
+  let report;
+  const jxl = await encodeAsync(src, { key: 'k', format: 'jxl', onConvert: (r) => { report = r; } });
+  assert.match(report.notes[0], /JPEG route not possible/);
+  assert.equal(inspect(jxl).width, 200);
+  const back = await sharp(Buffer.from(await convertAsync(await decodeAsync(jxl, { key: 'k' }), { format: 'png' }).then((r) => r.bytes))).raw().toBuffer();
+  assert.equal(back.length, 200 * 120 * 3);
+});
+
+test('enlarged scrambled JPEGs: an unknown flag or a lost size is refused, not misrestored', async () => {
+  const { frame, dqt } = sampled2x2(40, 24);
+  const scrambled = encode(assembleJpeg([dqt], frame), { key: 'k' });
+  const edit = (change) => writeSegments(readSegments(scrambled).segments.map(change).filter(Boolean));
+  const isMarker = (s) => s.marker === M.APP15 && Buffer.from(s.data.subarray(0, 7)).toString('latin1') === 'pixmix\0';
+  // pixmix before FLAG_ENLARGED only knew flag 1; a flag it does not know is refused.
+  const unknown = edit((s) => (isMarker(s) ? { ...s, data: Uint8Array.from(s.data, (b, i) => (i === s.data.length - 1 ? b | 4 : b)) } : s));
+  assert.throws(() => decode(unknown, { key: 'k' }), /Unsupported pixmix marker flags 6/);
+  const lost = edit((s) => (isSize(s) ? null : s));
+  assert.throws(() => decode(lost, { key: 'k' }), (err) => err.code === 'BAD_JPEG' && /original size/.test(err.message));
+  const wrong = edit((s) => (isSize(s) ? { ...s, data: Uint8Array.from([...s.data.subarray(0, 10), 0, 8, 0, 8]) } : s));
+  assert.throws(() => decode(wrong, { key: 'k' }), (err) => err.code === 'BAD_JPEG');
 });
 
 /** One scan per component, with a DQT redefining tables 0 and 1 before the second scan. */

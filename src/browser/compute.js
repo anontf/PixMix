@@ -28,7 +28,8 @@ import { apngDelay } from '../core/delay.js';
  * @property {'jpeg'} kind @property {string} type @property {Uint8Array} restored
  * @property {Uint8Array} scrambled  the scrambled JPEG
  * @property {Uint8Array|null} exif  APP1 TIFF payload
- * @property {{width: number, height: number}} layout
+ * @property {{width: number, height: number, storedWidth?: number, storedHeight?: number}} layout
+ *           storedWidth/storedHeight: a JPEG scrambled enlarged to whole MCUs is stored larger
  *
  * Both may also have `overlay` ({x, y, width, height, rgba}: the watermark drawn into
  * `restored`, for fading it in on the canvas) or `watermarkError` (it could not be drawn),
@@ -83,7 +84,8 @@ export async function compute(bytes, key, { animated = true, effect = 'dissolve'
       ...w,
       scrambled: bytes,
       exif,
-      layout: { width, height },
+      // storedWidth/storedHeight: only for a scrambled file enlarged to whole MCUs.
+      layout: { width, height, ...(d.layout.storedWidth ? { storedWidth: d.layout.storedWidth, storedHeight: d.layout.storedHeight } : {}) },
       // The page fades the watermark in from the restored image without it.
       ...(animated ? { anim: await jpegAnimation(want, d.layout, bytes, w.overlay ? d.toJpeg(null) : w.restored, w.overlay ? w.restored : null, w.overlay) } : {}),
     };
@@ -262,18 +264,30 @@ async function jpegAnimation(want, layout, scrambled, restored, final, overlay) 
   // Painting requantises whole MCUs, and chroma upsampling (and shrinking) mix in the
   // pixels next to them.
   const fade = overlay ? fadeRect(overlay, plan, tileW, tileH, plan.scale < 1 ? 3 : 2) : undefined;
-  const frames = await decodeFrames([scrambled, restored, final], plan.width, plan.height, width * height).catch(() => null);
+  // An enlarged scrambled JPEG holds the image in its top left.
+  const area = layout.storedWidth ? [{ width, height }] : [];
+  const frames = await decodeFrames([scrambled, restored, final], plan.width, plan.height, width * height, area).catch(() => null);
   if (!frames) return { ...plan, from: null, to: null, final: null, ...(final ? { plain: restored } : {}), order, fade };
   return { ...plan, from: frames[0], to: frames[1], final: frames[2], order, fade };
 }
 
-async function decodeFrames(files, width, height, full) {
+/** `areas[i]`: file i holds the image in that top-left area of a larger frame. */
+async function decodeFrames(files, width, height, full, areas = []) {
   if (typeof OffscreenCanvas === 'undefined' || typeof createImageBitmap === 'undefined') return null;
   const canvas = new OffscreenCanvas(width, height);
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   const out = [];
-  for (const bytes of files) {
+  for (const [i, bytes] of files.entries()) {
     if (!bytes) { out.push(null); continue; }
+    if (areas[i]) {
+      const bitmap = await createImageBitmap(withoutExif(bytes));
+      ctx.clearRect(0, 0, width, height);
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(bitmap, 0, 0, areas[i].width, areas[i].height, 0, 0, width, height);
+      bitmap.close?.();
+      out.push(ctx.getImageData(0, 0, width, height).data);
+      continue;
+    }
     // Shrunk while decoding where the engine can (JPEG decoders scale in the DCT).
     const bitmap = await createImageBitmap(withoutExif(bytes), ...(width * height < full ? [{ resizeWidth: width, resizeHeight: height, resizeQuality: 'medium' }] : []));
     ctx.clearRect(0, 0, width, height);

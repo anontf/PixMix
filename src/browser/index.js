@@ -309,11 +309,14 @@ async function jpegFramesHere(r, fileO) {
   const { width, height } = r.layout;
   const a = r.anim;
   const out = [];
-  for (const file of [r.scrambled, a.plain ?? r.restored, a.plain ? r.restored : null]) {
+  for (const [i, file] of [r.scrambled, a.plain ?? r.restored, a.plain ? r.restored : null].entries()) {
     if (!file) { out.push(null); continue; }
+    // A scrambled file enlarged to whole MCUs is stored larger; the image is its top left.
+    const w = i === 0 ? r.layout.storedWidth ?? width : width, h = i === 0 ? r.layout.storedHeight ?? height : height;
     const im = await loadImage(file, r.type);
-    const applied = swapsAxes(fileO) && width !== height && im.naturalWidth === width ? 1 : fileO; // this browser did not apply it
-    out.push(toRaw(im, width, height, applied, a.width, a.height).getContext('2d').getImageData(0, 0, a.width, a.height).data);
+    const applied = swapsAxes(fileO) && w !== h && im.naturalWidth === w ? 1 : fileO; // this browser did not apply it
+    const raw = toRaw(im, w, h, applied, Math.round((a.width * w) / width), Math.round((a.height * h) / height));
+    out.push(raw.getContext('2d').getImageData(0, 0, a.width, a.height).data);
   }
   [a.from, a.to, a.final] = out;
 }

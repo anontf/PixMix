@@ -9,13 +9,14 @@
 // Every name that becomes a path is checked against a strict pattern first, so nothing can
 // point outside the directory.
 
-import { readFile, writeFile, readdir, rename, rm, mkdir } from 'node:fs/promises';
+import { readFile, readdir, rm, mkdir } from 'node:fs/promises';
 import { readFileSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeDefinition, formatDefinition, formatJson, validateCompiled, ID_PATTERN, FONT_PATTERN, ASSET_PATTERN, FORMAT } from './schema.js';
 import { compileWatermark, watermarkToSvg } from './compile.js';
 import { PixmixError } from '../core/params.js';
+import { atomicWrite } from '../core/files.js';
 
 /** The repository's watermarks/ directory (or $PIXMIX_WATERMARKS_DIR). */
 export const DEFAULT_DIR = process.env.PIXMIX_WATERMARKS_DIR || fileURLToPath(new URL('../../watermarks/', import.meta.url));
@@ -77,14 +78,18 @@ export function watermarkStore(dir = DEFAULT_DIR) {
       return text ? validateCompiled(JSON.parse(text)) : compile(await this.get(id));
     },
 
-    /** Validates, compiles and writes the definition, the compiled file and its preview. */
-    async save(definition) {
+    /**
+     * Validates, compiles and writes the definition, the compiled file and its preview.
+     * `create`: only if there is no watermark with that id yet (else EXISTS, status 409),
+     * decided atomically, so of concurrent creations exactly one succeeds.
+     */
+    async save(definition, { create = false } = {}) {
       const normal = normalizeDefinition(definition);
       const compiled = compile(normal);
       await mkdir(join(root, 'compiled'), { recursive: true });
-      await atomic(def(normal.id), formatDefinition(normal));
-      await atomic(out(normal.id, 'json'), formatJson(compiled));
-      await atomic(out(normal.id, 'svg'), watermarkToSvg(compiled));
+      await atomicWrite(def(normal.id), formatDefinition(normal), create && `Watermark "${normal.id}"`);
+      await atomicWrite(out(normal.id, 'json'), formatJson(compiled));
+      await atomicWrite(out(normal.id, 'svg'), watermarkToSvg(compiled));
       return { definition: normal, compiled };
     },
 
@@ -108,12 +113,6 @@ export function watermarkStore(dir = DEFAULT_DIR) {
       return names.filter((n) => ASSET_PATTERN.test(n)).sort();
     },
   };
-}
-
-async function atomic(file, text) {
-  const tmp = `${file}.${process.pid}.tmp`;
-  await writeFile(tmp, text);
-  await rename(tmp, file);
 }
 
 /**

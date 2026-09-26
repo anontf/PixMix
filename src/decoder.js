@@ -7,6 +7,7 @@ import { unscrambleJxl, unscrambleJxlDetailed, inspectJxl } from './formats/jxl/
 import { PixmixError } from './core/params.js';
 import { loadPainter } from './watermark/load.js';
 import { withLimits } from './core/limits.js';
+import { inspectOther } from './formats/other.js';
 import { checkOptions } from './core/options.js';
 import { loadMetadataTools, metadataToolsIfLoaded } from './meta/load.js';
 
@@ -110,5 +111,8 @@ export async function chooseWatermark(requested, embedded, resolve) {
 export function inspect(input, opts) {
   const bytes = toBytes(input);
   const { limits } = withLimits(bytes, opts);
-  return pick(DECODERS, bytes).inspect(bytes, limits);
+  const format = detectFormat(bytes);
+  if (!format) throw new PixmixError('Unrecognised image format', 'UNSUPPORTED');
+  // The formats pixmix only reads are described the same way as by pixmix/encoder.
+  return DECODERS[format] ? DECODERS[format].inspect(bytes, limits) : inspectOther(bytes, format, limits);
 }

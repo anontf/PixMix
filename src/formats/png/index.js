@@ -15,7 +15,7 @@
 
 import { readChunks, writeChunks, isPng } from './chunks.js';
 import {
-  parseIhdr, pixelBytesOf, decodeRaster, encodeRaster, decodeRasterAsync, encodeRasterAsync,
+  parseIhdr, pixelBytesOf, rawSize, decodeRaster, encodeRaster, decodeRasterAsync, encodeRasterAsync,
 } from './raster.js';
 import { computeLayout, applyMap, fitParams } from '../../core/layout.js';
 import {
@@ -24,7 +24,7 @@ import {
 import { readOrientation } from '../../meta/exif.js';
 import { WATERMARK_TAG, STASH_TAG, encodeWatermark, decodeWatermark, restorePixelStash } from '../../watermark/embed.js';
 import { stashPng } from '../../watermark/paint.js';
-import { checkPixels, checkFrames } from '../../core/limits.js';
+import { checkPixels, checkFrames, resolveLimits, decompressedLimitError } from '../../core/limits.js';
 
 export const MARKER_CHUNK = 'pmIx';
 export { isPng };
@@ -334,13 +334,32 @@ export function rekeyPng(bytes, { from, to, mode, block, transforms, level, salt
 /** What rekey carries over: the compiled watermark, or just its id. */
 export const carried = (w) => (w ? w.compiled ?? { id: w.id } : null);
 
+/**
+ * What decoding checks before inflating, from the chunks alone: the frames (the IDAT image,
+ * then each fcTL after it), their pixels together, and what each frame inflates to.
+ */
+function checkFrameSizes(chunks, ihdr, limits) {
+  const idat = chunks.findIndex((c) => c.type === 'IDAT');
+  const sizes = [{ width: ihdr.width, height: ihdr.height }];
+  chunks.forEach((c, i) => {
+    if (c.type !== 'fcTL' || i < idat || c.data.length !== 26) return;
+    const dv = new DataView(c.data.buffer, c.data.byteOffset, 26);
+    sizes.push({ width: dv.getUint32(4), height: dv.getUint32(8) });
+  });
+  if (sizes.length > 1) checkFrames(sizes.length, sizes.reduce((n, f) => n + f.width * f.height, 0), limits);
+  const { maxDecompressedBytes } = resolveLimits(limits);
+  for (const f of sizes) {
+    checkPixels(f.width, f.height, limits, 'APNG frame');
+    if (rawSize({ ...ihdr, ...f }) > maxDecompressedBytes) throw decompressedLimitError(maxDecompressedBytes);
+  }
+}
+
 /** Cheap: parses chunks only, no inflate. Checks the same size limits as decoding. */
 export function inspectPng(bytes, limits) {
   const chunks = readChunks(bytes, limits);
   const ihdr = parseIhdr(chunks[0].data);
   checkPixels(ihdr.width, ihdr.height, limits);
-  const fctl = chunks.filter((c) => c.type === 'fcTL').length;
-  if (fctl > 1) checkFrames(fctl, 0, limits);
+  checkFrameSizes(chunks, ihdr, limits);
   const marker = readPngMarker(chunks);
   const actl = chunks.find((c) => c.type === 'acTL');
   const dv = actl?.data.length === 8 ? new DataView(actl.data.buffer, actl.data.byteOffset, 8) : null;

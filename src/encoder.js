@@ -12,8 +12,7 @@ import { convert, convertAsync, decodeForJxl, targetFormat, isScrambled, OUTPUT_
 import { PixmixError } from './core/params.js';
 import { withLimits } from './core/limits.js';
 import { checkOptions } from './core/options.js';
-import { readWebpMetadata } from './meta/webp.js';
-import { readOrientation } from './meta/exif.js';
+import { inspectOther } from './formats/other.js';
 import { validateCompiled, ID_PATTERN } from './watermark/schema.js';
 import * as metadataTools from './meta/apply.js';
 import { provideMetadataTools } from './meta/load.js';
@@ -297,12 +296,5 @@ export function inspect(input, opts) {
     return opts?.metadata ? { ...info, meta: readMetadata(bytes, { limits }) } : info;
   }
   if (!format) throw new PixmixError('Unrecognised image format', 'UNSUPPORTED');
-  const out = { format, scrambled: false };
-  const meta = format === 'webp' ? readWebpMetadata(bytes) : null;
-  if (meta) {
-    if (meta.width) Object.assign(out, { width: meta.width, height: meta.height });
-    out.metadata = ['exif', 'icc', 'xmp', 'density'].filter((k) => meta[k]);
-    if (meta.exif) out.orientation = readOrientation(meta.exif);
-  }
-  return out;
+  return inspectOther(bytes, format, limits);
 }

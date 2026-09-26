@@ -392,9 +392,11 @@ function changed(rebuild = false) {
 
 async function normaliseThen(after) {
   const mine = ++seq;
+  const sent = JSON.stringify(def);
   try {
     const r = await api('/api/watermarks/preview', { method: 'POST', body: def });
-    if (mine !== seq) return;
+    // Edited while this was on its way (the next preview is queued): keep the edit.
+    if (mine !== seq || JSON.stringify(def) !== sent) return;
     def = r.definition;
     compiled = r.compiled;
     showSaved();

@@ -274,8 +274,8 @@ Where each kind of metadata ends up:
 | EXIF | `eXIf` | APP1 `Exif` | `Exif` box |
 | ICC profile | `iCCP` | APP2 `ICC_PROFILE`, split across segments | in the codestream |
 | XMP | `iTXt XML:com.adobe.xmp` | APP1 XMP | `xml ` box |
-| Density | `pHYs` | JFIF APP0 | dropped (no field) |
-| Comments | `tEXt Comment` | COM | dropped (no field) |
+| Density | `pHYs` | JFIF APP0 (dots per inch when whole, else per cm) | dropped (no field) |
+| Comments | `tEXt Comment` (`iTXt` beyond Latin-1) | COM (UTF-8) | dropped (no field) |
 
 The pixels stay exactly as stored. They aren't rotated (the EXIF orientation travels with
 the EXIF) and aren't converted to sRGB (the ICC profile travels with the image).

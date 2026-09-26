@@ -22,6 +22,7 @@ import { readJxl, writeJxl, readJxlHeader } from '../formats/jxl/container.js';
 import { loadJxlCodec } from '../formats/jxl/load.js';
 import { exifTiff, unwrapBrob } from './jxl.js';
 import { stripIrbThumbnailSegments, stripMakerNotePreviews } from './thumbnails.js';
+import { commentBytes, pngTextChunk } from './text.js';
 import { parseExif, writeExif, encodeEntry, settableTag, orientationOf } from './tiff.js';
 import { tagName } from './exif-tags.js';
 import { XmpPacket, emptyPacket } from './xmp.js';
@@ -246,12 +247,6 @@ const PNG_BEFORE = new Set(['PLTE', 'tRNS', 'bKGD', 'hIST', 'sPLT', 'acTL', 'fcT
 const RAW_PROFILE = /^Raw profile type (exif|app1|xmp|icc|icm|iptc|8bim)$/i;
 const RAW_KIND = { exif: 'exif', app1: 'exif', xmp: 'xmp', icc: 'icc', icm: 'icc', iptc: 'other', '8bim': 'other' };
 
-/** tEXt when the text is Latin-1, else iTXt (UTF-8). */
-function pngTextChunk(keyword, text) {
-  const k = ascii(keyword);
-  if (/^[\x00-\xff]*$/.test(text) && !text.includes('\0')) return { type: 'tEXt', data: concat(k, Uint8Array.of(0), ascii(text)) };
-  return { type: 'iTXt', data: concat(k, Uint8Array.of(0, 0, 0, 0, 0), utf8.encode(text)) };
-}
 const xmpChunk = (text) => ({ type: 'iTXt', data: concat(ascii('XML:com.adobe.xmp'), Uint8Array.of(0, 0, 0, 0, 0), utf8.encode(text)) });
 
 function classifyPng(c, maxBytes) {
@@ -513,7 +508,7 @@ function applyJpeg(bytes, p, ctx) {
   const coms = info.map((x, i) => (x.kind === 'text' ? i : -1)).filter((i) => i >= 0);
   const comReason = p.kinds.text === 'strip' ? 'text' : removal(p, 'text', 'Comment');
   if (p.set.comments) {
-    const want = p.set.comments.map((c) => ({ marker: M.COM, data: utf8.encode(c).subarray(0, MAX_SEGMENT) }));
+    const want = p.set.comments.map((c) => ({ marker: M.COM, data: commentBytes(c) }));
     const same = coms.length === want.length && coms.every((i, k) => segments[i].data.length === want[k].data.length && segments[i].data.every((v, j) => v === want[k].data[j]));
     if (!same) {
       for (const i of coms) drop(i);

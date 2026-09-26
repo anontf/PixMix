@@ -260,3 +260,30 @@ test('keepThumbnails: data after the image is reported as dropped, and the MPF i
   assert.deepEqual(plain.dropped, []);
   assert.equal(plain.bytes.length, base.length);
 });
+
+test('density: a whole number of dots per inch is written in inches, anything else in cm', () => {
+  const jfifOf = (density) => {
+    const { png } = buildPng({ width: 8, height: 8, data: gradient(8, 8) }, { density });
+    const d = readSegments(convert(png, { format: 'jpeg' }).bytes).segments.find((s) => s.marker === M.APP0).data;
+    return [d[7], (d[8] << 8) | d[9], (d[10] << 8) | d[11]];
+  };
+  assert.deepEqual(jfifOf({ x: 2835, y: 2835, unit: 'meter' }), [1, 72, 72]);
+  assert.deepEqual(jfifOf({ x: 11811, y: 3780, unit: 'meter' }), [1, 300, 96]);
+  assert.deepEqual(jfifOf({ x: 11800, y: 11800, unit: 'meter' }), [2, 118, 118]); // 299.72 dpi
+  assert.deepEqual(jfifOf({ x: 2, y: 1, unit: 'none' }), [0, 2, 1]);
+});
+
+test('comments outside Latin-1 are written as UTF-8 to COM and read back', () => {
+  const text = 'Tōkyō 東京 ✓';
+  const { png } = buildPng({ width: 8, height: 8, data: gradient(8, 8) }, { comments: [text, 'café'] });
+  const jpeg = convert(png, { format: 'jpeg' }).bytes;
+  const coms = readSegments(jpeg).segments.filter((s) => s.marker === M.COM).map((s) => Buffer.from(s.data));
+  assert.deepEqual(coms.map((c) => c.toString('utf8')), [text, 'café']);
+  // Back to PNG: the reader takes UTF-8 COMs as such (and anything else as Latin-1).
+  const back = convert(jpeg, { format: 'png' }).bytes;
+  assert.ok(Buffer.from(back).includes(Buffer.concat([Buffer.from('iTXtComment\0\0\0\0\0', 'latin1'), Buffer.from(text)])), 'iTXt, UTF-8');
+  assert.ok(Buffer.from(back).includes(Buffer.from('tEXtComment\0caf\xe9', 'latin1')), 'tEXt, Latin-1');
+  // A metadata policy writes comments with the same encoder.
+  const set = convert(new Uint8Array(jpeg), { metadata: { set: { comment: [text] } } }).bytes;
+  assert.deepEqual(readSegments(set).segments.filter((s) => s.marker === M.COM).map((s) => Buffer.from(s.data).toString('utf8')), [text]);
+});

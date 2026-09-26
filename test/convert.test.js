@@ -242,3 +242,11 @@ test('lossless output of a lossy source carries a size note; JPEG output does no
   encode(src, { key: 'k', onConvert: (r) => { report = r; } });
   assert.deepEqual(report.notes ?? [], []);
 });
+
+test('PNG comments outside Latin-1 are written as iTXt', () => {
+  const { png } = buildPng({ width: 4, height: 4, data: new Uint8Array(64).fill(255) }, { comments: ['plain', 'naïve ✓'] });
+  const texts = readChunks(png).filter((c) => c.type === 'tEXt' || c.type === 'iTXt');
+  assert.deepEqual(texts.map((c) => c.type), ['tEXt', 'iTXt']);
+  assert.ok(Buffer.from(texts[1].data).includes(Buffer.from('naïve ✓')));
+  assert.deepEqual(convert(convert(png, { format: 'jpeg' }).bytes, { format: 'png' }).transferred.includes('comments'), true);
+});

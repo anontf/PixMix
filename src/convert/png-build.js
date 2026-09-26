@@ -7,6 +7,7 @@
 import { writeChunks } from '../formats/png/chunks.js';
 import { encodeRaster } from '../formats/png/raster.js';
 import { PixmixError } from '../core/params.js';
+import { pngTextChunk } from '../meta/text.js';
 // Metadata is compressed with fflate everywhere (not native zlib) so the same input gives
 // byte-identical chunks on servers and in browsers.
 import { zlibSync } from 'fflate';
@@ -79,7 +80,7 @@ export function buildPng(image, meta = {}) {
     transferred.push('XMP');
   }
   for (const text of meta.comments ?? []) {
-    chunks.push({ type: 'tEXt', data: concat(latin1Bytes('Comment'), new Uint8Array([0]), latin1Bytes(text)) });
+    chunks.push(pngTextChunk('Comment', text));
     if (!transferred.includes('comments')) transferred.push('comments');
   }
   if (raster.plte) chunks.push({ type: 'PLTE', data: raster.plte });

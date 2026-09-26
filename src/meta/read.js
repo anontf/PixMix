@@ -15,6 +15,7 @@ import { tagName, TYPES } from './exif-tags.js';
 import { XmpPacket } from './xmp.js';
 import { describeIcc } from './icc.js';
 import { readIptc } from './iptc.js';
+import { decodeComment } from './text.js';
 import { PixmixError } from '../core/params.js';
 
 const utf8 = new TextDecoder(), latin1 = new TextDecoder('latin1');
@@ -175,11 +176,6 @@ export function readPngText(type, data, maxBytes) {
     if (err?.code === 'LIMIT') throw err;
     return null;
   }
-}
-
-/** COM text: UTF-8 when it is valid UTF-8, else Latin-1. */
-function decodeComment(d) {
-  try { return new TextDecoder('utf-8', { fatal: true }).decode(d); } catch { return latin1.decode(d); }
 }
 
 function readJxlFile(bytes, out, limits) {

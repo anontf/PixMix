@@ -48,16 +48,20 @@ const needsAsync = (what) => new PixmixError(`JPEG XL ${what} is async; use ${wh
  * @property {'pixel'|'block'|'mcu'} [mode]  PNG: block (default: 16 px tiles, flipped/rotated) or pixel. JPEG: always mcu.
  *           JPEG XL: pixel/block (lossless pixels), or mcu, the JPEG route, which is the
  *           default when the source is a JPEG (or a JPEG XL holding one)
- * @property {number} [block=8]        block mode tile size
+ * @property {number} [block=16]       block mode tile size, 2-4096 (smaller for images that
+ *           would get only a few whole tiles)
  * @property {number} [effort]         JPEG XL encoder effort 1-9 (default 2 in pixel mode, else 7)
- * @property {boolean} [transforms=true]  JPEG: also flip/rotate each MCU (lossless)
+ * @property {boolean} [transforms=true]  also flip/rotate each block-mode tile and JPEG MCU
+ *           (lossless)
  * @property {boolean|'auto'} [progressive='auto']  JPEG: write progressive scans; 'auto'
  *           keeps a JPEG source's structure (and means baseline for other sources)
- * @property {number} [level]          zlib level for PNG output
- * @property {number} [quality=90]     JPEG quality when the input is not already JPEG
+ * @property {number} [level]          zlib level for PNG output, 0-9 (default 6; 1 in pixel mode)
+ * @property {number} [quality=90]     JPEG quality (1-100) when the input is not already JPEG
  * @property {'4:2:0'|'4:2:2'|'4:4:4'} [subsampling]  likewise
  * @property {string} [background]     JPEG: colour transparency is flattened onto
  * @property {boolean} [keepThumbnails=false]  keep embedded previews (they are unscrambled!)
+ * @property {Uint8Array} [salt]      at most 255 bytes; default: 16 random bytes per image.
+ *           A fixed salt makes the output reproducible (same key and size: same permutation)
  * @property {object[]} [decoders]     extra input decoders (see plugins/)
  * @property {(r: import('./convert/index.js').ConvertResult) => void} [onConvert]
  *           called with what happened to the input (decoder, metadata transferred/dropped)

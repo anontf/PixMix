@@ -38,6 +38,9 @@
     <label>Visible watermark
       <select id="visWm" class="wm-list" title="drawn on the scrambled image; restoring stays exact"><option value="">none</option></select>
     </label>
+    <label>Metadata
+      <select id="encMetadata" class="meta-list" title="the scrambled file's metadata: what visitors download"><option value="">keep</option><option value="strip-all">preset: strip-all</option><option value="privacy">preset: privacy</option><option value="web">preset: web</option></select>
+    </label>
     <label>Encode on
       <select id="where"><option value="server">server (Node)</option><option value="browser">browser</option></select>
     </label>
@@ -73,6 +76,9 @@
     <label>Watermark
       <select id="decWm" class="wm-list"><option value="auto">the file's own</option><option value="none">none</option></select>
     </label>
+    <label>Metadata
+      <select id="decMetadata" class="meta-list" title="the restored file's metadata (the pixels stay exact)"><option value="">keep</option><option value="strip-all">preset: strip-all</option><option value="privacy">preset: privacy</option><option value="web">preset: web</option></select>
+    </label>
     <button class="primary" id="replay" disabled>Decode again</button>
     <label>New key <input id="newKey" placeholder="rotate to…" size="18"></label>
     <button id="rekey" disabled>Rekey</button>
@@ -86,6 +92,25 @@
       <div id="chunks" class="meta">–</div>
     </div>
   </div>
+
+  <section class="card wm" id="mdEditor">
+    <h2>Metadata profiles <span class="meta" id="mdStatus"></span></h2>
+    <div class="controls wm-bar">
+      <label>Profile <select id="mdPick"></select></label>
+      <button id="mdNew">New</button>
+      <button id="mdCopy">Duplicate</button>
+      <button id="mdDelete">Delete</button>
+      <button class="primary" id="mdSave">Save to metadata-profiles/</button>
+    </div>
+    <div class="wm-body">
+      <form id="mdForm" class="wm-form" autocomplete="off" onsubmit="return false"></form>
+      <div class="wm-preview">
+        <div class="meta" id="mdReport">Load an image above to see what the profile does to its metadata.</div>
+        <div id="mdDiff" class="md-diff"></div>
+        <details class="meta"><summary>profile JSON (as saved)</summary><textarea id="mdJson" rows="12" spellcheck="false"></textarea></details>
+      </div>
+    </div>
+  </section>
 
   <section class="card wm" id="wmEditor">
     <h2>Watermarks <span class="meta" id="wmStatus"></span></h2>
@@ -258,15 +283,27 @@ const toQuery = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, 
 // Watermarks chosen for encoding: ids for the server, compiled watermarks in the browser.
 const compiledWm = (id) => fetch(`/watermarks/${encodeURIComponent(id)}.json`, { cache: 'no-cache' }).then((r) => r.json());
 async function withWatermarks(o, where) {
-  const carry = $('encWm').value, visible = $('visWm').value;
+  const carry = $('encWm').value, visible = $('visWm').value, meta = $('encMetadata').value;
   if (where === 'server') {
-    return { ...o, ...(carry ? { watermark: carry, ...($('encWmRef').checked ? { watermarkEmbed: 'id' } : {}) } : {}), ...(visible ? { visibleWatermark: visible } : {}) };
+    return { ...o, ...(carry ? { watermark: carry, ...($('encWmRef').checked ? { watermarkEmbed: 'id' } : {}) } : {}), ...(visible ? { visibleWatermark: visible } : {}), ...(meta ? { metadata: meta } : {}) };
   }
   return {
     ...o,
     ...(carry ? { watermark: $('encWmRef').checked ? { id: carry } : await compiledWm(carry) } : {}),
     ...(visible ? { visibleWatermark: await compiledWm(visible) } : {}),
+    ...(meta ? { metadata: await policyFor(meta) } : {}),
   };
+}
+
+// Metadata pickers: '' keeps everything, preset names pass as they are, anything else is a
+// saved profile (fetched for the browser; the server looks it up itself).
+const PRESETS = ['keep', 'strip-all', 'privacy', 'web'];
+async function policyFor(value) {
+  if (!value) return undefined;
+  if (PRESETS.includes(value)) return value;
+  const res = await fetch(`/api/metadata-profiles/${encodeURIComponent(value)}`);
+  if (!res.ok) throw new Error((await res.json()).error);
+  return res.json();
 }
 
 $('encode').addEventListener('click', async () => {
@@ -282,8 +319,8 @@ $('encode').addEventListener('click', async () => {
       scrambled = await Enc.encodeAsync(original, { ...wm, decoders: browserDecoders, onConvert: (r) => { report = r; } });
     }
     // Reference for verification: the input as the encoder saw it before scrambling
-    // (sanitised, or converted), recomputed in the browser.
-    reference = report?.bytes ?? (await Enc.convertAsync(original, { ...opts, decoders: browserDecoders })).bytes;
+    // (sanitised, or converted, with the metadata policy applied), recomputed in the browser.
+    reference = report?.bytes ?? (await Enc.convertAsync(original, { ...opts, metadata: await policyFor($('encMetadata').value), decoders: browserDecoders })).bytes;
   } catch (err) {
     $('scrMeta').innerHTML = `<span class="bad">${esc(err.message)}</span>`;
     return;
@@ -302,7 +339,17 @@ function describe(report) {
   }
   if (report.dropped.length) bits.push(`<span class="bad">dropped: ${esc(report.dropped.join(', '))}</span>`);
   if (report.notes?.length) bits.push(`<span class="bad">note: ${esc(report.notes.join('; '))}</span>`);
+  if (report.metadata) bits.push(describeMetadata(report.metadata));
   return bits.length ? `<br>${bits.join(' · ')}` : '';
+}
+
+/** What a metadata policy did, for the cards. */
+function describeMetadata(m) {
+  const parts = [];
+  if (m.removed.length) parts.push(`removed ${esc(m.removed.join(', '))}`);
+  if (m.set.length) parts.push(`set ${esc(m.set.join(', '))}`);
+  if (m.notes.length) parts.push(`<span class="bad">${esc(m.notes.join('; '))}</span>`);
+  return `metadata <b>${esc(m.policy)}</b>: ${parts.join(' · ') || 'nothing to change'}`;
 }
 
 function showScrambled(note, report) {
@@ -334,6 +381,7 @@ async function runDecode() {
       duration: Number($('duration').value),
       worker: $('worker').checked,
       watermark: $('decWm').value === 'auto' ? undefined : $('decWm').value === 'none' ? false : $('decWm').value,
+      metadata: await policyFor($('decMetadata').value),
       onProgress: (p) => { $('bar').style.width = `${p * 100}%`; },
     });
   } catch (err) {
@@ -343,7 +391,9 @@ async function runDecode() {
   $('decTime').textContent = ms(performance.now() - t0);
   try {
     const drawn = $('decWm').value === 'none' ? null : $('decWm').value === 'auto' ? Enc.inspect(scrambled).watermark?.id : $('decWm').value;
-    $('decMeta').innerHTML = await verify() + (drawn ? ` · watermark <b>${esc(drawn)}</b> drawn on the shown image (the check above is the exact restore)` : '');
+    const md = $('decMetadata').value;
+    $('decMeta').innerHTML = await verify() + (drawn ? ` · watermark <b>${esc(drawn)}</b> drawn on the shown image (the check above is the exact restore)` : '')
+      + (md ? ` · restored with metadata <b>${esc(md)}</b>` : '');
   } catch (err) {
     $('decMeta').innerHTML = `<span class="bad">verification failed: ${esc(err.message)}</span>`;
   }
@@ -366,8 +416,11 @@ async function verify() {
   // the <img> shows) with the (sanitised) original JPEG.
   const info = Enc.inspect(scrambled);
   const jpegRoute = info.format === 'jxl' && info.mode === 'mcu';
-  const restored = jpegRoute ? (await Dec.restoreForDisplay(scrambled, { key })).bytes : await Dec.decodeAsync(scrambled, { key });
-  const ref = jpegRoute ? (await Enc.convertAsync(original, { format: 'jpeg' })).bytes : reference;
+  // With a decoding policy, the restored file's metadata is the reference's with it applied.
+  const decPolicy = await policyFor($('decMetadata').value);
+  const restored = jpegRoute ? (await Dec.restoreForDisplay(scrambled, { key, metadata: decPolicy })).bytes : await Dec.decodeAsync(scrambled, { key, metadata: decPolicy });
+  let ref = jpegRoute ? (await Enc.convertAsync(original, { format: 'jpeg', metadata: await policyFor($('encMetadata').value) })).bytes : reference;
+  if (decPolicy) ref = (await Enc.applyMetadataAsync(ref, decPolicy)).bytes;
   const [a, b] = await Promise.all([rgba(ref), rgba(restored)]);
   let diff = 0, maxDelta = 0;
   for (let i = 0; i < a.length; i++) {
@@ -448,5 +501,6 @@ $('publish').addEventListener('click', async () => {
 });
 </script>
 <script type="module" src="/watermarks.js"></script>
+<script type="module" src="/metadata.js"></script>
 </body>
 </html>

@@ -2,9 +2,9 @@
 
 import { compute, transferables } from './compute.js';
 
-self.onmessage = async ({ data: { id, bytes, key, animated, limits, watermark } }) => {
+self.onmessage = async ({ data: { id, bytes, key, animated, limits, watermark, metadata } }) => {
   try {
-    const result = await compute(bytes, key, { animated, limits, watermark });
+    const result = await compute(bytes, key, { animated, limits, watermark, metadata });
     self.postMessage({ id, ok: true, result }, transferables(result));
   } catch (err) {
     self.postMessage({ id, ok: false, error: { name: err?.name, message: err?.message ?? String(err), code: err?.code } });

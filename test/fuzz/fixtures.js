@@ -17,6 +17,7 @@ import { decodeFrame } from '../../src/formats/jpeg/decode.js';
 import { assembleJpeg } from '../../src/formats/jpeg/encode.js';
 import { brotliCompressSync, deflateSync } from 'node:zlib';
 import { compileWatermark } from '../../src/watermark/compile.js';
+import { writeExif, encodeEntry, settableTag } from '../../src/meta/tiff.js';
 
 export const KEY = 'fuzz-key';
 const SALT = new Uint8Array(16).fill(7);
@@ -109,6 +110,53 @@ function jpegWithMetadata(jpeg) {
   return writeSegments([...extra, ...segments.filter((s) => s.marker !== M.APP0)], ascii('trailing motion photo'));
 }
 
+/**
+ * EXIF with every structure the policies edit: IFD0, Exif (with a MakerNote and Interop),
+ * GPS, an IFD1 thumbnail, an unknown tag; little- or big-endian.
+ */
+function richExif(le, thumb) {
+  const e = { le, ifds: { IFD0: [], Exif: [], GPS: [], Interop: [], IFD1: [] }, subIfds: [], makerNoteOffset: null, warnings: [] };
+  const put = (name, v) => { const info = settableTag(name); e.ifds[info.ifd].push(encodeEntry(info, v, le)); };
+  put('Make', 'Fuzzcam'); put('Model', 'F1'); put('Orientation', 6); put('Artist', 'Someone'); put('DateTime', '2024:01:02 03:04:05');
+  put('XPAuthor', 'Someone'); put('DateTimeOriginal', '2024:01:02 03:04:05'); put('BodySerialNumber', 'SN1'); put('FNumber', 2.8);
+  put('UserComment', 'hello'); put('GPSLatitudeRef', 'N'); put('GPSLatitude', [48, 51, 24]); put('GPSAltitude', 35.5);
+  e.ifds.Exif.push({ tag: 0x927c, type: 7, count: 12, data: Uint8Array.from('MAKERNOTE123', (c) => c.charCodeAt(0)) });
+  e.ifds.IFD0.push({ tag: 0xc0de, type: 7, count: 6, data: Uint8Array.of(1, 2, 3, 4, 5, 6) });
+  e.ifds.Interop.push({ tag: 1, type: 2, count: 4, data: ascii('R98\0') });
+  e.ifds.IFD1.push({ tag: 0x0103, type: 3, count: 1, data: le ? Uint8Array.of(6, 0) : Uint8Array.of(0, 6) },
+    { tag: 0x0201, type: 4, count: 1, data: new Uint8Array(4), blobs: [thumb] }, { tag: 0x0202, type: 4, count: 1, data: u32le(thumb.length, le) });
+  return writeExif(e).tiff;
+}
+const u32le = (v, le) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, v, le); return b; };
+
+const RICH_XMP = '<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+  + '<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:exif="http://ns.adobe.com/exif/1.0/" '
+  + 'xmp:CreatorTool="fuzz &amp; co" exif:GPSLatitude="48,51N"><dc:creator><rdf:Seq><rdf:li>Someone</rdf:li></rdf:Seq></dc:creator>'
+  + '<dc:rights><rdf:Alt><rdf:li xml:lang="x-default">(c) Someone</rdf:li></rdf:Alt></dc:rights><!-- note -->'
+  + '<xmp:Thumbnails><rdf:Alt><rdf:li rdf:parseType="Resource"><xmpGImg:image xmlns:xmpGImg="http://ns.adobe.com/xap/1.0/g/img/">AAAA</xmpGImg:image></rdf:li></rdf:Alt></xmp:Thumbnails>'
+  + '</rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end="w"?>';
+
+/** Photoshop APP13 with IPTC (a creator, a city, keywords) and a digest. */
+function iptcPayload() {
+  const ds = (n, t) => cat(Uint8Array.of(0x1c, 2, n, 0, t.length), ascii(t));
+  const iim = cat(Uint8Array.of(0x1c, 1, 90, 0, 3, 0x1b, 0x25, 0x47), ds(80, 'Someone'), ds(90, 'Paris'), ds(25, 'fuzz'), ds(116, '(c)'));
+  const res = (id, data) => cat(ascii('8BIM'), Uint8Array.of(id >> 8, id & 255, 0, 0), u32(data.length), data, new Uint8Array(data.length & 1));
+  return cat(ascii('Photoshop 3.0\0'), res(0x0404, iim), res(0x0425, new Uint8Array(16).fill(9)));
+}
+
+/** A JPEG with every kind of metadata the policies handle. */
+function jpegWithRichMetadata(jpeg, le) {
+  const { segments } = readSegments(jpeg);
+  const extra = [
+    { marker: M.APP1, data: cat(ascii('Exif\0\0'), richExif(le, jpeg.subarray(0, 48))) },
+    { marker: M.APP1, data: cat(ascii('http://ns.adobe.com/xap/1.0/\0'), new TextEncoder().encode(RICH_XMP)) },
+    { marker: M.APP13, data: iptcPayload() },
+    { marker: 0xeb, data: cat(ascii('JP'), Uint8Array.of(0, 1, 0, 0, 0, 1), u32(38), ascii('jumb'), u32(30), ascii('jumd'), new Uint8Array(16).fill(0x11), Uint8Array.of(3), ascii('c2pa\0')) },
+    { marker: M.COM, data: ascii('comment ✓') },
+  ];
+  return writeSegments([segments[0], ...extra, ...segments.slice(1).filter((s) => s.marker !== M.APP1)]);
+}
+
 /** A JPEG re-assembled with restart markers every 2 MCUs. */
 function withRestarts(jpeg) {
   const { segments } = readSegments(jpeg);
@@ -166,6 +214,29 @@ export async function buildFixtures() {
     { type: 'IDAT', data: encodeRaster({ width: 24, height: 16, depth: 8, colorType: 6, interlace: 0 }, rgba(24, 16, 2, true)) },
     { type: 'IEND', data: new Uint8Array(0) },
   ]));
+  // Metadata of every kind, for the policies (both EXIF byte orders), plain and scrambled
+  // with a policy applied.
+  const rich = jpegWithRichMetadata(baseline, true);
+  add('jpeg:rich-metadata', rich, { weight: 1.5 });
+  add('jpeg:rich-metadata-mm', jpegWithRichMetadata(baseline, false), { weight: 1 });
+  const richPng = writeChunks([
+    { type: 'IHDR', data: cat(u32(24, 16), Uint8Array.of(8, 6, 0, 0, 0)) },
+    { type: 'iCCP', data: cat(ascii('icc\0\0'), deflateSync(new Uint8Array(200).map((_, i) => (i === 16 ? 0x52 : i === 17 ? 0x47 : i === 18 ? 0x42 : i === 19 ? 0x20 : i === 36 ? 0x61 : i === 37 ? 0x63 : i === 38 ? 0x73 : i === 39 ? 0x70 : i)))) },
+    { type: 'gAMA', data: u32(45455) },
+    { type: 'eXIf', data: richExif(false, baseline.subarray(0, 40)) },
+    { type: 'iTXt', data: cat(ascii('XML:com.adobe.xmp\0\0\0\0\0'), new TextEncoder().encode(RICH_XMP)) },
+    { type: 'tEXt', data: cat(ascii('Author\0Someone')) },
+    { type: 'zTXt', data: cat(ascii('Raw profile type exif\0\0'), deflateSync(ascii('\nexif\n 4\n45786966\n'))) },
+    { type: 'tIME', data: Uint8Array.of(7, 232, 1, 2, 3, 4, 5) },
+    { type: 'caBX', data: ascii('jumbc2pa') },
+    { type: 'pHYs', data: cat(u32(2835, 2835), Uint8Array.of(1)) },
+    { type: 'IDAT', data: encodeRaster({ width: 24, height: 16, depth: 8, colorType: 6, interlace: 0 }, rgba(24, 16, 4, true)) },
+    { type: 'IEND', data: new Uint8Array(0) },
+  ]);
+  add('png:rich-metadata', richPng, { weight: 1.5 });
+  const web = { preset: 'web', set: { artist: 'Vivi', copyright: 'Vivi', exif: { Software: 'fuzz' } } };
+  scrambled('jpeg:scrambled-policy', rich, { metadata: 'privacy' }, 1);
+  scrambled('png:scrambled-policy', richPng, { metadata: web, mode: 'block', block: 4 }, 1);
   scrambled('jpeg:scrambled', baseline, {}, 2);
   scrambled('jpeg:scrambled-progressive', p444, {}, 2);
   scrambled('jpeg:scrambled-no-transforms', progressive, { transforms: false });
@@ -196,6 +267,9 @@ export async function buildFixtures() {
   add('jxl:scrambled-icc', await encodeAsync(iccJxl, { key: KEY, salt: SALT, mode: 'pixel', effort: 1 }), { scrambled: true, weight: 0.7 });
   add('png:icc-p3', p3, { weight: 0.5 });
   // JPEG route: recompressed JPEGs, now in-process (baseline, progressive, 4:4:4, grey).
+  add('jxl:rich-metadata', writeJxl([{ type: 'Exif', data: cat(new Uint8Array(4), richExif(true, baseline.subarray(0, 32))) },
+    { type: 'xml ', data: new TextEncoder().encode(RICH_XMP) }, { type: 'jumb', data: ascii('c2pa manifest') }], cs), { weight: 1 });
+  add('jxl:jpeg-route-rich-metadata', await codec.transcodeJpeg(convert(rich).bytes), { weight: 0.5 });
   add('jxl:jpeg-route', await codec.transcodeJpeg(baseline), { weight: 0.5 });
   add('jxl:jpeg-route-progressive', await codec.transcodeJpeg(progressive), { weight: 0.5 });
   add('jxl:scrambled-jpeg-route', await encodeAsync(baseline, { key: KEY, salt: SALT, format: 'jxl' }), { scrambled: true, weight: 1 });

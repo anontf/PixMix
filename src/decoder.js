@@ -7,9 +7,11 @@ import { unscrambleJxl, unscrambleJxlDetailed, inspectJxl } from './formats/jxl/
 import { PixmixError } from './core/params.js';
 import { loadPainter } from './watermark/load.js';
 import { withLimits } from './core/limits.js';
+import { loadMetadataTools, metadataToolsIfLoaded } from './meta/load.js';
 
 export { configureJxl } from './formats/jxl/load.js';
 export { configureWatermarks } from './watermark/load.js';
+export { configureMetadata } from './meta/load.js';
 
 // JPEG XL only decodes asynchronously (its codec is WASM, loaded on first use).
 const DECODERS = {
@@ -25,8 +27,10 @@ export { DEFAULT_LIMITS } from './core/limits.js';
 /**
  * Restores the original image.
  * @param {Uint8Array|ArrayBuffer} input scrambled image bytes
- * @param {{key: string|Uint8Array, level?: number, limits?: Partial<import('./core/limits.js').Limits>}} opts
- *        limits: resource limits for untrusted input (see core/limits.js)
+ * @param {{key: string|Uint8Array, level?: number, limits?: Partial<import('./core/limits.js').Limits>,
+ *   metadata?: object|string, onMetadata?: (report: object) => void}} opts
+ *        limits: resource limits for untrusted input (see core/limits.js). metadata: a
+ *        metadata policy for the restored file (see meta/policy.js); the pixels stay exact
  * @returns {Uint8Array}
  */
 export function decode(input, opts) {
@@ -34,7 +38,22 @@ export function decode(input, opts) {
   const d = pick(DECODERS, bytes);
   if (opts?.watermark) throw new PixmixError('Drawing a watermark is async; use decodeAsync', 'ASYNC_DECODER');
   if (!d.unscramble) throw new PixmixError('JPEG XL decoding is async; use decodeAsync', 'ASYNC_DECODER');
-  return d.unscramble(bytes, withLimits(bytes, opts));
+  opts = withLimits(bytes, opts);
+  if (!opts.metadata) return d.unscramble(bytes, opts);
+  const tools = metadataToolsIfLoaded();
+  if (!tools) throw new PixmixError('A metadata policy needs pixmix\'s metadata module: use decodeAsync, or import pixmix (or pixmix/encoder)', 'ASYNC_DECODER');
+  return d.unscramble(policyApplied(tools, bytes, opts), opts);
+}
+
+/**
+ * PNG and JPEG: the policy is applied to the scrambled file, whose metadata the restored
+ * file copies (pixmix's own chunks are never touched), so the orientation a watermark is
+ * drawn with is the one the restored file ends up with.
+ */
+function policyApplied(tools, bytes, opts) {
+  const { bytes: out, report } = tools.applyMetadata(bytes, opts.metadata, { limits: opts.limits });
+  opts.onMetadata?.(report);
+  return out;
 }
 
 /**
@@ -44,14 +63,21 @@ export function decode(input, opts) {
  *   `resolveWatermark(id)`;
  * - true or 'embedded': the one the file carries (nothing is drawn if it carries none).
  * @param {{key: string|Uint8Array, level?: number, watermark?: object|string|boolean,
- *   resolveWatermark?: (id: string) => object|Promise<object>}} opts
+ *   resolveWatermark?: (id: string) => object|Promise<object>, metadata?: object|string,
+ *   onMetadata?: (report: object) => void}} opts  metadata: a policy for the restored file
  */
 export async function decodeAsync(input, opts) {
-  const bytes = toBytes(input);
+  let bytes = toBytes(input);
   const d = pick(DECODERS, bytes);
   opts = withLimits(bytes, opts);
-  if (!opts.watermark) return d.unscramble ? d.unscramble(bytes, opts) : d.unscrambleAsync(bytes, opts);
   const format = detectFormat(bytes);
+  if (opts.metadata) {
+    const tools = await loadMetadataTools();
+    opts = { ...opts, metadata: tools.normalizePolicy(opts.metadata) };
+    if (format === 'jxl') opts.meta = { tools, policy: opts.metadata, limits: opts.limits, onReport: opts.onMetadata };
+    else bytes = policyApplied(tools, bytes, opts);
+  }
+  if (!opts.watermark) return d.unscramble ? d.unscramble(bytes, opts) : d.unscrambleAsync(bytes, opts);
   const detail = format === 'png' ? unscramblePngDetailed(bytes, opts)
     : format === 'jpeg' ? unscrambleJpegDetailed(bytes, opts) : await unscrambleJxlDetailed(bytes, opts);
   const watermark = await chooseWatermark(opts.watermark, detail.watermark, opts.resolveWatermark);

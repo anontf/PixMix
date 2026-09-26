@@ -216,11 +216,36 @@ function restoreStash(boxes, marker, image, key, limits) {
   }
 }
 
-export async function scrambleJxl(bytes, opts = {}) {
+/** What the pixel route scrambles: the decoded image and the metadata boxes to carry. */
+export async function jxlForScramble(bytes, opts = {}) {
   const { limits } = opts;
   const { boxes } = readChecked(bytes, limits);
   if (readMarkerBox(boxes)) throw new PixmixError('Image is already scrambled (decode it first, or use rekey)', 'ALREADY_SCRAMBLED');
-  return scrambleJxlPixels(await decodeJxlImage(bytes, { limits }), sanitizeBoxes(boxes, opts).boxes, opts);
+  return { image: await decodeJxlImage(bytes, { limits }), boxes: sanitizeBoxes(boxes, opts).boxes };
+}
+
+export async function scrambleJxl(bytes, opts = {}) {
+  const { image, boxes } = await jxlForScramble(bytes, opts);
+  return scrambleJxlPixels(image, boxes, opts);
+}
+
+/**
+ * A metadata policy, where this module decodes and encodes (see encoder.js metaHook):
+ * `meta` is {tools, policy, limits, onReport}, tools being meta/apply.js (passed in, so
+ * the browser decoder only loads it when a policy is used).
+ */
+function policyOnJpeg(meta, jpeg) {
+  if (!meta) return jpeg;
+  const { bytes, report } = meta.tools.applyMetadata(jpeg, meta.policy, { limits: meta.limits });
+  meta.onReport?.(report);
+  return bytes;
+}
+
+function policyOnParts(meta, boxes, image) {
+  if (!meta) return { boxes, image };
+  const parts = meta.tools.applyJxlParts({ boxes, icc: image.icc ?? null }, meta.policy, { limits: meta.limits });
+  meta.onReport?.(parts.report);
+  return { boxes: parts.boxes, image: { ...image, icc: parts.icc } };
 }
 
 // --- JPEG route -------------------------------------------------------------------
@@ -320,13 +345,13 @@ export async function scrambleJpegToJxl(jpeg, { key, transforms, salt, limits, w
  * is not offered). JPEG route: `jpeg` is the unscrambled JPEG's detail (see formats/jpeg)
  * and `toJxl` recompresses it.
  */
-export async function unscrambleJxlDetailed(bytes, { key, effort, display = false, limits } = {}) {
+export async function unscrambleJxlDetailed(bytes, { key, effort, display = false, limits, meta } = {}) {
   const { boxes } = readChecked(bytes, limits);
   const marker = readMarkerBox(boxes);
   if (!marker) throw new PixmixError('Image carries no pixmix marker', 'NOT_SCRAMBLED');
   const codec = await loadJxlCodec();
   if (marker.params.mode === 'mcu') {
-    const scrambledJpeg = await scrambledJpegOf(bytes, limits);
+    const scrambledJpeg = policyOnJpeg(meta, await scrambledJpegOf(bytes, limits));
     const jpeg = unscrambleJpegDetailed(scrambledJpeg, { key, limits });
     return { route: 'jpeg', params: marker.params, jpeg, watermark: jpeg.watermark, toJxl: (paint) => codec.transcodeJpeg(jpeg.toJpeg(paint)) };
   }
@@ -351,7 +376,10 @@ export async function unscrambleJxlDetailed(bytes, { key, effort, display = fals
     watermark: jxlWatermark(boxes, limits),
     /** The restored image with a watermark drawn on a copy (`paint`: {painter, watermark}). */
     paint: paintImage,
-    toJxl: display ? null : async (paint) => wrapCodestream(kept, await codec.encode(paintImage(paint), { effort: effort ?? 7 })),
+    toJxl: display ? null : async (paint) => {
+      const out = policyOnParts(meta, kept, paintImage(paint));
+      return wrapCodestream(out.boxes, await codec.encode(out.image, { effort: effort ?? 7 }));
+    },
   };
 }
 
@@ -361,20 +389,20 @@ export async function unscrambleJxl(bytes, opts) {
   return (await unscrambleJxlDetailed(bytes, opts)).toJxl();
 }
 
-export async function rekeyJxl(bytes, { from, to, mode, block, salt, effort, transforms, limits, watermark, visibleWatermark } = {}) {
+export async function rekeyJxl(bytes, { from, to, mode, block, salt, effort, transforms, limits, watermark, visibleWatermark, meta } = {}) {
   const { boxes } = readChecked(bytes, limits);
   const marker = readMarkerBox(boxes);
   if (!marker) throw new PixmixError('Image carries no pixmix marker', 'NOT_SCRAMBLED');
   if (marker.params.mode === 'mcu') {
     if (mode && mode !== 'mcu') throw new PixmixError('This JPEG XL holds a scrambled JPEG; it can only be re-keyed in mode "mcu"', 'BAD_OPTION');
-    const jpeg = await scrambledJpegOf(bytes, limits);
+    const jpeg = policyOnJpeg(meta, await scrambledJpegOf(bytes, limits));
     return toJxlWithMarker(rekeyJpeg(jpeg, { from, to, transforms, salt, progressive: false, limits, watermark, visibleWatermark }), limits);
   }
   if (mode === 'mcu') throw new PixmixError('Mode "mcu" needs a JPEG XL that holds a JPEG', 'BAD_OPTION');
   const scrambled = await decodeJxlImage(bytes, { limits });
   const visible = restoreStash(boxes, marker, scrambled, from, limits);
-  const { image } = mapFrames(from, marker.params, scrambled, 'unscramble', marker.check);
-  const kept = boxes.filter((b) => !STRUCTURE.has(b.type));
+  const restored = mapFrames(from, marker.params, scrambled, 'unscramble', marker.check).image;
+  const { boxes: kept, image } = policyOnParts(meta, boxes.filter((b) => !STRUCTURE.has(b.type)), restored);
   return scrambleJxlPixels(image, kept, {
     key: to, salt, effort,
     mode: mode ?? marker.params.mode,

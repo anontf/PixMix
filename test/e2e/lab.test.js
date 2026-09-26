@@ -6,15 +6,19 @@ import { spawn } from 'node:child_process';
 import { mkdtempSync, cpSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import sharp from 'sharp';
 import { launch, engines, openPage } from './harness.js';
+import { readMetadata } from '../../src/index.js';
 
-let proc, base, wmDir;
+let proc, base, wmDir, mdDir;
 before(async () => {
-  // The lab saves watermarks: give it a copy of the directory, not the repository's.
+  // The lab saves watermarks and metadata profiles: give it copies of the directories.
   wmDir = mkdtempSync(join(tmpdir(), 'pixmix-lab-wm-'));
   cpSync(new URL('../../watermarks', import.meta.url).pathname, wmDir, { recursive: true });
+  mdDir = mkdtempSync(join(tmpdir(), 'pixmix-lab-md-'));
+  cpSync(new URL('../../metadata-profiles', import.meta.url).pathname, mdDir, { recursive: true });
   proc = spawn(process.execPath, [new URL('../../server/server.js', import.meta.url).pathname], {
-    env: { ...process.env, PORT: '0', PIXMIX_WATERMARKS_DIR: wmDir }, stdio: ['ignore', 'pipe', 'inherit'],
+    env: { ...process.env, PORT: '0', PIXMIX_WATERMARKS_DIR: wmDir, PIXMIX_METADATA_PROFILES_DIR: mdDir }, stdio: ['ignore', 'pipe', 'inherit'],
   });
   base = await new Promise((resolve, reject) => {
     proc.stdout.on('data', (d) => { const m = /http:\/\/[\d.]+:\d+/.exec(String(d)); if (m) resolve(m[0]); });
@@ -24,7 +28,13 @@ before(async () => {
 after(async () => {
   proc?.kill();
   if (wmDir) rmSync(wmDir, { recursive: true, force: true });
+  if (mdDir) rmSync(mdDir, { recursive: true, force: true });
 });
+
+/** A photo-like JPEG with EXIF (owner, device, GPS), as a phone would upload. */
+const photo = () => sharp({ create: { width: 96, height: 64, channels: 3, background: '#4a7' } })
+  .withExif({ IFD0: { Artist: 'Jane Doe', Make: 'Cam', Model: 'P1' }, IFD2: { DateTimeOriginal: '2024:01:02 03:04:05' }, IFD3: { GPSLatitudeRef: 'N', GPSLatitude: '48/1 51/1 2400/100' } })
+  .jpeg().toBuffer();
 
 async function encodeInLab(p, { sample, format, where, mode = '' }) {
   await p.selectOption('#sampleType', sample);
@@ -115,6 +125,69 @@ for (const { name: engine, skip } of await engines()) describe(engine, { skip },
     await p.click('#wmDelete');
     await p.waitForFunction(() => /deleted/.test(document.querySelector('#wmStatus').textContent));
     assert.equal(existsSync(join(wmDir, `${id}.json`)), false);
+    assert.deepEqual(errors, []);
+    await p.close();
+  });
+
+  test('lab metadata profiles: before/after, save, encode and decode with them', async () => {
+    const { page: p, errors } = await openPage(browser);
+    await p.goto(base);
+    await p.waitForFunction(() => document.querySelectorAll('#mdPick option').length === 2 && document.querySelectorAll('#encMetadata option').length === 6);
+    await p.setInputFiles('#file', { name: 'photo.jpg', mimeType: 'image/jpeg', buffer: await photo() });
+    await p.waitForFunction(() => !document.querySelector('#encode').disabled);
+    // The default web profile: everything goes but the orientation, Vivi is set.
+    await p.selectOption('#mdPick', 'vivi-web');
+    await p.waitForFunction(() => /after \(vivi-web\)/.test(document.querySelector('#mdDiff').textContent), null, { timeout: 20000 });
+    const rows = await p.$$eval('#mdDiff tr', (trs) => trs.map((tr) => [tr.className, ...[...tr.cells].map((c) => c.textContent)]));
+    const row = (k) => rows.find((r) => r[1] === k);
+    assert.deepEqual(row('EXIF GPS:GPSLatitude'), ['gone', 'EXIF GPS:GPSLatitude', '48, 51, 24', '']);
+    assert.deepEqual(row('EXIF IFD0:Artist'), ['changed', 'EXIF IFD0:Artist', 'Jane Doe', 'Vivi']);
+    assert.equal(row('EXIF IFD0:Copyright')[0], 'new');
+    assert.match(await p.textContent('#mdReport'), /set: EXIF Artist, EXIF Copyright/);
+    // A new one, edited in the form, saved.
+    const id = `lab-${engine}`;
+    await p.click('#mdNew');
+    await p.waitForFunction(() => /not saved/.test(document.querySelector('#mdStatus').textContent));
+    await p.fill('#mdForm input[name="id"]', id);
+    await p.selectOption('#mdForm select[name="preset"]', 'privacy');
+    await p.fill('#mdForm input[name="set.copyright"]', '');
+    await p.fill('#mdForm input[name="set.artist"]', 'Vivi Lab');
+    await p.fill('#mdForm textarea[name="set.exif"]', 'Software=pixmix lab');
+    await p.selectOption('#mdForm select[name="kind.icc"]', 'strip');
+    await p.waitForFunction((i) => new RegExp(`"id": "${i}"`).test(document.querySelector('#mdJson').value) && /pixmix lab/.test(document.querySelector('#mdJson').value)
+      && /after \(/.test(document.querySelector('#mdDiff').textContent) && document.querySelector('#mdDiff').textContent.includes(i), id, { timeout: 20000 });
+    await p.click('#mdSave');
+    await p.waitForFunction(() => /^saved metadata-profiles/.test(document.querySelector('#mdStatus').textContent));
+    assert.deepEqual(JSON.parse(readFileSync(join(mdDir, `${id}.json`), 'utf8')), { id, name: 'New profile', preset: 'privacy', strip: ['icc'], set: { artist: 'Vivi Lab', exif: { Software: 'pixmix lab' } } });
+    await p.waitForFunction((i) => [...document.querySelectorAll('#encMetadata option, #decMetadata option')].filter((o) => o.value === i).length === 2, id);
+    // Encoding with it, on the server and in the browser: the scrambled file carries it, and
+    // decoding with strip-all gives the same pixels with only the orientation left.
+    for (const where of ['server', 'browser']) {
+      await p.selectOption('#encMetadata', id);
+      await p.selectOption('#decMetadata', where === 'server' ? '' : 'strip-all');
+      await p.selectOption('#where', where);
+      await p.fill('#duration', '200');
+      await p.evaluate(() => { for (const id of ['scrMeta', 'decMeta']) document.getElementById(id).textContent = ''; });
+      await p.click('#encode');
+      await p.waitForFunction(() => /✓|✗|≈|Error/.test(document.querySelector('#decMeta').textContent + document.querySelector('#scrMeta').textContent), null, { timeout: 60000 });
+      const scr = await p.textContent('#scrMeta'), dec = await p.textContent('#decMeta');
+      assert.match(scr, new RegExp(`metadata ${id}: removed .*EXIF Artist.*GPS.*set EXIF Artist, EXIF Software`), scr);
+      assert.match(dec, /✓ pixel-identical/, dec);
+      assert.match(dec, /✓ metadata chunks identical/, dec);
+      if (where === 'browser') assert.match(dec, /restored with metadata strip-all/);
+      const shown = await p.evaluate(async () => Array.from(new Uint8Array(await (await fetch(document.querySelector('#decStage img').src)).arrayBuffer())));
+      const tags = readMetadata(new Uint8Array(shown)).exif?.tags.map((t) => [t.name, t.value]) ?? [];
+      const names = tags.map(([n]) => n);
+      if (where === 'browser') assert.deepEqual(tags, [], 'strip-all on decode (orientation 1 needs no EXIF)');
+      else {
+        assert.deepEqual(tags.filter(([n]) => n === 'Artist' || n === 'Software'), [['Software', 'pixmix lab'], ['Artist', 'Vivi Lab']]); // by tag number
+        assert.ok(names.includes('Make') && !names.some((n) => /GPS|DateTime/.test(n)), names.join());
+      }
+    }
+    p.once('dialog', (d) => d.accept());
+    await p.click('#mdDelete');
+    await p.waitForFunction(() => /deleted/.test(document.querySelector('#mdStatus').textContent));
+    assert.equal(existsSync(join(mdDir, `${id}.json`)), false);
     assert.deepEqual(errors, []);
     await p.close();
   });

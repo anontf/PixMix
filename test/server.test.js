@@ -13,14 +13,16 @@ import { readPng } from '../src/formats/png/index.js';
 const ROOT = new URL('..', import.meta.url).pathname;
 const built = existsSync(join(ROOT, 'dist/pixmix-encoder.mjs'));
 const skip = built ? false : 'needs dist/ (npm run build)';
-let proc, base, dir;
+let proc, base, dir, profilesDir;
 
 before(async () => {
   if (!built) return;
   dir = mkdtempSync(join(tmpdir(), 'pixmix-server-'));
   cpSync(join(ROOT, 'watermarks'), dir, { recursive: true });
+  profilesDir = mkdtempSync(join(tmpdir(), 'pixmix-server-profiles-'));
+  cpSync(join(ROOT, 'metadata-profiles'), profilesDir, { recursive: true });
   proc = spawn(process.execPath, [join(ROOT, 'server/server.js')], {
-    env: { ...process.env, PORT: '0', PIXMIX_WATERMARKS_DIR: dir }, stdio: ['ignore', 'pipe', 'inherit'],
+    env: { ...process.env, PORT: '0', PIXMIX_WATERMARKS_DIR: dir, PIXMIX_METADATA_PROFILES_DIR: profilesDir }, stdio: ['ignore', 'pipe', 'inherit'],
   });
   base = await new Promise((resolve, reject) => {
     proc.stdout.on('data', (d) => { const m = /http:\/\/[\d.]+:\d+/.exec(String(d)); if (m) resolve(m[0]); });
@@ -30,6 +32,7 @@ before(async () => {
 after(() => {
   proc?.kill();
   if (dir) rmSync(dir, { recursive: true, force: true });
+  if (profilesDir) rmSync(profilesDir, { recursive: true, force: true });
 });
 
 const call = async (path, { method = 'GET', body, json = true } = {}) => {
@@ -105,4 +108,57 @@ test('encode and decode endpoints take watermark ids', { skip }, async () => {
   assert.equal(r.status, 200, 'an id-only watermark is looked up in the store');
   assert.equal((await call('/api/decode?key=k&watermark=../x', { method: 'POST', body: scrambled })).status, 400);
   assert.equal((await call('/api/encode?key=k&watermark=nope', { method: 'POST', body: png })).status, 404);
+});
+
+test('metadata profile API: list, read, create, update, delete; strict ids and bodies', { skip }, async () => {
+  let r = await call('/api/metadata-profiles');
+  assert.deepEqual(r.body.profiles.map((p) => p.id), ['vivi-privacy', 'vivi-web']);
+  assert.deepEqual(r.body.presets, ['keep', 'strip-all', 'privacy', 'web']);
+  assert.ok(r.body.kinds.includes('exif') && r.body.groups.includes('gps'));
+  assert.equal((await call('/api/metadata-profiles/vivi-web')).body.set.artist, 'Vivi');
+  const p = { id: 'api-test', name: 'Test', preset: 'privacy', set: { copyright: 'Vivi' } };
+  r = await call('/api/metadata-profiles', { method: 'POST', body: p });
+  assert.equal(r.status, 201);
+  assert.equal(readFileSync(join(profilesDir, 'api-test.json'), 'utf8'), `${JSON.stringify(p, null, 2)}\n`);
+  assert.equal((await call('/api/metadata-profiles', { method: 'POST', body: p })).status, 409);
+  r = await call('/api/metadata-profiles/api-test', { method: 'PUT', body: { ...p, set: { copyright: 'V2' } } });
+  assert.equal(r.status, 200);
+  assert.equal(JSON.parse(readFileSync(join(profilesDir, 'api-test.json'), 'utf8')).set.copyright, 'V2');
+  assert.equal((await call('/api/metadata-profiles/api-test', { method: 'PUT', body: { ...p, id: 'other' } })).status, 400);
+  for (const body of [{ id: 'web' }, { id: 'x', strip: ['pixels'] }, { id: 'x', extra: 1 }, { id: 'x', set: { exif: { MakerNote: 'x' } } }, { id: 'X' }, { id: '../x' }]) {
+    const res = await call('/api/metadata-profiles', { method: 'POST', body });
+    assert.equal(res.status, 400, JSON.stringify(body));
+    assert.ok(res.body.error);
+  }
+  for (const path of ['/api/metadata-profiles/..%2F..%2Fpackage', '/api/metadata-profiles/A', '/api/metadata-profiles/a.json', '/api/metadata-profiles/%2e%2e']) {
+    assert.ok([400, 404].includes((await call(path)).status), path);
+    assert.ok([400, 404].includes((await call(path, { method: 'PUT', body: { id: 'x' } })).status), path);
+  }
+  assert.equal((await call('/api/metadata-profiles/api-test', { method: 'DELETE' })).status, 200);
+  assert.equal((await call('/api/metadata-profiles/api-test')).status, 404);
+  assert.equal((await call('/api/metadata-profiles/api-test', { method: 'DELETE' })).status, 404);
+});
+
+test('encode, decode, rekey and inspect endpoints take ?metadata=', { skip }, async () => {
+  const jpeg = new Uint8Array(await sharp({ create: { width: 64, height: 48, channels: 3, background: '#406080' } })
+    .withExif({ IFD0: { Artist: 'Jane Doe', Make: 'Cam' }, IFD3: { GPSLatitudeRef: 'N', GPSLatitude: '48/1 51/1 2400/100' } }).jpeg().toBuffer());
+  let res = await fetch(`${base}/api/encode?key=k&metadata=vivi-web`, { method: 'POST', body: jpeg });
+  assert.equal(res.status, 200);
+  const report = JSON.parse(res.headers.get('X-Pixmix-Convert'));
+  assert.deepEqual(report.metadata.set, ['EXIF Artist', 'EXIF Copyright']);
+  const scrambled = new Uint8Array(await res.arrayBuffer());
+  let r = await call('/api/inspect?metadata=1', { method: 'POST', body: scrambled });
+  assert.deepEqual(r.body.meta.exif.tags.map((t) => t.value), ['Vivi', 'Vivi']);
+  res = await fetch(`${base}/api/decode?key=k&metadata=strip-all`, { method: 'POST', body: scrambled });
+  assert.match(res.headers.get('X-Pixmix-Metadata'), /EXIF \(2 tags\)/);
+  r = await call('/api/inspect?metadata=1', { method: 'POST', body: new Uint8Array(await res.arrayBuffer()) });
+  assert.equal(r.body.meta.exif, null);
+  res = await fetch(`${base}/api/rekey?from=k&to=k2&metadata=vivi-privacy`, { method: 'POST', body: scrambled });
+  assert.equal(res.status, 200);
+  assert.ok(JSON.parse(res.headers.get('X-Pixmix-Metadata')).removed.some((x) => /Artist/.test(x)));
+  // Non-ASCII in reports stays a valid header.
+  res = await fetch(`${base}/api/decode?key=k&metadata=vivi-web`, { method: 'POST', body: scrambled });
+  assert.equal(res.status, 200);
+  assert.equal((await call('/api/encode?key=k&metadata=nope', { method: 'POST', body: jpeg })).status, 404);
+  assert.equal((await call('/api/encode?key=k&metadata=..%2Fx', { method: 'POST', body: jpeg })).status, 400);
 });

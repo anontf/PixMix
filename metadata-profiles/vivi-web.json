@@ -1,0 +1,10 @@
+{
+  "id": "vivi-web",
+  "name": "Web: strip everything, credit Vivi",
+  "description": "What a website serves: only what display needs (ICC profile unless it is plain sRGB, orientation), plus Vivi as artist and copyright holder.",
+  "preset": "web",
+  "set": {
+    "artist": "Vivi",
+    "copyright": "Vivi"
+  }
+}

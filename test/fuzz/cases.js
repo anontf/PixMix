@@ -42,6 +42,14 @@ export async function loadTarget(srcUrl) {
   };
 }
 
+/** Metadata policies the cases apply: presets and ones that set, remove and replace. */
+export const FUZZ_POLICIES = [
+  'strip-all', 'privacy', 'web',
+  { preset: 'web', set: { artist: 'Vivi', copyright: 'Vivi', comment: 'fuzz', orientation: 3, icc: 'srgb' } },
+  { remove: ['exif:GPS/*', 'exif:*Serial*', 'xmp:dc:*', 'iptc:City', 'text:Author', 'other:APP13'], set: { exif: { Software: 'fuzz', XResolution: 72 }, xmp: { 'dc:title': 'T', 'xmp:Rating': '5' }, text: { Title: 'Vi ✓' } } },
+  { strip: ['icc', 'colour', 'orientation'], set: { xmpPacket: '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"/></x:xmpmeta>' } },
+];
+
 /** The mutated input of case `index`, and a description of how it was made. */
 export function makeCase(fixtures, seed, index) {
   const r = rng(caseSeed(seed, index));
@@ -73,12 +81,24 @@ export async function runCase(t, { fixture, bytes, r }, { key, onOp = () => {} }
     ['compute:watermark', () => t.compute(bytes, key, { animated: false, limits, watermark: r.chance(0.5) ? 'embedded' : fuzzWatermark() })],
   ];
   if (fixture.scrambled) ops.push(['rekeyAsync', () => t.rekeyAsync(bytes, { from: key, to: 'other', limits, salt, effort: 1 })]);
+  // Metadata: parsed for inspect, and every kind of policy applied (to scrambled files
+  // too, whose pixmix chunks must survive: decoding afterwards may only fail as before).
+  const policy = r.pick(FUZZ_POLICIES);
+  ops.push(['inspect:metadata', () => t.inspect(bytes, { limits, metadata: true })]);
+  ops.push(['applyMetadata', () => t.applyMetadata(bytes, policy, { limits })]);
+  ops.push(['applyMetadataAsync', () => t.applyMetadataAsync(bytes, policy, { limits })]);
+  if (fixture.scrambled) {
+    ops.push(['decodeAsync:metadata', () => t.decodeAsync(bytes, { key, limits, effort: 1, metadata: policy })]);
+    ops.push(['compute:metadata', () => t.compute(bytes, key, { animated: false, limits, metadata: policy })]);
+  }
   // Converting to each output format covers the decoders and builders the defaults skip.
   const to = r.pick(['png', 'jpeg', 'jxl']);
   ops.push([`convertAsync:${to}`, () => t.convertAsync(bytes, { format: to, limits, decoders })]);
   // Whatever encode accepts must come back: decoding its output may not fail, and PNG pixels
   // and JPEG coefficients must be exactly the input's (pixmix promises lossless).
   if (!fixture.scrambled) ops.push(['roundtrip', () => roundtrip(t, bytes, { key, limits, salt })]);
+  // With a policy too: the metadata changes, the pixels / coefficients must not.
+  if (!fixture.scrambled && r.chance(0.5)) ops.push(['roundtrip:metadata', () => roundtrip(t, bytes, { key, limits, salt, metadata: policy })]);
   // And with a visible watermark on the scrambled image, restoring must still be exact.
   if (!fixture.scrambled && r.chance(0.5)) {
     ops.push(['roundtrip:visible', () => roundtrip(t, bytes, { key, limits, salt, watermark: fuzzWatermark(), visibleWatermark: fuzzWatermark() })]);
@@ -118,6 +138,10 @@ async function roundtrip(t, bytes, { key, limits, salt, ...extra }) {
   const same = (a, b) => a.length === b.length && a.every((x, i) => Buffer.from(x).equals(Buffer.from(b[i])));
   if (format === 'png' && t.detectFormat(bytes) === 'png') {
     if (!same(t.readPng(bytes).frames, t.readPng(restored).frames)) throw new Error('roundtrip: PNG pixels differ');
+    if (extra.metadata) { // pixmix's own reading of what it wrote must work
+      t.inspect(restored, { limits: { ...limits, maxInputBytes: Infinity }, metadata: true });
+      t.applyMetadata(restored, extra.metadata);
+    }
   } else if (format === 'jpeg' && t.detectFormat(bytes) === 'jpeg') {
     const coefs = (b) => t.decodeFrame(t.readSegments(b).segments).components.map((c) => c.coefs);
     if (!same(coefs(bytes), coefs(restored))) throw new Error('roundtrip: JPEG coefficients differ');

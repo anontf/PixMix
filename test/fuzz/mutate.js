@@ -103,6 +103,82 @@ function watermarkPayload(d, r) {
   return null;
 }
 
+// --- metadata ------------------------------------------------------------------------
+// EXIF (TIFF) and XMP payloads, aimed at what the metadata parsers walk: IFD entry counts,
+// types, value counts and offsets, IFD pointers; and XML structure (tags, nesting,
+// entities, attributes).
+
+/** Offsets of the IFD entries reachable from IFD0 (following Exif/GPS/next pointers). */
+function tiffEntries(t) {
+  if (t.length < 8 || !((t[0] === 0x49 && t[1] === 0x49) || (t[0] === 0x4d && t[1] === 0x4d))) return null;
+  const le = t[0] === 0x49;
+  const dv = new DataView(t.buffer, t.byteOffset, t.byteLength);
+  const entries = [], ifds = [];
+  const seen = new Set();
+  const walk = (o, depth) => {
+    if (depth > 3 || seen.has(o) || o < 8 || o + 2 > t.length) return;
+    seen.add(o);
+    ifds.push(o);
+    const n = dv.getUint16(o, le);
+    for (let i = 0; i < n && o + 2 + 12 * i + 12 <= t.length; i++) {
+      const e = o + 2 + 12 * i;
+      entries.push(e);
+      const tag = dv.getUint16(e, le);
+      if (tag === 0x8769 || tag === 0x8825 || tag === 0xa005) walk(dv.getUint32(e + 8, le), depth + 1);
+    }
+    const next = o + 2 + 12 * n;
+    if (next + 4 <= t.length) walk(dv.getUint32(next, le), depth + 1);
+  };
+  walk(dv.getUint32(4, le), 0);
+  return { le, dv, entries, ifds };
+}
+
+function tiffPayload(t, r) {
+  const x = tiffEntries(t);
+  if (!x || !x.entries.length) return null;
+  const out = t.slice();
+  const dv = new DataView(out.buffer);
+  const e = r.pick(x.entries);
+  const k = r.below(7);
+  if (k === 0) dv.setUint16(e + 2, r.pick([0, 1, 2, 3, 4, 5, 7, 10, 11, 12, 13, 14, 129, 0xffff]), x.le); // type
+  else if (k === 1) dv.setUint32(e + 4, r.chance(0.5) ? r.pick(INTERESTING32) : dv.getUint32(e + 4, x.le) + r.below(9) - 4, x.le); // count
+  else if (k === 2) dv.setUint32(e + 8, r.chance(0.5) ? r.pick(INTERESTING32) : r.below(out.length + 16), x.le); // value / offset
+  else if (k === 3) dv.setUint16(e, r.pick([0x8769, 0x8825, 0xa005, 0x014a, 0x0201, 0x0202, 0x0111, 0x0117, 0x927c, 0x0112, r.below(65536)]), x.le); // tag
+  else if (k === 4) { const o = r.pick(x.ifds); dv.setUint16(o, r.pick([0, 1, 2, 0x7fff, 0xffff, dv.getUint16(o, x.le) + 1]), x.le); } // entry count
+  else if (k === 5) { // swap two entries: tags out of order, duplicates
+    const f = r.pick(x.entries);
+    const a = out.slice(e, e + 12);
+    out.copyWithin(e, f, f + 12);
+    out.set(a, f);
+  } else dv.setUint32(4, r.chance(0.5) ? r.pick(INTERESTING32) : r.pick(x.ifds), x.le); // IFD0 offset
+  return out;
+}
+
+const XML_BITS = ['<', '>', '</rdf:li>', '<rdf:li>', '&amp;', '&bogus;', '&#0;', '&#x110000;', '"', "'", '<!DOCTYPE x>', '<![CDATA[', ']]>', '<?x', '?>', '<!--', '-->',
+  ' xmlns:dc="urn:x"', ' rdf:parseType="Resource"', '<rdf:Description rdf:about="">', '</rdf:Description>', '<a:b xmlns:a="http://purl.org/dc/elements/1.1/">'];
+
+function xmpPayload(text, r) {
+  const k = r.below(5);
+  const at = r.below(text.length + 1);
+  if (k === 0) return text.slice(0, at) + r.pick(XML_BITS) + text.slice(at);
+  if (k === 1) { const n = 1 + r.below(200); return text.slice(0, at) + '<a>'.repeat(n) + '</a>'.repeat(r.chance(0.5) ? n : r.below(n)) + text.slice(at); }
+  if (k === 2) { const tags = [...text.matchAll(/<\/?[A-Za-z][^>]*>/g)]; if (!tags.length) return null; const t = r.pick(tags); return text.slice(0, t.index) + text.slice(t.index + t[0].length); }
+  if (k === 3) { const b = r.below(text.length), n = 1 + r.below(200); return text.slice(0, b) + text.slice(b, b + n).repeat(1 + r.below(20)) + text.slice(b + n); }
+  return text.slice(0, at);
+}
+
+const utf8Decode = (d) => fromUtf8.decode(d);
+
+/** Mutates an EXIF or XMP payload; `tiffAt` is where the TIFF starts, null for XMP text. */
+function metadataPayload(d, r, tiffAt) {
+  if (tiffAt !== null) {
+    const t = tiffPayload(d.subarray(tiffAt), r);
+    return t && cat(d.subarray(0, tiffAt), t);
+  }
+  const x = xmpPayload(utf8Decode(d), r);
+  return x === null ? null : utf8.encode(x);
+}
+
 // --- generic -------------------------------------------------------------------------
 
 const GENERIC = {
@@ -217,6 +293,17 @@ const PNG = {
     c.data = d;
     return true;
   },
+  metadata(chunks, r) {
+    const xmp = (c) => c.type === 'iTXt' && fromUtf8.decode(c.data.subarray(0, 18)) === 'XML:com.adobe.xmp\0' && c.data[18] === 0;
+    const targets = chunks.filter((c) => c.type === 'eXIf' || xmp(c));
+    if (!targets.length) return false;
+    const c = r.pick(targets);
+    const head = c.type === 'eXIf' ? 0 : 22;
+    const d = c.type === 'eXIf' ? metadataPayload(c.data, r, 0) : metadataPayload(c.data.subarray(head), r, null);
+    if (!d) return false;
+    c.data = c.type === 'eXIf' ? d : cat(c.data.subarray(0, head), d);
+    return true;
+  },
   /** Recompress image data so the bytes inside the zlib stream change, not just the stream. */
   splitData(chunks, r) {
     const i = chunks.findIndex((c) => c.type === 'IDAT' || c.type === 'fdAT');
@@ -260,6 +347,18 @@ function jpegWrite({ segs, tail }) {
 }
 
 const JPEG = {
+  metadata(j, r) {
+    const sig = (s, str) => str.length <= s.data.length && [...str].every((ch, i) => s.data[i] === ch.charCodeAt(0));
+    const targets = j.segs.filter((s) => s.marker === 0xe1 && (sig(s, 'Exif\0') || sig(s, 'http://ns.adobe.com/xap/1.0/\0')));
+    if (!targets.length) return false;
+    const s = r.pick(targets);
+    const exif = sig(s, 'Exif\0');
+    const head = exif ? 6 : 29;
+    const d = exif ? metadataPayload(s.data, r, head) : metadataPayload(s.data.subarray(head), r, null);
+    if (!d || d.length + (exif ? 0 : head) > 65000) return false;
+    s.data = exif ? d : cat(s.data.subarray(0, head), d);
+    return true;
+  },
   watermark(j, r) {
     const sig = (s) => s.marker === 0xef && s.data[6] === 0x2d && s.data[9] === 0; // "pixmix-w?\0"
     const s = j.segs.find(sig);
@@ -396,6 +495,15 @@ function jxlWrite(boxes) {
 }
 
 const JXL = {
+  metadata(boxes, r) {
+    const targets = boxes.filter((b) => (b.type === 'Exif' && b.data.length > 12) || b.type === 'xml ');
+    if (!targets.length) return false;
+    const x = r.pick(targets);
+    const d = x.type === 'Exif' ? metadataPayload(x.data, r, 4) : metadataPayload(x.data, r, null);
+    if (!d) return false;
+    x.data = d;
+    return true;
+  },
   watermark(boxes, r) {
     const x = boxes.find((b) => b.type === 'pmWm' || b.type === 'pmWs');
     const d = x && watermarkPayload(x.data, r);
@@ -504,7 +612,8 @@ function structured(b, r, log) {
     const chunks = pngChunks(b);
     if (!chunks.length) return null;
     const carries = chunks.some((c) => c.type === 'pmWm' || c.type === 'pmWs');
-    const name = carries && r.chance(0.35) ? 'watermark' : r.pick(Object.keys(PNG));
+    const meta = chunks.some((c) => c.type === 'eXIf' || c.type === 'iTXt');
+    const name = carries && r.chance(0.35) ? 'watermark' : meta && r.chance(0.3) ? 'metadata' : r.pick(Object.keys(PNG));
     if (!PNG[name](chunks, r)) return null;
     const fix = r.chance(0.85);
     log.push(`png.${name}${fix ? '' : ' (bad crc)'}`);
@@ -514,7 +623,8 @@ function structured(b, r, log) {
     const j = jpegSegments(b);
     if (!j.segs.length) return null;
     const carries = j.segs.some((s) => s.marker === 0xef && s.data[6] === 0x2d);
-    const name = carries && r.chance(0.35) ? 'watermark' : r.pick(Object.keys(JPEG));
+    const meta = j.segs.some((s) => s.marker === 0xe1);
+    const name = carries && r.chance(0.35) ? 'watermark' : meta && r.chance(0.3) ? 'metadata' : r.pick(Object.keys(JPEG));
     if (!JPEG[name](j, r)) return null;
     log.push(`jpeg.${name}`);
     return jpegWrite(j);
@@ -523,7 +633,8 @@ function structured(b, r, log) {
     const boxes = jxlBoxes(b);
     if (!boxes.length) return null;
     const carries = boxes.some((b) => b.type === 'pmWm' || b.type === 'pmWs');
-    const name = carries && r.chance(0.35) ? 'watermark' : r.pick(Object.keys(JXL));
+    const meta = boxes.some((b) => b.type === 'Exif' || b.type === 'xml ');
+    const name = carries && r.chance(0.35) ? 'watermark' : meta && r.chance(0.3) ? 'metadata' : r.pick(Object.keys(JXL));
     if (!JXL[name](boxes, r)) return null;
     log.push(`jxl.${name}`);
     return jxlWrite(boxes);

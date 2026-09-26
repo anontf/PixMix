@@ -81,6 +81,13 @@ tr.added td { color: var(--accent); }
 .wm-zoom { min-height: 60px; }
 .wm-zoom canvas { image-rendering: pixelated; }
 
+.md-diff table td { vertical-align: top; word-break: break-word; }
+.md-diff tr.gone td:nth-child(2) { color: var(--bad); text-decoration: line-through; }
+.md-diff tr.gone td:nth-child(3), .md-diff tr.new td:nth-child(3), .md-diff tr.changed td:nth-child(3) { color: var(--accent); }
+.md-diff td:first-child { color: var(--muted); white-space: nowrap; }
+.wm-form .md-kinds { display: grid; grid-template-columns: repeat(4, auto); gap: 6px 12px; }
+.wm-form textarea.md-lines { width: 280px; }
+
 @media (max-width: 900px) {
   .wm-body { grid-template-columns: 1fr; }
 }

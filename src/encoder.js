@@ -4,7 +4,8 @@ import { pick, toBytes, detectFormat } from './formats/index.js';
 import { scramblePng, rekeyPng, inspectPng } from './formats/png/index.js';
 import { scrambleJpeg, rekeyJpeg, inspectJpeg } from './formats/jpeg/index.js';
 import {
-  scrambleJxl, scrambleJxlPixels, scrambleJpegToJxl, rekeyJxl, inspectJxl, reencodeNotes, hasJpegData, reconstructJpeg, rebuiltJpegMatches,
+  scrambleJxlPixels, scrambleJpegToJxl, rekeyJxl, inspectJxl, reencodeNotes, hasJpegData, reconstructJpeg, jxlForScramble,
+  rebuiltJpegMatches,
 } from './formats/jxl/index.js';
 import { readJxl, readJxlHeader } from './formats/jxl/container.js';
 import { convert, convertAsync, decodeForJxl, targetFormat, OUTPUT_FORMATS } from './convert/index.js';
@@ -13,6 +14,12 @@ import { withLimits } from './core/limits.js';
 import { readWebpMetadata } from './meta/webp.js';
 import { readOrientation } from './meta/exif.js';
 import { validateCompiled, ID_PATTERN } from './watermark/schema.js';
+import * as metadataTools from './meta/apply.js';
+import { provideMetadataTools } from './meta/load.js';
+
+// Sync decode() with a metadata policy uses these too (see decoder.js).
+provideMetadataTools(metadataTools);
+const { applyMetadata, applyJxlParts, normalizePolicy, readMetadata } = metadataTools;
 
 export { detectFormat, convert, convertAsync, OUTPUT_FORMATS };
 export { configureJxl, loadJxlCodec } from './formats/jxl/load.js';
@@ -22,12 +29,15 @@ export { sharpDecoder } from './plugins/sharp.js';
 export { browserDecoder } from './plugins/browser.js';
 export { PixmixError, WrongKeyError } from './core/params.js';
 export { DEFAULT_LIMITS } from './core/limits.js';
+export {
+  readMetadata, applyMetadata, applyMetadataAsync, normalizePolicy, normalizeProfile, formatProfile, PRESET_NAMES as METADATA_PRESETS,
+} from './meta/apply.js';
 
 // JPEG XL only has async operations (its codec is WASM, loaded on first use).
 const SCRAMBLERS = {
   png: { scramble: scramblePng, rekey: rekeyPng, inspect: inspectPng },
   jpeg: { scramble: scrambleJpeg, rekey: rekeyJpeg, inspect: inspectJpeg },
-  jxl: { scrambleAsync: scrambleJxl, rekeyAsync: rekeyJxl, inspect: inspectJxl },
+  jxl: { rekeyAsync: rekeyJxl, inspect: inspectJxl },
 };
 
 const needsAsync = (what) => new PixmixError(`JPEG XL ${what} is async; use ${what}Async`, 'ASYNC_DECODER');
@@ -60,6 +70,10 @@ const needsAsync = (what) => new PixmixError(`JPEG XL ${what} is async; use ${wh
  *           restoring stays exact
  * @property {Partial<import('./core/limits.js').Limits>} [limits]  resource limits for untrusted
  *           input, over the defaults in core/limits.js; a violation throws code 'LIMIT'
+ * @property {object|string} [metadata]  a metadata policy for the scrambled file (a preset
+ *           name, or {preset, keep, strip, remove, set}; see meta/policy.js). Without one,
+ *           metadata is kept as described above. onConvert's report gets `metadata`: what
+ *           the policy removed and set
  */
 
 /**
@@ -78,6 +92,7 @@ function checkWatermarks(opts) {
     } else out.watermark = validateCompiled(w);
   }
   if (opts.visibleWatermark) out.visibleWatermark = validateCompiled(opts.visibleWatermark);
+  if (opts.metadata !== undefined) out.metadata = normalizePolicy(opts.metadata);
   return out;
 }
 
@@ -131,13 +146,24 @@ export async function encodeAsync(input, opts) {
     opts.onConvert?.(fallbackNote(report));
     return scrambleJxlPixels(image, boxes, opts);
   }
-  const converted = await convertAsync(bytes, withFormat);
-  if (converted.format === 'jxl') {
+  if (withFormat.format === 'jxl') {
+    // JPEG XL to JPEG XL, pixel route: the codestream is encoded again, so a metadata
+    // policy applies to the ICC profile as well as the boxes.
+    const converted = await convertAsync(bytes, { ...withFormat, metadata: undefined });
     converted.dropped.push(...reencodeNotes(readJxlHeader(readJxl(converted.bytes, opts.limits).codestream, opts.limits)));
+    let { image, boxes } = await jxlForScramble(converted.bytes, opts);
+    if (opts.metadata) {
+      const parts = applyJxlParts({ boxes, icc: image.icc ?? null }, opts.metadata, { limits: opts.limits, stripThumbnails: !opts.keepThumbnails });
+      ({ boxes } = parts);
+      image = { ...image, icc: parts.icc };
+      converted.metadata = parts.report;
+    }
+    opts.onConvert?.(fallbackNote(converted));
+    return scrambleJxlPixels(image, boxes, opts);
   }
-  opts.onConvert?.(fallbackNote(converted));
-  const s = SCRAMBLERS[converted.format];
-  return s.scramble ? s.scramble(converted.bytes, opts) : s.scrambleAsync(converted.bytes, opts);
+  const converted = await convertAsync(bytes, withFormat);
+  opts.onConvert?.(converted);
+  return SCRAMBLERS[converted.format].scramble(converted.bytes, opts);
 }
 
 /**
@@ -189,16 +215,19 @@ function withTarget(input, opts) {
  * intermediate unscrambled file.
  * @param {Uint8Array|ArrayBuffer} input
  * @param {{from: string|Uint8Array, to: string|Uint8Array, mode?: 'pixel'|'block', block?: number, level?: number,
- *   watermark?: object|null, visibleWatermark?: object|null,
+ *   watermark?: object|null, visibleWatermark?: object|null, metadata?: object|string,
+ *   onMetadata?: (report: object) => void,
  *   limits?: Partial<import('./core/limits.js').Limits>}} opts  watermarks are kept unless
- *   given (null removes them)
+ *   given (null removes them); metadata is kept unless a policy is given, which is applied
+ *   again (onMetadata gets its report)
  */
 export function rekey(input, opts) {
   opts = checkWatermarks(opts);
   const bytes = toBytes(input);
   const s = pick(SCRAMBLERS, bytes);
   if (!s.rekey) throw needsAsync('rekey');
-  return s.rekey(bytes, withLimits(bytes, opts));
+  opts = withLimits(bytes, opts);
+  return s.rekey(withMetadata(bytes, opts), opts);
 }
 
 /** rekey for every format, including JPEG XL. */
@@ -207,19 +236,41 @@ export async function rekeyAsync(input, opts) {
   const bytes = toBytes(input);
   const s = pick(SCRAMBLERS, bytes);
   opts = withLimits(bytes, opts);
-  return s.rekey ? s.rekey(bytes, opts) : s.rekeyAsync(bytes, opts);
+  if (s.rekey) return s.rekey(withMetadata(bytes, opts), opts);
+  return s.rekeyAsync(bytes, opts.metadata ? { ...opts, meta: metaHook(opts) } : opts);
 }
+
+/**
+ * PNG and JPEG: the policy is applied to the scrambled file itself (pixmix's own chunks are
+ * never touched), so everything read from it afterwards, orientation included, agrees.
+ */
+function withMetadata(bytes, opts) {
+  if (!opts.metadata) return bytes;
+  const { bytes: out, report } = applyMetadata(bytes, opts.metadata, { limits: opts.limits });
+  opts.onMetadata?.(report);
+  return out;
+}
+
+/** What the JPEG XL module needs to apply a policy where it decodes and encodes. */
+const metaHook = (opts) => ({ tools: metadataTools, policy: opts.metadata, limits: opts.limits, onReport: opts.onMetadata });
 
 /**
  * Describes an image and whether it carries a pixmix marker. Reads headers only, and checks
  * them against the same limits as decoding, so it doubles as a cheap check up front.
- * @param {Uint8Array|ArrayBuffer} input @param {{limits?: Partial<import('./core/limits.js').Limits>}} [opts]
+ * With `metadata: true` it also parses the metadata (PNG, JPEG, JPEG XL) into `meta`: EXIF
+ * tags by name, XMP properties, the ICC profile, text, IPTC and other chunks (see
+ * meta/read.js).
+ * @param {Uint8Array|ArrayBuffer} input
+ * @param {{limits?: Partial<import('./core/limits.js').Limits>, metadata?: boolean}} [opts]
  */
 export function inspect(input, opts) {
   const bytes = toBytes(input);
   const { limits } = withLimits(bytes, opts);
   const format = detectFormat(bytes);
-  if (SCRAMBLERS[format]) return SCRAMBLERS[format].inspect(bytes, limits);
+  if (SCRAMBLERS[format]) {
+    const info = SCRAMBLERS[format].inspect(bytes, limits);
+    return opts?.metadata ? { ...info, meta: readMetadata(bytes, { limits }) } : info;
+  }
   if (!format) throw new PixmixError('Unrecognised image format', 'UNSUPPORTED');
   const out = { format, scrambled: false };
   const meta = format === 'webp' ? readWebpMetadata(bytes) : null;

@@ -8,6 +8,8 @@
 //   dist/pixmix-encoder.cjs       CommonJS build of the encoder, for require()-based servers
 //   dist/pixmix-watermark.mjs     the watermark painter, loaded on demand when a watermark
 //                                 is drawn
+//   dist/pixmix-metadata.mjs      the metadata tools (policies, EXIF/XMP editing), loaded on
+//                                 demand by the decoders when a metadata policy is used
 //   dist/pixmix-jxl.mjs           JPEG XL codec, loaded on demand by all of the above,
 //   dist/pixmix-jxl-{enc,dec}.wasm  with its WASM (libjxl encoder, native/libjxl; jxl-oxide
 //                                 decoder, native/jxl), and pixmix-jxl-enc-nosimd.wasm, the
@@ -27,7 +29,10 @@ await rm(out(''), { recursive: true, force: true });
 await mkdir(out(''), { recursive: true });
 
 const chunk = {
-  define: { __PIXMIX_JXL_CHUNK__: '"./pixmix-jxl.mjs"', __PIXMIX_WORKER__: '"./pixmix-worker.mjs"', __PIXMIX_WATERMARK_CHUNK__: '"./pixmix-watermark.mjs"' },
+  define: {
+    __PIXMIX_JXL_CHUNK__: '"./pixmix-jxl.mjs"', __PIXMIX_WORKER__: '"./pixmix-worker.mjs"', __PIXMIX_WATERMARK_CHUNK__: '"./pixmix-watermark.mjs"',
+    __PIXMIX_METADATA_CHUNK__: '"./pixmix-metadata.mjs"',
+  },
 };
 const targets = [
   { entryPoints: [`${root}src/browser/index.js`], outfile: out('pixmix-decoder.js'), format: 'esm', platform: 'browser', ...chunk },
@@ -45,6 +50,7 @@ const targets = [
   },
   { entryPoints: [`${root}src/browser/worker.js`], outfile: out('pixmix-worker.mjs'), format: 'esm', platform: 'browser', minify: true, ...chunk },
   { entryPoints: [`${root}src/watermark/paint.js`], outfile: out('pixmix-watermark.mjs'), format: 'esm', platform: 'neutral', minify: true, ...chunk },
+  { entryPoints: [`${root}src/meta/apply.js`], outfile: out('pixmix-metadata.mjs'), format: 'esm', platform: 'neutral', minify: true, ...chunk },
   {
     entryPoints: [`${root}src/formats/jxl/codec.js`], outfile: out('pixmix-jxl.mjs'), format: 'esm', platform: 'neutral',
     minify: true,

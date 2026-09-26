@@ -8,12 +8,14 @@ import { encodeAsync, decodeAsync, rekeyAsync, inspect, detectFormat, PixmixErro
 import { targetFormat } from '../src/convert/index.js';
 import { sharpDecoder } from '../src/plugins/sharp.js';
 import { loadWatermark } from '../src/watermark/store.js';
+import { loadMetadataPolicy } from '../src/meta/profiles.js';
+import { normalizePolicy } from '../src/meta/policy.js';
 
 const USAGE = `Usage:
   pixmix encode  <file...> [options]   scramble images (any supported input -> PNG, JPEG or JPEG XL)
   pixmix decode  <file...> [options]   restore scrambled images
   pixmix rekey   <file...> [options]   change the key (and optionally the mode) losslessly
-  pixmix inspect <file...> [--json]    show format, size, metadata and scramble info
+  pixmix inspect <file...> [--json]    show format, size, scramble info and the parsed metadata
 
 Keys (prefer the file or environment forms; -k ends up in shell history):
   -k, --key <key>          key            --key-file <path>      read key from file
@@ -44,6 +46,12 @@ Watermarks (<wm> is an id in the watermarks directory, or a .json definition / c
                            stays exact: the pixels under it are kept, encrypted, in the file)
   --no-watermark           rekey: remove both watermarks
   --watermarks <dir>       watermarks directory (default: $PIXMIX_WATERMARKS_DIR or pixmix's own)
+
+Metadata (<policy> is a preset: keep, strip-all, privacy, web; a profile id in the
+metadata profiles directory; or a .json file holding a profile or a policy):
+  --metadata <policy>      encode: the scrambled file's metadata. decode: the restored
+                           file's. rekey: apply it again (default: keep what the file has)
+  --metadata-profiles <dir>  profiles directory (default: $PIXMIX_METADATA_PROFILES_DIR or pixmix's own)
   --in-place               rekey: overwrite the input
   -f, --force              overwrite existing outputs
   --no-sharp               do not use sharp even if installed
@@ -82,6 +90,8 @@ const OPTIONS = {
   'visible-watermark': { type: 'string' },
   'no-watermark': { type: 'boolean' },
   watermarks: { type: 'string' },
+  metadata: { type: 'string' },
+  'metadata-profiles': { type: 'string' },
   'in-place': { type: 'boolean' },
   force: { type: 'boolean', short: 'f' },
   'no-sharp': { type: 'boolean' },
@@ -154,6 +164,7 @@ async function commandOptions(command, o) {
   if (o['keep-thumbnails']) opts.keepThumbnails = true;
   opts.limits = limitsFrom(o);
   Object.assign(opts, await watermarkOptions(command, o));
+  if (o.metadata !== undefined) opts.metadata = await metadataPolicy(o.metadata, o['metadata-profiles']);
   if (command === 'rekey') {
     opts.from = await keyFrom(o.key, o['key-file'], 'PIXMIX_KEY', 'old key (-k, --key-file or $PIXMIX_KEY)');
     opts.to = await keyFrom(o.to, o['to-file'], 'PIXMIX_NEW_KEY', 'new key (--to, --to-file or $PIXMIX_NEW_KEY)');
@@ -195,9 +206,20 @@ async function watermarkOptions(command, o) {
   return out;
 }
 
+/** A --metadata reference as a validated policy (a usage error when it is not one). */
+async function metadataPolicy(ref, dir) {
+  try {
+    return normalizePolicy(await loadMetadataPolicy(ref, { dir }));
+  } catch (err) {
+    throw new UsageError(`metadata "${ref}": ${err.message}`);
+  }
+}
+
 async function run(command, input, opts) {
-  if (command === 'decode') return { bytes: await decodeAsync(input, opts) };
-  if (command === 'rekey') return { bytes: await rekeyAsync(input, opts) };
+  let meta = null;
+  const onMetadata = (r) => { meta = r; };
+  if (command === 'decode') return { bytes: await decodeAsync(input, { ...opts, onMetadata }), note: describeMetadata(meta) };
+  if (command === 'rekey') return { bytes: await rekeyAsync(input, { ...opts, onMetadata }), note: describeMetadata(meta) };
   let report;
   const bytes = await encodeAsync(input, { ...opts, onConvert: (r) => { report = r; } });
   const bits = [];
@@ -207,7 +229,18 @@ async function run(command, input, opts) {
   }
   if (report.dropped.length) bits.push(`dropped ${report.dropped.join(', ')}`);
   if (report.notes?.length) bits.push(`note: ${report.notes.join('; ')}`);
+  if (report.metadata) bits.push(describeMetadata(report.metadata));
   return { bytes, note: bits.join('; ') };
+}
+
+/** One line for what a metadata policy did. */
+function describeMetadata(r) {
+  if (!r) return '';
+  const bits = [];
+  if (r.removed.length) bits.push(`removed ${r.removed.join(', ')}`);
+  if (r.set.length) bits.push(`set ${r.set.join(', ')}`);
+  if (r.notes.length) bits.push(`note: ${r.notes.join('; ')}`);
+  return `metadata (${r.policy}): ${bits.join('; ') || 'nothing to change'}`;
 }
 
 async function runInspect(files, o, limits) {
@@ -215,7 +248,7 @@ async function runInspect(files, o, limits) {
   const all = [];
   for (const file of files) {
     try {
-      const info = inspect(file === '-' ? await readStdin() : await readFile(file), { limits });
+      const info = inspect(file === '-' ? await readStdin() : await readFile(file), { limits, metadata: true });
       if (o.json) { all.push({ file, ...info }); continue; }
       const dims = info.width ? `${info.width}x${info.height}` : '';
       const scramble = info.scrambled ? `scrambled (${info.mode}${info.block ? ` ${info.block}px` : ''})` : 'not scrambled';
@@ -225,6 +258,7 @@ async function runInspect(files, o, limits) {
       if (info.metadata) console.log(`  metadata: ${info.metadata.join(', ') || 'none'}${info.orientation > 1 ? ` (orientation ${info.orientation})` : ''}`);
       if (info.watermark) console.log(`  watermark: ${info.watermark.id}${info.watermark.embedded ? '' : ' (id only)'}`);
       if (info.visibleWatermark) console.log('  visible watermark on the scrambled image');
+      if (info.meta) for (const line of metadataLines(info.meta)) console.log(`  ${line}`);
     } catch (err) {
       failed++;
       process.stderr.write(`pixmix: ${file}: ${err.message}\n`);
@@ -232,6 +266,33 @@ async function runInspect(files, o, limits) {
   }
   if (o.json) console.log(JSON.stringify(files.length === 1 ? all[0] ?? null : all, null, 2));
   return failed ? 1 : 0;
+}
+
+/** inspect's parsed metadata, a line per block (long values cut short). */
+function metadataLines(m) {
+  const show = (v) => {
+    const s = typeof v === 'string' ? v : Array.isArray(v) ? v.join(', ') : v && typeof v === 'object' ? (v.bytes !== undefined && Object.keys(v).length === 1 ? `(${v.bytes} bytes)` : JSON.stringify(v)) : String(v);
+    return s.length > 60 ? `${s.slice(0, 57)}...` : s;
+  };
+  const lines = [];
+  if (m.exif?.error) lines.push(`EXIF: ${m.exif.error}`);
+  else if (m.exif) {
+    const byIfd = new Map();
+    for (const t of m.exif.tags) byIfd.set(t.ifd, [...(byIfd.get(t.ifd) ?? []), `${t.name}=${show(t.value)}`]);
+    for (const [ifd, tags] of byIfd) lines.push(`EXIF ${ifd}: ${tags.join(' | ')}`);
+    if (!m.exif.tags.length) lines.push('EXIF: no tags');
+  }
+  if (m.xmp?.error) lines.push(`XMP: ${m.xmp.error}`);
+  else if (m.xmp) lines.push(`XMP: ${m.xmp.properties.map((p) => `${p.name}=${show(p.value)}`).join(' | ') || 'no properties'}${m.xmp.extended ? ` (+${m.xmp.extended} extended)` : ''}`);
+  if (m.icc?.source === 'codestream') lines.push(`ICC: in the codestream (${m.icc.srgb === true ? 'sRGB' : m.icc.srgb === false ? 'not sRGB' : 'unknown'})`);
+  else if (m.icc) lines.push(`ICC: ${m.icc.error ?? `"${m.icc.description ?? 'unnamed'}" v${m.icc.version} ${m.icc.class} ${m.icc.colourSpace}${m.icc.srgb ? ' (sRGB)' : ''}, ${m.icc.bytes} bytes`}`);
+  if (m.colour.length) lines.push(`colour: ${m.colour.map((c) => `${c.type}=${show(c.value)}`).join(' | ')}`);
+  if (m.density) lines.push(`density: ${m.density.x}x${m.density.y} per ${m.density.unit}`);
+  for (const t of m.text) lines.push(`text ${t.keyword}: ${show(t.text)}`);
+  if (m.iptc?.length) lines.push(`IPTC: ${m.iptc.map((d) => `${d.name}=${show(d.value)}`).join(' | ')}`);
+  if (m.other.length) lines.push(`other: ${m.other.map((o) => `${o.label ?? o.type}${o.value ? ` ${o.value}` : ''} (${o.bytes} bytes)`).join(', ')}`);
+  if (m.pixmix.length) lines.push(`pixmix: ${m.pixmix.join(', ')}`);
+  return lines;
 }
 
 const EXT = { png: 'png', jpeg: 'jpg', jxl: 'jxl' };

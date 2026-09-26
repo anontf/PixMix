@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import sharp from 'sharp';
@@ -122,4 +122,40 @@ test('watermarks: carry one, draw one on decode, show one on the scrambled image
   assert.doesNotMatch(run(['inspect', join(dir, 'wm.plain.png')]).stdout.toString(), /watermark/);
   assert.equal(run(['decode', '-k', 'w', '--watermark', 'no-such-mark', join(dir, 'wm.scrambled.png')]).status, 2);
   assert.equal(run(['decode', '-k', 'w', '--visible-watermark', 'vivi-gold', join(dir, 'wm.scrambled.png')]).status, 2);
+});
+
+test('--metadata: presets, profiles and policy files on encode, decode and rekey; inspect shows parsed metadata', async () => {
+  const src = await sharp({ create: { width: 32, height: 24, channels: 3, background: '#468' } })
+    .withExif({ IFD0: { Artist: 'Jane Doe', Make: 'Cam' }, IFD3: { GPSLatitudeRef: 'N', GPSLatitude: '48/1 51/1 2400/100' } }).jpeg().toBuffer();
+  writeFileSync(join(dir, 'm.jpg'), src);
+  let r = run(['inspect', join(dir, 'm.jpg')]);
+  assert.match(r.stdout.toString(), /EXIF IFD0: .*Make=Cam .*Artist=Jane Doe/);
+  assert.match(r.stdout.toString(), /EXIF GPS: GPSLatitudeRef=N \| GPSLatitude=48, 51, 24/);
+  r = run(['encode', '-k', 'm', '--metadata', 'vivi-web', '-f', join(dir, 'm.jpg')]);
+  assert.equal(r.status, 0, r.stderr.toString());
+  assert.match(r.stderr.toString(), /metadata \(vivi-web\): removed EXIF .*; set EXIF Artist, EXIF Copyright/);
+  r = run(['inspect', '--json', join(dir, 'm.scrambled.jpg')]);
+  assert.deepEqual(JSON.parse(r.stdout).meta.exif.tags.map((t) => [t.name, t.value]), [['Artist', 'Vivi'], ['Copyright', 'Vivi']]);
+  writeFileSync(join(dir, 'policy.json'), JSON.stringify({ set: { comment: 'from a file' } }));
+  r = run(['decode', '-k', 'm', '--metadata', join(dir, 'policy.json'), '-o', join(dir, 'm.out.jpg'), join(dir, 'm.scrambled.jpg')]);
+  assert.equal(r.status, 0, r.stderr.toString());
+  assert.match(run(['inspect', join(dir, 'm.out.jpg')]).stdout.toString(), /text Comment: from a file/);
+  r = run(['rekey', '-k', 'm', '--to', 'n', '--metadata', 'strip-all', '-o', join(dir, 'm.rk.jpg'), join(dir, 'm.scrambled.jpg')]);
+  assert.equal(r.status, 0, r.stderr.toString());
+  assert.doesNotMatch(run(['inspect', join(dir, 'm.rk.jpg')]).stdout.toString(), /EXIF/);
+  // A directory of its own, and bad references.
+  const profiles = join(dir, 'profiles');
+  mkdirSync(profiles);
+  writeFileSync(join(profiles, 'mine.json'), JSON.stringify({ id: 'mine', preset: 'privacy' }));
+  r = run(['encode', '-k', 'm', '--metadata', 'mine', '--metadata-profiles', profiles, '-o', join(dir, 'm2.jpg'), join(dir, 'm.jpg')]);
+  assert.equal(r.status, 0, r.stderr.toString());
+  assert.match(r.stderr.toString(), /metadata \(mine\): removed EXIF Artist \(owner\), EXIF GPS:GPSLatitudeRef/);
+  for (const bad of ['no-such-profile', '../x', join(dir, 'missing.json')]) {
+    r = run(['encode', '-k', 'm', '--metadata', bad, '-f', join(dir, 'm.jpg')]);
+    assert.equal(r.status, 2, bad);
+  }
+  writeFileSync(join(dir, 'bad.json'), JSON.stringify({ strip: ['pixels'] }));
+  r = run(['encode', '-k', 'm', '--metadata', join(dir, 'bad.json'), '-f', join(dir, 'm.jpg')]);
+  assert.equal(r.status, 2);
+  assert.match(r.stderr.toString(), /unknown kind "pixels"/);
 });

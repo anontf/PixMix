@@ -7,8 +7,11 @@ import { mkdtempSync, cpSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import sharp from 'sharp';
+import omggif from 'omggif';
 import { launch, engines, openPage } from './harness.js';
 import { readMetadata } from '../../src/index.js';
+
+const { GifWriter } = omggif;
 
 let proc, base, wmDir, mdDir;
 before(async () => {
@@ -188,6 +191,123 @@ for (const { name: engine, skip } of await engines()) describe(engine, { skip },
     await p.click('#mdDelete');
     await p.waitForFunction(() => /deleted/.test(document.querySelector('#mdStatus').textContent));
     assert.equal(existsSync(join(mdDir, `${id}.json`)), false);
+    assert.deepEqual(errors, []);
+    await p.close();
+  });
+
+  test('lab editors: saving never replaces another file without asking; the picker names what is edited', async () => {
+    const { page: p, errors } = await openPage(browser);
+    await p.goto(base);
+    await p.waitForFunction(() => document.querySelectorAll('#wmPick option').length === 3 && document.querySelector('#mdForm input[name="id"]'));
+    const editors = [
+      { pre: 'wm', dir: wmDir, other: 'vivi-gold', from: 'vivi-pixel', form: '#wmForm' },
+      { pre: 'md', dir: mdDir, other: 'vivi-web', from: 'vivi-privacy', form: '#mdForm' },
+    ];
+    for (const { pre, dir, other, from, form } of editors) {
+      const file = (id) => join(dir, `${id}.json`);
+      const picked = () => p.$eval(`#${pre}Pick`, (s) => s.selectedOptions[0]?.textContent);
+      const otherBefore = readFileSync(file(other), 'utf8');
+      const dialogs = [];
+      const onDialog = (d) => { dialogs.push(d.message()); d.dismiss(); };
+      p.on('dialog', onDialog);
+      // New, given an existing id: Save asks, and declining leaves the file alone.
+      await p.click(`#${pre}New`);
+      await p.waitForFunction((s) => /not saved/.test(document.querySelector(s).textContent), `#${pre}Status`);
+      assert.match(await picked(), /· not saved$/);
+      await p.fill(`${form} input[name="id"]`, other);
+      await p.waitForFunction(([s, o]) => document.querySelector(s).textContent.includes(`${o}.json already exists`), [`#${pre}Status`, other]);
+      await p.click(`#${pre}Save`);
+      await p.waitForFunction((s) => /^not saved: .* already exists \(give/.test(document.querySelector(s).textContent), `#${pre}Status`);
+      assert.equal(dialogs.length, 1);
+      assert.match(dialogs[0], new RegExp(`${other}\\.json already exists`));
+      assert.equal(readFileSync(file(other), 'utf8'), otherBefore);
+      // Delete on something unsaved says why it does nothing.
+      await p.click(`#${pre}Delete`);
+      await p.waitForFunction((s) => /is not saved yet: there is no file to delete/.test(document.querySelector(s).textContent), `#${pre}Status`);
+      assert.equal(dialogs.length, 1);
+      // Duplicate: the picker names the copy; Save creates it.
+      await p.selectOption(`#${pre}Pick`, from);
+      await p.waitForFunction(([s, f]) => document.querySelector(s).textContent.endsWith(`/${f}.json`), [`#${pre}Status`, from]);
+      await p.click(`#${pre}Copy`);
+      await p.waitForFunction((s) => /-copy\) · not saved$/.test(document.querySelector(s).selectedOptions[0]?.textContent), `#${pre}Pick`);
+      await p.click(`#${pre}Save`);
+      await p.waitForFunction((s) => /^saved .*-copy\.json/.test(document.querySelector(s).textContent), `#${pre}Status`);
+      assert.ok(existsSync(file(`${from}-copy`)));
+      assert.match(await picked(), new RegExp(`\\(${from}-copy\\)$`));
+      // A saved one given another (taken) id: asks too, and keeps both files.
+      await p.fill(`${form} input[name="id"]`, other);
+      await p.waitForFunction(([s, o]) => document.querySelector(s).textContent.includes(`${o}.json already exists`), [`#${pre}Status`, other]);
+      await p.click(`#${pre}Save`);
+      await p.waitForFunction((s) => /^not saved: .* already exists \(give/.test(document.querySelector(s).textContent), `#${pre}Status`);
+      assert.equal(dialogs.length, 2);
+      assert.equal(readFileSync(file(other), 'utf8'), otherBefore);
+      assert.ok(existsSync(file(`${from}-copy`)));
+      p.off('dialog', onDialog);
+      // Clean up the copy.
+      await p.selectOption(`#${pre}Pick`, `${from}-copy`);
+      await p.waitForFunction((s) => /-copy\.json$/.test(document.querySelector(s).textContent), `#${pre}Status`);
+      p.once('dialog', (d) => d.accept());
+      await p.click(`#${pre}Delete`);
+      await p.waitForFunction((s) => /^deleted/.test(document.querySelector(s).textContent), `#${pre}Status`);
+      assert.equal(existsSync(file(`${from}-copy`)), false);
+    }
+    assert.deepEqual(errors, []);
+    await p.close();
+  });
+
+  test('lab: a bad file clears the old results; hidden choices reset; animated restores match', async () => {
+    const { page: p, errors } = await openPage(browser);
+    await p.goto(base);
+    await encodeInLab(p, { sample: 'image/png', format: '', where: 'browser' });
+    await p.setInputFiles('#file', { name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('hello, not an image') });
+    await p.waitForFunction(() => /notes\.txt/.test(document.querySelector('#origMeta').textContent));
+    assert.deepEqual(await p.evaluate(() => ({
+      stages: ['origStage', 'scrStage', 'decStage'].map((id) => document.getElementById(id).childElementCount),
+      enabled: ['encode', 'replay', 'rekey', 'publish'].filter((id) => !document.getElementById(id).disabled),
+      text: ['scrMeta', 'decMeta', 'chunks'].map((id) => document.getElementById(id).textContent),
+    })), { stages: [0, 0, 0], enabled: [], text: ['', '', ''] });
+    // A new image while the previous one still decodes: its result never lands.
+    await p.selectOption('#sampleType', 'image/png');
+    await p.click('#sample');
+    await p.waitForFunction(() => !document.querySelector('#encode').disabled);
+    await p.fill('#duration', '1500');
+    await p.click('#encode');
+    await p.waitForFunction(() => document.querySelector('#decMeta').textContent === 'decoding…', null, { timeout: 30000 });
+    await p.selectOption('#sampleType', 'image/jpeg');
+    await p.click('#sample');
+    await p.waitForFunction(() => /^JPEG/.test(document.querySelector('#origMeta').textContent));
+    await new Promise((r) => setTimeout(r, 2500));
+    assert.equal(await p.textContent('#decMeta'), '');
+    // "mcu" is the JPEG route: offered for JPEG XL from a JPEG, and reset when it no longer applies.
+    await p.selectOption('#format', 'jxl');
+    assert.equal(await p.isVisible('#transforms'), true);
+    await p.selectOption('#mode', 'mcu');
+    await p.selectOption('#format', 'png');
+    assert.equal(await p.inputValue('#mode'), '');
+    await p.selectOption('#format', 'jxl');
+    await p.selectOption('#mode', 'pixel');
+    assert.equal(await p.isVisible('#transforms'), false, 'no JPEG MCUs in pixel mode');
+    await p.selectOption('#mode', '');
+    await p.selectOption('#sampleType', 'image/png');
+    await p.click('#sample');
+    await p.waitForFunction(() => /^PNG/.test(document.querySelector('#origMeta').textContent));
+    assert.equal(await p.$eval('#modeMcu', (o) => o.hidden), true, 'no JPEG route for a PNG');
+    assert.equal(await p.isVisible('#transforms'), false);
+    // An animated GIF, restored exactly: its frames (fdAT) are image data, not metadata.
+    const w = 24, h = 16, gif = Buffer.alloc(4096);
+    const gw = new GifWriter(gif, w, h, { loop: 0, palette: [0xff0000, 0x00ff00, 0x0000ff, 0xffffff] });
+    for (let f = 0; f < 3; f++) gw.addFrame(0, 0, w, h, Uint8Array.from({ length: w * h }, (_, i) => (i + f * 5) % 4), { delay: 10 });
+    await p.setInputFiles('#file', { name: 'anim.gif', mimeType: 'image/gif', buffer: gif.subarray(0, gw.end()) });
+    await p.waitForFunction(() => /^GIF/.test(document.querySelector('#origMeta').textContent));
+    await p.selectOption('#format', 'png');
+    await p.fill('#duration', '200');
+    await p.click('#encode');
+    await p.waitForFunction(() => /✓|✗|≈|Error|bad/i.test(document.querySelector('#decMeta').textContent + document.querySelector('#scrMeta').textContent) &&
+      document.querySelector('#decMeta').textContent !== 'decoding…', null, { timeout: 60000 });
+    const dec = await p.textContent('#decMeta');
+    assert.match(dec, /✓ pixel-identical/, dec);
+    assert.match(dec, /✓ metadata chunks identical/, dec);
+    assert.match(await p.textContent('#chunks'), /fdAT/, 'an APNG with frame data');
     assert.deepEqual(errors, []);
     await p.close();
   });

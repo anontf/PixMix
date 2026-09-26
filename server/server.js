@@ -191,8 +191,8 @@ const watermarkRoutes = {
   DELETE: async (id) => { await watermarks.remove(id); return json({ ok: true }); },
 };
 
-const pick = ({ format, width, height, mode, block, watermark, visibleWatermark }) => ({
-  format, width, height, mode, block, carries: watermark?.id ?? null, visibleWatermark,
+const pick = ({ format, width, height, orientation, mode, block, watermark, visibleWatermark }) => ({
+  format, width, height, orientation: orientation ?? 1, mode, block, carries: watermark?.id ?? null, visibleWatermark,
 });
 const urlFor = (id, bytes) => `/images/${id}.${IMAGE[detectFormat(bytes)][1]}`;
 

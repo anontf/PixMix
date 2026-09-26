@@ -280,6 +280,16 @@ export function rekeyJpeg(bytes, { from, to, transforms, salt, mode, progressive
   });
 }
 
+/**
+ * The same image as a clean JPEG (like jpegtran): explicit Huffman tables, no stray bytes,
+ * truncated data zero-filled, redefined quantisation tables merged, baseline scans. For
+ * pixel decoders that cannot read the original.
+ */
+export function rebuildJpeg(bytes, limits) {
+  const { segments, frame } = parse(bytes, limits);
+  return assembleJpeg(headerSegments(segments), frame);
+}
+
 /** Cheap: parses segments only, no entropy decoding. */
 export function inspectJpeg(bytes, limits) {
   const { segments, trailing } = readSegments(bytes, limits);

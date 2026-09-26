@@ -191,6 +191,11 @@ test('truncated JPEG data is zero-filled, not fatal', async () => {
   const cut = new Uint8Array(Buffer.concat([full.subarray(0, full.length - 200), Buffer.from([0xff, 0xd9])]));
   const s = encode(cut, { key: 'k' });
   assert.ok(sameCoefs(decode(s, { key: 'k' }), cut));
+  // What libjpeg shows of a truncated file: the rest of the scan stays empty.
+  for (const bytes of [cut, full.subarray(0, Math.floor(full.length * 0.6))]) {
+    const ref = await sharp(bytes, { failOn: 'none' }).raw().toBuffer();
+    assert.ok(ref.equals(await pixels(decode(encode(new Uint8Array(bytes), { key: 'k' }), { key: 'k' }))));
+  }
 });
 
 test('progressive JPEGs stay progressive through scramble and restore; option overrides', async () => {

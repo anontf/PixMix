@@ -26,3 +26,8 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# jxl-jbr 0.2.1 with one fix: COM segments were rebuilt with their marker byte written twice
+# (see the "pixmix patch" comment in patches/jxl-jbr/src/reconstruct.rs).
+[patch.crates-io]
+jxl-jbr = { path = "patches/jxl-jbr" }

@@ -352,9 +352,16 @@ a JPEG XL made by recompressing one (it has a `jbrd` box):
 - Speed at 12 MP: about 1.2 s to encode, 1.0 s to reveal in a browser, 1.7 s to restore to
   JPEG XL.
 - It works everywhere, browsers included, since the encoder is plain WASM.
-- Reconstruction uses jxl-oxide. jxl-oxide 0.12 can't rebuild some *progressive* JPEGs from
-  third-party JPEG XL files. Those fall back to the pixel route; pixmix's own JPEGs are
-  always baseline.
+- Reconstruction uses jxl-oxide (0.12, with a patch for JPEGs with comments). It gets
+  some JPEGs wrong, so both ends are checked, and anything that fails falls back to the
+  pixel route. The report's `notes` then say why, and the file is several times larger.
+  Asking for `mode: 'mcu'` gives an `UNSUPPORTED` error instead.
+  - For a JPEG XL made from a JPEG by another tool, the rebuilt JPEG is recompressed and
+    must decode to exactly the same pixels. Some progressive JPEGs fail this: jxl-oxide
+    either stops with an error or silently rebuilds different coefficients.
+  - Every file pixmix writes must rebuild bit for bit before it is returned. This catches
+    JPEGs jxl-oxide can't rebuild, such as 4:4:4 stored with 1×2 sampling factors, and
+    ones libjxl can't recompress, such as CMYK and 4:1:1.
 
 **Pixel route** (`mode: 'pixel' | 'block'`), for everything else:
 - Decode JPEG XL with pixmix → the exact samples the input decodes to: 8- or 16-bit, in

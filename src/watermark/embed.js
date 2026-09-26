@@ -88,13 +88,18 @@ function crypt(data, key, salt) {
 export function encodeStash({ watermark, regions, raw, key, salt }) {
   const json = utf8.encode(JSON.stringify(watermark));
   const data = crypt(zlibSync(raw, { level: 6 }), key, salt);
-  const out = new Uint8Array(1 + 4 + json.length + 1 + regions.length * 20 + 4 + data.length);
+  // Version 1 stores the region count in one byte; version 2 (only written when there are
+  // 256 or more regions, e.g. an APNG with 256+ frames) stores it in four.
+  const version = regions.length > 255 ? 2 : 1;
+  const countBytes = version === 1 ? 1 : 4;
+  const out = new Uint8Array(1 + 4 + json.length + countBytes + regions.length * 20 + 4 + data.length);
   const dv = new DataView(out.buffer);
   let o = 0;
-  out[o++] = 1;
+  out[o++] = version;
   dv.setUint32(o, json.length); o += 4;
   out.set(json, o); o += json.length;
-  out[o++] = regions.length;
+  if (version === 1) out[o++] = regions.length;
+  else { dv.setUint32(o, regions.length); o += 4; }
   for (const r of regions) for (const v of [r.frame, r.x, r.y, r.width, r.height]) { dv.setUint32(o, v); o += 4; }
   dv.setUint32(o, data.length); o += 4;
   out.set(data, o);
@@ -111,14 +116,17 @@ export function decodeStash(payload, key, salt, bytesOf, limits) {
   const need = (o, n) => { if (o + n > payload.length) throw bad('truncated'); };
   let o = 0;
   need(0, 5);
-  if (payload[o++] !== 1) throw bad('version');
+  const version = payload[o++];
+  if (version !== 1 && version !== 2) throw bad('version');
+  const countBytes = version === 1 ? 1 : 4;
   const jl = dv.getUint32(o); o += 4;
-  need(o, jl + 1);
+  need(o, jl + countBytes);
   checkJson(jl, limits);
   let watermark;
   try { watermark = JSON.parse(fromUtf8.decode(payload.subarray(o, o + jl))); } catch { throw bad('JSON'); }
   o += jl;
-  const count = payload[o++];
+  const count = version === 1 ? payload[o] : dv.getUint32(o);
+  o += countBytes;
   need(o, count * 20 + 4);
   const regions = [];
   let total = 0;

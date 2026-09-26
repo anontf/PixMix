@@ -4,7 +4,7 @@ import { pick, toBytes, detectFormat } from './formats/index.js';
 import { scramblePng, rekeyPng, inspectPng } from './formats/png/index.js';
 import { scrambleJpeg, rekeyJpeg, inspectJpeg } from './formats/jpeg/index.js';
 import {
-  scrambleJxl, scrambleJxlPixels, scrambleJpegToJxl, rekeyJxl, inspectJxl, reencodeNotes, hasJpegData, reconstructJpeg,
+  scrambleJxl, scrambleJxlPixels, scrambleJpegToJxl, rekeyJxl, inspectJxl, reencodeNotes, hasJpegData, reconstructJpeg, rebuiltJpegMatches,
 } from './formats/jxl/index.js';
 import { readJxl, readJxlHeader } from './formats/jxl/container.js';
 import { convert, convertAsync, decodeForJxl, targetFormat, OUTPUT_FORMATS } from './convert/index.js';
@@ -103,34 +103,47 @@ export async function encodeAsync(input, opts) {
   opts = withLimits(bytes, opts);
   const withFormat = withTarget(bytes, opts);
   const from = detectFormat(bytes);
+  // Why the default JPEG route was not taken for a JPEG source, for the report.
+  let fallback = null;
   if (withFormat.format === 'jxl') {
     const viaJpeg = await jpegForJxl(bytes, from, opts);
-    if (viaJpeg) {
+    if (viaJpeg?.jpeg) {
       // JPEG route: sanitise the JPEG, scramble it in the DCT domain, recompress to JXL.
       const converted = convert(viaJpeg.jpeg, { ...opts, format: 'jpeg' });
-      opts.onConvert?.({ ...converted, bytes: undefined, format: 'jxl', from, decoder: viaJpeg.decoder, dropped: [...viaJpeg.notes, ...converted.dropped] });
-      return scrambleJpegToJxl(converted.bytes, opts);
-    }
+      try {
+        const out = await scrambleJpegToJxl(converted.bytes, opts);
+        opts.onConvert?.({ ...converted, bytes: undefined, format: 'jxl', from, decoder: viaJpeg.decoder, dropped: [...viaJpeg.notes, ...converted.dropped] });
+        return out;
+      } catch (err) {
+        if (!err?.jpegRoute || opts.mode === 'mcu') throw err;
+        fallback = err.message;
+      }
+    } else if (viaJpeg?.fallback) fallback = viaJpeg.fallback;
   }
+  const fallbackNote = (report) => {
+    // The size note would point at the JPEG route; say it was tried instead.
+    if (fallback) report.notes = [`JPEG route not possible, used the pixel route (lossless, typically 3-8 times larger): ${fallback}`];
+    return report;
+  };
   if (withFormat.format === 'jxl' && from !== 'jxl') {
     // Decode once, scramble the pixels, encode once (no intermediate unscrambled JXL).
     const { image, boxes, report } = await decodeForJxl(bytes, withFormat);
-    opts.onConvert?.(report);
+    opts.onConvert?.(fallbackNote(report));
     return scrambleJxlPixels(image, boxes, opts);
   }
   const converted = await convertAsync(bytes, withFormat);
   if (converted.format === 'jxl') {
     converted.dropped.push(...reencodeNotes(readJxlHeader(readJxl(converted.bytes, opts.limits).codestream, opts.limits)));
   }
-  opts.onConvert?.(converted);
+  opts.onConvert?.(fallbackNote(converted));
   const s = SCRAMBLERS[converted.format];
   return s.scramble ? s.scramble(converted.bytes, opts) : s.scrambleAsync(converted.bytes, opts);
 }
 
 /**
- * For JPEG XL output: the JPEG to take the JPEG route with, or null for the pixel route.
- * The route is used when asked for (mode mcu), or by default when the source is a JPEG or a
- * recompressed-JPEG JXL.
+ * For JPEG XL output: {jpeg} to take the JPEG route with, {fallback: reason} when a JPEG
+ * source cannot take it, or null for the pixel route. The route is used when asked for
+ * (mode mcu), or by default when the source is a JPEG or a recompressed-JPEG JXL.
  */
 async function jpegForJxl(bytes, from, { mode, limits }) {
   if (mode && mode !== 'mcu') return null;
@@ -140,12 +153,21 @@ async function jpegForJxl(bytes, from, { mode, limits }) {
     return null;
   }
   if (from === 'jpeg') return { jpeg: bytes, decoder: 'none', notes: [] };
+  let jpeg;
   try {
-    return { jpeg: await reconstructJpeg(bytes, limits), decoder: 'jpeg reconstruction', notes: [] };
+    jpeg = await reconstructJpeg(bytes, limits);
   } catch (err) {
     if (mode === 'mcu' || err?.code === 'LIMIT') throw err;
-    return null; // e.g. a progressive JPEG jxl-oxide cannot rebuild: fall back to pixels
+    return { fallback: `jxl-oxide cannot rebuild its JPEG: ${err?.message ?? err}` };
   }
+  // jxl-oxide 0.12 rebuilds some progressive JPEGs wrongly without an error; scrambling that
+  // JPEG would "restore" a different image.
+  if (!(await rebuiltJpegMatches(bytes, jpeg, limits))) {
+    const why = 'jxl-oxide does not rebuild its JPEG exactly';
+    if (mode === 'mcu') throw new PixmixError(`This JPEG XL cannot take the JPEG route (${why}); use mode "block" or "pixel"`, 'UNSUPPORTED');
+    return { fallback: why };
+  }
+  return { jpeg, decoder: 'jpeg reconstruction', notes: [] };
 }
 
 // Validates the output format and mode combination up front, before any decoding work.

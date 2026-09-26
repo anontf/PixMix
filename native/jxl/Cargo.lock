@@ -126,8 +126,6 @@ dependencies = [
 [[package]]
 name = "jxl-jbr"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e35d032bcec660647828527ff42c6f5776d2fd44b8357f9f6d9ac6dc07218e46"
 dependencies = [
  "brotli-decompressor",
  "jxl-bitstream",

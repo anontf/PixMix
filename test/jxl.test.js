@@ -184,6 +184,46 @@ test('a recompressed-JPEG JXL input stays on the JPEG route; rekey works on it',
   await assert.rejects(rekeyAsync(s, { from: 'one', to: 'two', mode: 'pixel' }), /only be re-keyed in mode "mcu"/);
 });
 
+test('JPEG route: a JPEG with a comment (COM) is rebuilt exactly (jxl-oxide patch)', async () => {
+  const base = new Uint8Array(await photo(96, 64));
+  const text = new TextEncoder().encode('a comment');
+  const com = Uint8Array.of(0xff, 0xfe, 0, text.length + 2, ...text);
+  const jpg = new Uint8Array([...base.subarray(0, 2), ...com, ...base.subarray(2)]);
+  const s = await encodeAsync(jpg, { key: 'k', format: 'jxl' });
+  assert.equal(inspect(s).mode, 'mcu');
+  const restored = await codec.reconstructJpeg(await decodeAsync(s, { key: 'k' }));
+  assert.ok(sameCoefs(restored, jpg));
+  assert.ok(Buffer.from(restored).includes(Buffer.from(com)), 'the comment comes back as it was');
+  // A third-party recompressed JPEG with a comment too.
+  assert.ok(Buffer.from(await codec.reconstructJpeg(await codec.transcodeJpeg(jpg))).equals(Buffer.from(jpg)));
+});
+
+test('JPEG route: JPEGs it cannot carry fall back to the pixel route, and the report says why', async () => {
+  const cmyk = new Uint8Array(await sharp(await photo(64, 48)).toColourspace('cmyk').jpeg().toBuffer());
+  let report;
+  const s = await encodeAsync(cmyk, { key: 'k', format: 'jxl', onConvert: (r) => { report = r; } });
+  assert.equal(inspect(s).mode, 'block');
+  assert.match(report.notes.join(), /JPEG route not possible/);
+  await decodeAsync(s, { key: 'k' });
+  await assert.rejects(encodeAsync(cmyk, { key: 'k', format: 'jxl', mode: 'mcu' }), { code: 'UNSUPPORTED' });
+});
+
+test('a recompressed-JPEG JXL that jxl-oxide rebuilds wrongly takes the pixel route', async () => {
+  // jxl-oxide 0.12 silently rebuilds this progressive JPEG with different coefficients.
+  const w = 768, h = 512, d = Buffer.alloc(w * h * 3);
+  let seed = 1;
+  for (let i = 0; i < d.length; i++) { seed = (seed * 1103515245 + 12345) >>> 0; d[i] = ((((i / 3) | 0) % w) * 2 + (seed >>> 24) / 4) & 255; }
+  const jpg = new Uint8Array(await sharp(d, { raw: { width: w, height: h, channels: 3 } }).jpeg({ quality: 85, progressive: true }).toBuffer());
+  const jxl = await codec.transcodeJpeg(jpg);
+  assert.ok(!Buffer.from(await codec.reconstructJpeg(jxl)).equals(Buffer.from(jpg)), 'still a case jxl-oxide gets wrong');
+  let report;
+  const s = await encodeAsync(jxl, { key: 'k', onConvert: (r) => { report = r; } });
+  assert.equal(inspect(s).mode, 'block');
+  assert.match(report.notes.join(), /does not rebuild its JPEG exactly/);
+  assert.ok((await pixelsOf(await decodeAsync(s, { key: 'k' }))).equals(await pixelsOf(jxl)), 'the image the JPEG XL shows');
+  await assert.rejects(encodeAsync(jxl, { key: 'k', mode: 'mcu' }), { code: 'UNSUPPORTED' });
+});
+
 test('inspect describes JPEG-route files properly', async () => {
   const jxl = await encodeAsync(new Uint8Array(await photo(64, 48)), { key: 'k', format: 'jxl', transforms: false });
   const info = inspect(jxl);

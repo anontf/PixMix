@@ -241,14 +241,66 @@ export async function scrambledJpegOf(bytes, limits) {
   return jpeg;
 }
 
-async function toJxlWithMarker(scrambledJpeg) {
+/**
+ * The error for a JPEG the JPEG route cannot carry. `jpegRoute` lets the encoder fall back to
+ * the pixel route when the route was only the default.
+ */
+function routeError(why) {
+  const err = new PixmixError(`This JPEG cannot take the JPEG XL JPEG route (${why}); use mode "block" or "pixel"`, 'UNSUPPORTED');
+  err.jpegRoute = true;
+  return err;
+}
+
+async function toJxlWithMarker(scrambledJpeg, limits) {
   const codec = await loadJxlCodec();
-  const { boxes, codestream } = readJxl(await codec.transcodeJpeg(scrambledJpeg));
+  let transcoded;
+  try {
+    transcoded = await codec.transcodeJpeg(scrambledJpeg);
+  } catch (err) {
+    if (err?.code === 'LIMIT') throw err;
+    throw routeError(`libjxl cannot recompress it: ${err?.message ?? err}`); // e.g. CMYK, 4:1:1
+  }
+  const { boxes, codestream } = readJxl(transcoded);
   const kept = boxes.filter((b) => !STRUCTURE.has(b.type)); // jbrd, Exif, xml from libjxl
   // The JPEG inside holds the watermark segments; a copy in a box lets inspect() see it.
   const wm = jpegWatermark(readSegments(scrambledJpeg).segments);
   const mirror = wm ? [{ type: WATERMARK_TAG, data: encodeWatermark(carried(wm)) }] : [];
-  return writeJxl([...kept, { type: MARKER_BOX, data: jpegMarkerBytes(scrambledJpeg) }, ...mirror], codestream);
+  const out = writeJxl([...kept, { type: MARKER_BOX, data: jpegMarkerBytes(scrambledJpeg) }, ...mirror], codestream);
+  // libjxl writes the file and jxl-oxide rebuilds the JPEG from it, and jxl-oxide 0.12 gets
+  // some JPEGs wrong (e.g. 4:4:4 stored with 1x2 sampling factors). A file that cannot be
+  // rebuilt bit for bit could never be restored, so never write one.
+  let rebuilt;
+  try {
+    rebuilt = await codec.reconstructJpeg(out, { limits });
+  } catch (err) {
+    if (err?.code === 'LIMIT') throw err;
+    throw routeError(`jxl-oxide cannot rebuild it: ${err?.message ?? err}`);
+  }
+  if (!rebuilt || !sameBytes(rebuilt, scrambledJpeg)) throw routeError('jxl-oxide does not rebuild it exactly');
+  return out;
+}
+
+const sameBytes = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
+
+/**
+ * Whether `jpeg` (rebuilt by jxl-oxide from a third-party recompressed JPEG XL) holds the
+ * same image as the JPEG XL itself. jxl-oxide 0.12 rebuilds some progressive JPEGs wrongly
+ * without an error. Recompressing the rebuilt JPEG and decoding both with the same decoder
+ * gives identical pixels exactly when the DCT coefficients match; a false alarm only costs
+ * the pixel route.
+ */
+export async function rebuiltJpegMatches(jxl, jpeg, limits) {
+  const codec = await loadJxlCodec();
+  let again;
+  try {
+    again = await codec.transcodeJpeg(jpeg);
+  } catch (err) {
+    if (err?.code === 'LIMIT') throw err;
+    return false;
+  }
+  const a = await codec.decode(jxl, { srgb: false, limits });
+  const b = await codec.decode(again, { srgb: false, limits });
+  return a.width === b.width && a.height === b.height && sameBytes(a.data, b.data);
 }
 
 /**
@@ -256,7 +308,7 @@ async function toJxlWithMarker(scrambledJpeg) {
  * is always baseline: jxl-oxide 0.12 cannot reconstruct some progressive JPEGs.
  */
 export async function scrambleJpegToJxl(jpeg, { key, transforms, salt, limits, watermark, visibleWatermark } = {}) {
-  return toJxlWithMarker(scrambleJpeg(jpeg, { key, transforms, salt, progressive: false, limits, watermark, visibleWatermark }));
+  return toJxlWithMarker(scrambleJpeg(jpeg, { key, transforms, salt, progressive: false, limits, watermark, visibleWatermark }), limits);
 }
 
 // --- both routes -------------------------------------------------------------------
@@ -316,7 +368,7 @@ export async function rekeyJxl(bytes, { from, to, mode, block, salt, effort, tra
   if (marker.params.mode === 'mcu') {
     if (mode && mode !== 'mcu') throw new PixmixError('This JPEG XL holds a scrambled JPEG; it can only be re-keyed in mode "mcu"', 'BAD_OPTION');
     const jpeg = await scrambledJpegOf(bytes, limits);
-    return toJxlWithMarker(rekeyJpeg(jpeg, { from, to, transforms, salt, progressive: false, limits, watermark, visibleWatermark }));
+    return toJxlWithMarker(rekeyJpeg(jpeg, { from, to, transforms, salt, progressive: false, limits, watermark, visibleWatermark }), limits);
   }
   if (mode === 'mcu') throw new PixmixError('Mode "mcu" needs a JPEG XL that holds a JPEG', 'BAD_OPTION');
   const scrambled = await decodeJxlImage(bytes, { limits });

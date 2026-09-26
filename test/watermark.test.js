@@ -245,6 +245,23 @@ test('APNG: every full-size frame gets the watermark', async () => {
   for (let i = 0; i < 3; i++) assert.ok(changedOnlyIn(toRGBA8(plain, plain.frames[i]), marked.frames[i], 40, rect, 4) > 10, `frame ${i}`);
 });
 
+test('visible watermark on an APNG with 256+ frames: the stash counts regions in four bytes', async () => {
+  const gif = (n) => {
+    const buf = Buffer.alloc(1 << 20);
+    const gw = new GifWriter(buf, 40, 24, { loop: 0, palette: [0x000000, 0xff0000, 0x00ff00, 0x0000ff] });
+    for (let f = 0; f < n; f++) gw.addFrame(0, 0, 40, 24, Array.from({ length: 960 }, (_, i) => (((i % 40) + f * 9) >> 3) & 3), { delay: 5 });
+    return new Uint8Array(buf.subarray(0, gw.end()));
+  };
+  for (const [n, version] of [[255, 1], [256, 2], [300, 2]]) {
+    const png = encode(gif(n), { key: 'k' });
+    const want = await decodeAsync(png, { key: 'k' });
+    const s = await rekeyAsync(png, { from: 'k', to: 'k', visibleWatermark: tiny });
+    assert.equal(readChunks(s).find((c) => c.type === 'pmWs').data[0], version, `${n} frames`);
+    assert.ok(samePng(await decodeAsync(s, { key: 'k' }), want), `${n} frames: exact restore`);
+    assert.ok(samePng(await decodeAsync(await rekeyAsync(s, { from: 'k', to: 'j' }), { key: 'j' }), want), `${n} frames: exact after rekey`);
+  }
+});
+
 for (const [name, src] of [['baseline 4:2:0', JPEG], ['progressive', JPEG_PROGRESSIVE], ['4:4:4', JPEG_444], ['grey', JPEG_GREY]]) {
   test(`JPEG ${name}: the watermark is painted in the DCT domain, only its MCUs change`, async () => {
     const s = encode(src, { key: 'k', watermark: gold });

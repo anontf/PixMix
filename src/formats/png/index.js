@@ -265,11 +265,12 @@ export function pngWatermark(chunks, limits) {
 /**
  * The restored frames with a watermark drawn on them. `paint` is {painter, watermark}:
  * painter is watermark/paint.js (loaded by the caller, so decoders only fetch it when
- * needed), watermark a compiled watermark.
+ * needed), watermark a compiled watermark; `orientation` overrides the eXIf one (for
+ * browsers that show PNGs unrotated).
  */
 function painted(img, frames, paint) {
   if (!paint?.watermark) return { img, frames };
-  return paint.painter.paintPng(img, frames, paint.watermark, pngOrientation(img.chunks), paint.limits) ?? { img, frames };
+  return paint.painter.paintPng(img, frames, paint.watermark, paint.orientation ?? pngOrientation(img.chunks), paint.limits) ?? { img, frames };
 }
 
 /**

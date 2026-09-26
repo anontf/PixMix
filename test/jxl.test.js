@@ -259,3 +259,18 @@ test('16-bit JPEG XL stays 16-bit through scramble, restore and rekey, exactly',
     assert.deepEqual(await samples(await decodeAsync(r, { key: 'k2' })), d, `${opts.mode}: exact after rekey`);
   }
 });
+
+test('JPEG route: a JPEG with comments comes back bit for bit (jxl-oxide 0.12 doubles the COM marker byte)', async () => {
+  const { readSegments, writeSegments } = await import('../src/formats/jpeg/markers.js');
+  const { convert } = await import('../src/index.js');
+  const base = new Uint8Array(await sharp(Buffer.from(rgba(32, 16)), { raw: { width: 32, height: 16, channels: 4 } }).removeAlpha().jpeg().toBuffer());
+  const { segments } = readSegments(base);
+  const com = (s) => ({ marker: 0xfe, data: new TextEncoder().encode(s) });
+  const jpeg = writeSegments([com('first'), ...segments.slice(0, 2), com('second, after the tables'), ...segments.slice(2)]);
+  assert.deepEqual(await codec.reconstructJpeg(await codec.transcodeJpeg(jpeg)), jpeg);
+  const scrambled = await encodeAsync(jpeg, { key: 'k', format: 'jxl' });
+  const restored = await codec.reconstructJpeg(await decodeAsync(scrambled, { key: 'k' }));
+  const comments = (b) => readSegments(b).segments.filter((s) => s.marker === 0xfe).map((s) => Buffer.from(s.data).toString());
+  assert.deepEqual(comments(restored), ['first', 'second, after the tables']);
+  assert.deepEqual(comments(convert(jpeg).bytes), comments(restored));
+});

@@ -140,7 +140,35 @@ export async function decodeAnimation(bytes, { srgb = true, icc: wantIcc = !srgb
 export async function reconstructJpeg(bytes, { limits } = {}) {
   await ready();
   const l = wasmLimits(limits);
-  return guard(() => reconstructRaw(bytes, l.maxPixels, l.alloc)) ?? null;
+  const jpeg = guard(() => reconstructRaw(bytes, l.maxPixels, l.alloc)) ?? null;
+  return jpeg && repairComments(jpeg);
+}
+
+/**
+ * jxl-oxide 0.12 writes each COM segment's marker byte twice (FF FE FE len …), so a JPEG
+ * with a comment does not come back as it went in. Drops the extra byte, only where the
+ * segment then lines up with the next marker (a fixed jxl-oxide leaves the file alone).
+ */
+function repairComments(jpeg) {
+  const drop = [];
+  let p = 2;
+  while (p + 4 < jpeg.length && jpeg[p] === 0xff) {
+    const m = jpeg[p + 1];
+    if (m === 0xda || m === 0xd9) break;
+    const len = (b) => (jpeg[b] << 8) | jpeg[b + 1];
+    if (m === 0xfe && jpeg[p + 2] === 0xfe && p + 5 < jpeg.length) {
+      const fixedEnd = p + 3 + len(p + 3);
+      const asIsEnd = p + 2 + len(p + 2);
+      if (jpeg[fixedEnd] === 0xff && jpeg[asIsEnd] !== 0xff) { drop.push(p + 2); p = fixedEnd; continue; }
+    }
+    p += 2 + len(p + 2);
+  }
+  if (!drop.length) return jpeg;
+  const out = new Uint8Array(jpeg.length - drop.length);
+  let o = 0, from = 0;
+  for (const d of drop) { out.set(jpeg.subarray(from, d), o); o += d - from; from = d + 1; }
+  out.set(jpeg.subarray(from), o);
+  return out;
 }
 
 /**

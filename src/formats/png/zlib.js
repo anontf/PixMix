@@ -42,9 +42,37 @@ export function inflateUpTo(data, limit) {
     z.push(data.subarray(i, i + STEP), last);
     if (last) break;
   }
+  // fflate does not check the Adler-32 that ends the stream; node:zlib (and the browsers'
+  // streams) do, so a file must not be accepted here and refused there.
+  if (ended && n <= limit && !hasChecksum(data, adler32(parts))) throw new Error('incorrect data check');
   const out = concat(parts, Math.min(n, limit));
   if (n > limit) out.more = true;
   return out;
+}
+
+function adler32(parts) {
+  let a = 1, b = 0;
+  for (const p of parts) {
+    for (let i = 0; i < p.length;) {
+      const end = Math.min(i + 3800, p.length);
+      for (; i < end; i++) { a += p[i]; b += a; }
+      a %= 65521;
+      b %= 65521;
+    }
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+/**
+ * The checksum follows the deflate data, normally at the very end; bytes after the stream
+ * are tolerated (as by node:zlib), so it is looked for from the end backwards.
+ */
+function hasChecksum(data, sum) {
+  const b0 = sum >>> 24, b1 = (sum >> 16) & 255, b2 = (sum >> 8) & 255, b3 = sum & 255;
+  for (let i = data.length - 4; i >= 2; i--) {
+    if (data[i] === b0 && data[i + 1] === b1 && data[i + 2] === b2 && data[i + 3] === b3) return true;
+  }
+  return false;
 }
 
 /** Async variants for browsers: (De)CompressionStream('deflate') is native zlib and far

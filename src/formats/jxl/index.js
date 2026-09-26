@@ -17,18 +17,20 @@
 // image, a `pmWs` box holds the pixels under a watermark drawn on the scrambled image (pixel
 // route; the JPEG route keeps both in the JPEG's APP15 segments, and mirrors pmWm in a box).
 
-import { readJxl, writeJxl, wrapCodestream, readJxlHeader, isJxl } from './container.js';
+import { readJxl, writeJxl, wrapCodestream, readJxlHeader, isJxl, extraChannelsNote } from './container.js';
 import { loadJxlCodec } from './load.js';
-import { computeLayout, applyMap } from '../../core/layout.js';
+import { computeLayout, applyMap, fitParams } from '../../core/layout.js';
 import {
   makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError, FLAG_STASH, tileSize, tileTransforms,
 } from '../../core/params.js';
-import { stripExifThumbnail } from '../../meta/thumbnails.js';
+import { stripExifPreviews, stripXmpPreviews } from '../../meta/thumbnails.js';
 import { exifTiff, unwrapBrob } from '../../meta/jxl.js';
 import { scrambleJpeg, unscrambleJpegDetailed, rekeyJpeg, jpegMarkerBytes, jpegWatermark } from '../jpeg/index.js';
 import { readSegments } from '../jpeg/markers.js';
-import { watermarkInfo, carried } from '../png/index.js';
-import { WATERMARK_TAG, STASH_TAG, encodeWatermark, decodeWatermark, restorePixelStash } from '../../watermark/embed.js';
+import { watermarkInfo, carriedFields } from '../png/index.js';
+import {
+  WATERMARK_TAG, STASH_TAG, encodeWatermark, readCarried, keptWatermark, restorePixelStash,
+} from '../../watermark/embed.js';
 import { stashRgba } from '../../watermark/paint.js';
 
 export { isJxl };
@@ -40,35 +42,46 @@ const STALE = {
   jbrd: 'JPEG reconstruction data (no longer matches the image)',
   jhgm: 'HDR gain map (a second image)',
 };
+const KEPT_WITH_CODESTREAM = new Set(['jxll', MARKER_BOX, WATERMARK_TAG, STASH_TAG]);
 
 /**
- * Metadata boxes to carry over, with EXIF thumbnails removed unless kept.
+ * Metadata boxes to carry over, with EXIF and XMP previews removed unless kept.
+ * `sameCodestream`: the codestream is copied unchanged (not re-encoded), so what belongs to
+ * it stays too: its level box (jxll), a pixmix marker with its watermark boxes, and the JPEG
+ * reconstruction data (jbrd), unless removing a preview changed the EXIF or XMP it rebuilds.
  * @returns {{boxes: import('./container.js').Box[], dropped: string[]}}
  */
-export function sanitizeBoxes(boxes, { keepThumbnails = false, limits } = {}) {
+export function sanitizeBoxes(boxes, { keepThumbnails = false, limits, sameCodestream = false } = {}) {
   const out = [], dropped = [];
+  const note = (s) => { if (!dropped.includes(s)) dropped.push(s); };
+  let metaChanged = false;
   for (const box of boxes) {
+    if (sameCodestream && (KEPT_WITH_CODESTREAM.has(box.type) || box.type === 'jbrd')) { out.push(box); continue; }
     if (STRUCTURE.has(box.type)) continue;
     if (STALE[box.type]) { dropped.push(STALE[box.type]); continue; }
     if (keepThumbnails) { out.push(box); continue; }
-    if (box.type === 'Exif' && box.data.length > 4) {
-      const stripped = stripExifThumbnail(exifTiff(box.data));
-      if (stripped) {
-        out.push({ type: 'Exif', data: withOffset(stripped) });
-        dropped.push('EXIF thumbnail');
-        continue;
-      }
-    } else if (box.type === 'brob' && String.fromCharCode(...box.data.subarray(0, 4)) === 'Exif') {
-      const inner = unwrapBrob(box.data, limits);
-      if (!inner.data) { dropped.push('compressed EXIF (cannot be checked for a thumbnail here)'); continue; }
-      const stripped = stripExifThumbnail(exifTiff(inner.data));
-      out.push(stripped ? { type: 'Exif', data: withOffset(stripped) } : box);
-      if (stripped) dropped.push('EXIF thumbnail');
-      continue;
+    const inner = box.type === 'brob' ? String.fromCharCode(...box.data.subarray(0, 4)) : box.type;
+    if (inner !== 'Exif' && inner !== 'xml ') { out.push(box); continue; }
+    let data = box.data;
+    if (box.type === 'brob') {
+      const u = unwrapBrob(box.data, limits);
+      if (!u.data) { metaChanged = true; dropped.push(`compressed ${inner === 'Exif' ? 'EXIF' : 'XMP'} (cannot be checked for a ${inner === 'Exif' ? 'thumbnail' : 'preview'} here)`); continue; }
+      data = u.data;
     }
-    out.push(box);
+    if (inner === 'Exif') {
+      const stripped = data.length > 4 ? stripExifPreviews(exifTiff(data)) : null;
+      out.push(stripped ? { type: 'Exif', data: withOffset(stripped.tiff) } : box);
+      if (stripped) { stripped.dropped.forEach(note); metaChanged = true; }
+    } else {
+      const stripped = stripXmpPreviews(new TextDecoder().decode(data));
+      if (stripped) { stripped.dropped.forEach(note); metaChanged = true; }
+      if (!stripped) out.push(box);
+      else if (stripped.text !== null) out.push({ type: 'xml ', data: new TextEncoder().encode(stripped.text) });
+    }
   }
-  return { boxes: out, dropped };
+  if (!metaChanged || !out.some((b) => b.type === 'jbrd')) return { boxes: out, dropped };
+  dropped.push('JPEG reconstruction data (it rebuilds the preview that was removed)');
+  return { boxes: out.filter((b) => b.type !== 'jbrd'), dropped };
 }
 
 function withOffset(tiff) {
@@ -85,6 +98,8 @@ export function reencodeNotes(header) {
   if (header.lossy) notes.push('lossy compression (re-encoded losslessly from the decoded pixels; the file grows)');
   if (highPrecision(header) && header.animated) notes.push(`${header.float ? 'floating-point' : `${header.bits}-bit`} precision (reduced to 8-bit; animations are 8-bit)`);
   else if (header.float || header.bits > 16) notes.push(`${header.float ? 'floating-point' : `${header.bits}-bit`} precision (reduced to 16-bit)`);
+  const extra = extraChannelsNote(header);
+  if (extra) notes.push(extra);
   return notes;
 }
 
@@ -100,10 +115,12 @@ function readMarkerBox(boxes) {
   return box ? readMarker(box.data) : null;
 }
 
-/** The watermark a JPEG XL carries for its restored image ({id, name, compiled}), or null. */
+/**
+ * The watermark a JPEG XL carries for its restored image, read tolerantly (see readCarried
+ * in watermark/embed.js): {watermark: {id, name, compiled}|null, error, data}.
+ */
 export function jxlWatermark(boxes, limits) {
-  const box = boxes.find((b) => b.type === WATERMARK_TAG);
-  return box ? decodeWatermark(box.data, limits) : null;
+  return readCarried(boxes.find((b) => b.type === WATERMARK_TAG)?.data, limits);
 }
 
 const frameList = (image) => (image.frames ? image.frames.map((f) => f.data) : [image.data]);
@@ -180,7 +197,7 @@ const effortFor = (params, effort) => effort ?? (params.mode === 'pixel' ? 2 : 7
  */
 export async function scrambleJxlPixels(image, boxes, { key, mode, block, transforms, salt, effort, watermark, visibleWatermark } = {}) {
   if (mode === 'mcu') throw new PixmixError('Mode "mcu" needs a JPEG source', 'BAD_OPTION');
-  let params = makeParams({ mode, block, transforms, salt });
+  let params = fitParams(makeParams({ mode, block, transforms, salt }), [image]);
   const scrambled = mapFrames(key, params, image, 'scramble');
   const extra = [];
   if (watermark) extra.push({ type: WATERMARK_TAG, data: encodeWatermark(watermark) });
@@ -216,12 +233,16 @@ function restoreStash(boxes, marker, image, key, limits) {
   }
 }
 
-/** What the pixel route scrambles: the decoded image and the metadata boxes to carry. */
+/** What the pixel route scrambles: the decoded image, the metadata boxes to carry, and what was not carried. */
 export async function jxlForScramble(bytes, opts = {}) {
   const { limits } = opts;
-  const { boxes } = readChecked(bytes, limits);
+  const { boxes, codestream } = readChecked(bytes, limits);
   if (readMarkerBox(boxes)) throw new PixmixError('Image is already scrambled (decode it first, or use rekey)', 'ALREADY_SCRAMBLED');
-  return { image: await decodeJxlImage(bytes, { limits }), boxes: sanitizeBoxes(boxes, opts).boxes };
+  const clean = sanitizeBoxes(boxes, opts);
+  // Only the pixels are needed: JPEG reconstruction data the decoder cannot use (the reason
+  // the JPEG route was not taken) would fail the decode, so the bare codestream is decoded.
+  const pixels = boxes.some((b) => b.type === 'jbrd') ? codestream : bytes;
+  return { image: await decodeJxlImage(pixels, { limits }), boxes: clean.boxes, dropped: clean.dropped };
 }
 
 export async function scrambleJxl(bytes, opts = {}) {
@@ -288,8 +309,8 @@ async function toJxlWithMarker(scrambledJpeg, limits) {
   const { boxes, codestream } = readJxl(transcoded);
   const kept = boxes.filter((b) => !STRUCTURE.has(b.type)); // jbrd, Exif, xml from libjxl
   // The JPEG inside holds the watermark segments; a copy in a box lets inspect() see it.
-  const wm = jpegWatermark(readSegments(scrambledJpeg).segments);
-  const mirror = wm ? [{ type: WATERMARK_TAG, data: encodeWatermark(carried(wm)) }] : [];
+  const wm = jpegWatermark(readSegments(scrambledJpeg).segments, limits).data;
+  const mirror = wm ? [{ type: WATERMARK_TAG, data: wm }] : [];
   const out = writeJxl([...kept, { type: MARKER_BOX, data: jpegMarkerBytes(scrambledJpeg) }, ...mirror], codestream);
   // libjxl writes the file and jxl-oxide rebuilds the JPEG from it, and jxl-oxide 0.12 gets
   // some JPEGs wrong (e.g. 4:4:4 stored with 1x2 sampling factors). A file that cannot be
@@ -353,7 +374,7 @@ export async function unscrambleJxlDetailed(bytes, { key, effort, display = fals
   if (marker.params.mode === 'mcu') {
     const scrambledJpeg = policyOnJpeg(meta, await scrambledJpegOf(bytes, limits));
     const jpeg = unscrambleJpegDetailed(scrambledJpeg, { key, limits });
-    return { route: 'jpeg', params: marker.params, jpeg, watermark: jpeg.watermark, toJxl: (paint) => codec.transcodeJpeg(jpeg.toJpeg(paint)) };
+    return { route: 'jpeg', params: marker.params, jpeg, watermark: jpeg.watermark, watermarkError: jpeg.watermarkError, toJxl: (paint) => codec.transcodeJpeg(jpeg.toJpeg(paint)) };
   }
   const scrambled = await decodeJxlImage(bytes, { display, limits });
   restoreStash(boxes, marker, scrambled, key, limits);
@@ -373,7 +394,7 @@ export async function unscrambleJxlDetailed(bytes, { key, effort, display = fals
     scrambled: scrambled.data,
     pixels: image.data,
     image,
-    watermark: jxlWatermark(boxes, limits),
+    ...carriedFields(jxlWatermark(boxes, limits)),
     /** The restored image with a watermark drawn on a copy (`paint`: {painter, watermark}). */
     paint: paintImage,
     toJxl: display ? null : async (paint) => {
@@ -408,8 +429,8 @@ export async function rekeyJxl(bytes, { from, to, mode, block, salt, effort, tra
     mode: mode ?? marker.params.mode,
     block: block ?? (marker.params.mode === 'block' ? tileSize(marker.params) : undefined),
     transforms: transforms ?? (marker.params.mode === 'block' ? tileTransforms(marker.params) : undefined),
-    watermark: watermark === undefined ? carried(jxlWatermark(boxes, limits)) : watermark,
-    visibleWatermark: visibleWatermark === undefined ? visible : visibleWatermark,
+    watermark: watermark === undefined ? keptWatermark(jxlWatermark(boxes, limits)) : watermark,
+    visibleWatermark: visibleWatermark === undefined ? visible?.() ?? null : visibleWatermark,
   });
 }
 

@@ -7,6 +7,8 @@ import { unscrambleJxl, unscrambleJxlDetailed, inspectJxl } from './formats/jxl/
 import { PixmixError } from './core/params.js';
 import { loadPainter } from './watermark/load.js';
 import { withLimits } from './core/limits.js';
+import { inspectOther } from './formats/other.js';
+import { checkOptions } from './core/options.js';
 import { loadMetadataTools, metadataToolsIfLoaded } from './meta/load.js';
 
 export { configureJxl } from './formats/jxl/load.js';
@@ -38,7 +40,7 @@ export function decode(input, opts) {
   const d = pick(DECODERS, bytes);
   if (opts?.watermark) throw new PixmixError('Drawing a watermark is async; use decodeAsync', 'ASYNC_DECODER');
   if (!d.unscramble) throw new PixmixError('JPEG XL decoding is async; use decodeAsync', 'ASYNC_DECODER');
-  opts = withLimits(bytes, opts);
+  opts = withLimits(bytes, checkOptions(opts));
   if (!opts.metadata) return d.unscramble(bytes, opts);
   const tools = metadataToolsIfLoaded();
   if (!tools) throw new PixmixError('A metadata policy needs pixmix\'s metadata module: use decodeAsync, or import pixmix (or pixmix/encoder)', 'ASYNC_DECODER');
@@ -61,7 +63,9 @@ function policyApplied(tools, bytes, opts) {
  * Restoring is exact unless `watermark` asks for one to be drawn on the result:
  * - a compiled watermark (see watermark/compile.js), or {id} / an id string, looked up with
  *   `resolveWatermark(id)`;
- * - true or 'embedded': the one the file carries (nothing is drawn if it carries none).
+ * - true or 'embedded': the one the file carries (nothing is drawn if it carries none; one
+ *   that cannot be read is a BAD_WATERMARK or LIMIT error). Otherwise a carried watermark that
+ *   cannot be read (damaged, or over maxMetadataBytes) is ignored: it never stops restoring.
  * @param {{key: string|Uint8Array, level?: number, watermark?: object|string|boolean,
  *   resolveWatermark?: (id: string) => object|Promise<object>, metadata?: object|string,
  *   onMetadata?: (report: object) => void}} opts  metadata: a policy for the restored file
@@ -69,7 +73,7 @@ function policyApplied(tools, bytes, opts) {
 export async function decodeAsync(input, opts) {
   let bytes = toBytes(input);
   const d = pick(DECODERS, bytes);
-  opts = withLimits(bytes, opts);
+  opts = withLimits(bytes, checkOptions(opts));
   const format = detectFormat(bytes);
   if (opts.metadata) {
     const tools = await loadMetadataTools();
@@ -80,6 +84,9 @@ export async function decodeAsync(input, opts) {
   if (!opts.watermark) return d.unscramble ? d.unscramble(bytes, opts) : d.unscrambleAsync(bytes, opts);
   const detail = format === 'png' ? unscramblePngDetailed(bytes, opts)
     : format === 'jpeg' ? unscrambleJpegDetailed(bytes, opts) : await unscrambleJxlDetailed(bytes, opts);
+  // The file's own watermark was asked for and cannot be read: say so (restoring alone, or
+  // drawing another watermark, ignores it).
+  if ((opts.watermark === true || opts.watermark === 'embedded') && detail.watermarkError) throw detail.watermarkError;
   const watermark = await chooseWatermark(opts.watermark, detail.watermark, opts.resolveWatermark);
   const paint = watermark ? { painter: await loadPainter(), watermark, limits: opts.limits } : null;
   return format === 'png' ? detail.toPng(paint) : format === 'jpeg' ? detail.toJpeg(paint) : detail.toJxl(paint);
@@ -109,5 +116,8 @@ export async function chooseWatermark(requested, embedded, resolve) {
 export function inspect(input, opts) {
   const bytes = toBytes(input);
   const { limits } = withLimits(bytes, opts);
-  return pick(DECODERS, bytes).inspect(bytes, limits);
+  const format = detectFormat(bytes);
+  if (!format) throw new PixmixError('Unrecognised image format', 'UNSUPPORTED');
+  // The formats pixmix only reads are described the same way as by pixmix/encoder.
+  return DECODERS[format] ? DECODERS[format].inspect(bytes, limits) : inspectOther(bytes, format, limits);
 }

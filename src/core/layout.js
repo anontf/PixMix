@@ -8,7 +8,7 @@
 // compatibility with existing images, so bump the marker version if you ever do.
 
 import { ChaChaRng } from './prng.js';
-import { deriveSeed, PixmixError } from './params.js';
+import { deriveSeed, PixmixError, BLOCK_TRANSFORMS, tileSize } from './params.js';
 
 /**
  * @typedef {object} Layout
@@ -19,6 +19,34 @@ import { deriveSeed, PixmixError } from './params.js';
  *           block mode: perm[slot] = original tile index shown in that slot
  * @property {Uint8Array} check
  */
+
+// A grid of fewer tiles than this is barely shuffled: one tile stays where it is, two stay
+// in place for half of all keys. Both give at least 10^4 arrangements (8! = 40320; with the
+// 8 flips/rotations per tile, 4! x 8^4 = 98304).
+const MIN_TILES = 8, MIN_TILES_TRANSFORMED = 4;
+
+/**
+ * Block mode params that actually scramble every frame (`sizes`: each frame's width and
+ * height). A frame of only a few whole tiles would keep them in place, or nearly (a 16x16
+ * icon at the default block 16 was only rotated), so the tile size shrinks to the largest
+ * one that gives every frame either no whole tile (its pixels are shuffled one by one) or
+ * enough of them; for images too small even for 2 px tiles, pixel mode. The marker records
+ * the params used, so decoding needs nothing new, and images that tile well are unchanged.
+ * @param {import('./params.js').ScrambleParams} params
+ * @param {{width: number, height: number}[]} sizes
+ */
+export function fitParams(params, sizes) {
+  if (params.mode !== 'block') return params;
+  const min = params.block & BLOCK_TRANSFORMS ? MIN_TILES_TRANSFORMED : MIN_TILES;
+  const fits = (b) => sizes.every(({ width, height }) => {
+    const n = Math.floor(width / b) * Math.floor(height / b);
+    return n === 0 || n >= min;
+  });
+  for (let b = tileSize(params); b >= 2; b--) {
+    if (fits(b)) return b === tileSize(params) ? params : { ...params, block: b | (params.block & BLOCK_TRANSFORMS) };
+  }
+  return { ...params, mode: 'pixel', block: 0 };
+}
 
 /** @returns {Layout} */
 export function computeLayout(key, params, width, height, index = 0) {

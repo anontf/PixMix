@@ -159,3 +159,61 @@ test('--metadata: presets, profiles and policy files on encode, decode and rekey
   assert.equal(r.status, 2);
   assert.match(r.stderr.toString(), /unknown kind "pixels"/);
 });
+
+test('--key-file: the bytes, without one trailing newline or a BOM; binary keys stay distinct', () => {
+  const src = join(FIX, 'basn2c08.png');
+  writeFileSync(join(dir, 'bom.key'), '﻿secret\r\n');
+  let r = run(['encode', '--key-file', join(dir, 'bom.key'), '-o', join(dir, 'kf.png'), src]);
+  assert.equal(r.status, 0, r.stderr.toString());
+  assert.equal(run(['decode', '-k', 'secret', '-o', '-', join(dir, 'kf.png')]).status, 0, 'same key as the text');
+  writeFileSync(join(dir, 'bin1.key'), Uint8Array.of(0xff, 0xfe, 1));
+  writeFileSync(join(dir, 'bin2.key'), Uint8Array.of(0xfe, 0xff, 1)); // both were U+FFFD U+FFFD 1
+  r = run(['encode', '--key-file', join(dir, 'bin1.key'), '-o', join(dir, 'kb.png'), src]);
+  assert.equal(r.status, 0, r.stderr.toString());
+  assert.equal(run(['decode', '--key-file', join(dir, 'bin1.key'), '-o', '-', join(dir, 'kb.png')]).status, 0);
+  assert.match(run(['decode', '--key-file', join(dir, 'bin2.key'), '-o', '-', join(dir, 'kb.png')]).stderr.toString(), /does not match/);
+  assert.equal(run(['encode', '--key-file', join(dir, 'missing.key'), src]).status, 2);
+  assert.equal(run(['encode', '-k', '', src]).status, 2);
+});
+
+test('rekey --in-place keeps symlinks and permissions', { skip: process.platform === 'win32' }, async () => {
+  const { symlinkSync, chmodSync, statSync, lstatSync } = await import('node:fs');
+  const real = join(dir, 'real.scrambled.png');
+  assert.equal(run(['encode', '-k', 'a', '-o', real, join(FIX, 'basn2c08.png')]).status, 0);
+  chmodSync(real, 0o640);
+  const link = join(dir, 'link.png');
+  symlinkSync(real, link);
+  const r = run(['rekey', '-k', 'a', '--to', 'b', '--in-place', link]);
+  assert.equal(r.status, 0, r.stderr.toString());
+  assert.ok(lstatSync(link).isSymbolicLink());
+  assert.equal(statSync(real).mode & 0o777, 0o640);
+  assert.equal(run(['decode', '-k', 'b', '-o', '-', link]).status, 0);
+});
+
+test('batch outputs never collide, even with -f', () => {
+  mkdirSync(join(dir, 'c1'), { recursive: true });
+  mkdirSync(join(dir, 'c2'), { recursive: true });
+  writeFileSync(join(dir, 'c1', 'x.png'), readFileSync(join(FIX, 'basn2c08.png')));
+  writeFileSync(join(dir, 'c2', 'x.png'), readFileSync(join(FIX, 'basn0g08.png')));
+  const out = join(dir, 'c-out');
+  const r = run(['encode', '-k', 'c', '-f', '-o', out, join(dir, 'c1', 'x.png'), join(dir, 'c2', 'x.png')]);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr.toString(), /already written for .*c1.x\.png in this run/);
+  // The first input's output survives.
+  assert.equal(run(['decode', '-k', 'c', '-o', join(dir, 'c-back.png'), join(out, 'x.scrambled.png')]).status, 0);
+  assert.ok(pixels(join(dir, 'c-back.png')).equals(pixels(join(FIX, 'basn2c08.png'))));
+});
+
+test('inapplicable flags and out-of-range numbers are usage errors', () => {
+  const src = join(FIX, 'basn2c08.png');
+  for (const args of [
+    ['rekey', '-k', 'a', '--to', 'b', '--in-place', '-o', 'x.png', src],
+    ['decode', '-k', 'a', '--format', 'jpeg', src], ['rekey', '-k', 'a', '--to', 'b', '--format', 'png', src],
+    ['encode', '-k', 'a', '--in-place', src], ['decode', '-k', 'a', '--in-place', src], ['decode', '-k', 'a', '--mode', 'pixel', src],
+    ['decode', '-k', 'a', '--quality', '80', src], ['encode', '-k', 'a', '--to', 'b', src], ['inspect', '-o', 'x', src],
+    ['encode', '-k', 'a', '--level', '11', src], ['encode', '-k', 'a', '--effort', '12', src], ['encode', '-k', 'a', '--quality', '0', src],
+    ['encode', '-k', 'a', '--block', '1', src],
+  ]) {
+    assert.equal(run(args).status, 2, args.join(' '));
+  }
+});

@@ -162,3 +162,53 @@ test('encode, decode, rekey and inspect endpoints take ?metadata=', { skip }, as
   assert.equal((await call('/api/encode?key=k&metadata=nope', { method: 'POST', body: jpeg })).status, 404);
   assert.equal((await call('/api/encode?key=k&metadata=..%2Fx', { method: 'POST', body: jpeg })).status, 400);
 });
+
+test('bad requests: numeric parameters, JSON bodies, reserved and unknown ids, oversized bodies', { skip }, async () => {
+  const png = new Uint8Array(await sharp({ create: { width: 40, height: 30, channels: 3, background: '#406080' } }).png().toBuffer());
+  let r = await call('/api/encode?key=k&format=jpeg&quality=abc', { method: 'POST', body: png });
+  assert.deepEqual([r.status, r.body.code], [400, 'BAD_OPTION']);
+  assert.equal((await call('/api/encode?key=k&format=jpeg&quality=', { method: 'POST', body: png, json: false })).status, 200, 'empty = default');
+  assert.equal((await call('/api/encode?key=k&level=12', { method: 'POST', body: png })).status, 400);
+  for (const body of ['null', '[]', '"x"', '7']) {
+    r = await fetch(`${base}/api/watermarks`, { method: 'POST', body });
+    assert.deepEqual([r.status, (await r.json()).code], [400, 'BAD_REQUEST'], body);
+  }
+  const def = JSON.parse(readFileSync(join(dir, 'vivi-pixel.json'), 'utf8'));
+  assert.equal((await call('/api/watermarks', { method: 'POST', body: { ...def, id: 'preview' } })).status, 400);
+  assert.equal((await call('/api/watermarks/preview', { method: 'PUT', body: { ...def, id: 'preview' } })).status, 400);
+  r = await call('/api/encode?key=k&watermark=nope&watermarkEmbed=id', { method: 'POST', body: png });
+  assert.deepEqual([r.status, r.body.code], [404, 'NOT_FOUND']);
+  // 413, answered (the connection is not just reset).
+  r = await fetch(`${base}/api/watermarks/preview`, { method: 'POST', body: new Uint8Array(300 * 1024) });
+  assert.deepEqual([r.status, (await r.json()).code], [413, 'TOO_LARGE']);
+});
+
+test('concurrent saves of one watermark: no 500s, exactly one creation', { skip }, async () => {
+  const def = JSON.parse(readFileSync(join(dir, 'vivi-pixel.json'), 'utf8'));
+  const save = (id, method, i) => fetch(`${base}/api/watermarks${method === 'PUT' ? `/${id}` : ''}`, {
+    method, body: JSON.stringify({ ...def, id, text: `v${i}` }),
+  }).then((r) => r.status);
+  const puts = await Promise.all([0, 1, 2, 3, 4].map((i) => save('race-put', 'PUT', i)));
+  assert.deepEqual(puts.sort(), [200, 200, 200, 200, 201]);
+  const posts = await Promise.all([0, 1, 2, 3, 4].map((i) => save('race-post', 'POST', i)));
+  assert.deepEqual(posts.sort(), [201, 409, 409, 409, 409]);
+  for (const id of ['race-put', 'race-post']) await call(`/api/watermarks/${id}`, { method: 'DELETE' });
+});
+
+test('static files: HEAD, content types; gallery images only under their own extension', { skip }, async () => {
+  let r = await fetch(`${base}/`, { method: 'HEAD' });
+  assert.equal(r.status, 200);
+  assert.equal(r.headers.get('content-type'), 'text/html; charset=utf-8');
+  assert.equal((await r.arrayBuffer()).byteLength, 0);
+  r = await fetch(`${base}/dist/pixmix-jxl-enc.LICENSES.txt`, { method: 'HEAD' });
+  assert.equal(r.headers.get('content-type'), 'text/plain; charset=utf-8');
+  r = await fetch(`${base}/dist/pixmix-encoder.cjs`, { method: 'HEAD' });
+  assert.equal(r.headers.get('content-type'), 'text/javascript');
+  const png = new Uint8Array(await sharp({ create: { width: 40, height: 30, channels: 3, background: '#406080' } }).png().toBuffer());
+  const scrambled = (await call('/api/encode?key=k', { method: 'POST', body: png, json: false })).body;
+  const { url } = (await call('/api/gallery?key=k', { method: 'POST', body: scrambled })).body;
+  assert.match(url, /\.png$/);
+  assert.equal((await fetch(base + url)).status, 200);
+  assert.equal((await fetch(base + url.replace(/\.png$/, '.jpg'))).status, 404);
+  await call('/api/gallery', { method: 'DELETE' });
+});

@@ -53,14 +53,16 @@ export function renderFor(c, width, height, o = 1, limits) {
  * Composites a patch into native samples, in place.
  * @param {{x: number, y: number, width: number, height: number, data: Float32Array}} patch
  * @param {{width: number, height: number, channels: 1|2|3|4, depth: number,
- *   data: Uint8Array|Uint16Array, x?: number, y?: number}} target  interleaved samples; 16-bit
- *   as a Uint16Array, or big-endian bytes in a Uint8Array (PNG); x, y: where the target sits
- *   in the patch's coordinates (APNG sub-frames)
+ *   data: Uint8Array|Uint16Array, x?: number, y?: number, key?: number[]|null}} target
+ *   interleaved samples; 16-bit as a Uint16Array, or big-endian bytes in a Uint8Array (PNG);
+ *   x, y: where the target sits in the patch's coordinates (APNG sub-frames); key: a PNG
+ *   tRNS colour key (grey or RGB samples), whose pixels are transparent
  * @returns {boolean} whether any pixel changed
  */
 export function paintSamples(patch, target) {
   if (!patch) return false;
   const { width, height, channels, depth, data } = target;
+  const key = target.key && target.key.length === channels ? target.key : null;
   const tx = target.x ?? 0, ty = target.y ?? 0;
   const max = depth === 16 ? 65535 : (1 << depth) - 1;
   const wide = depth === 16 && !(data instanceof Uint16Array);
@@ -69,21 +71,38 @@ export function paintSamples(patch, target) {
   const grey = channels < 3, alpha = channels === 2 || channels === 4;
   const q = (v) => Math.round(Math.min(1, Math.max(0, v)) * max);
   let changed = false;
+  const isKey = key ? (i) => key.every((v, k) => get(i + k) === v) : () => false;
   forPatch(patch, tx, ty, width, height, (p, x, y) => {
     const [r, g, b, a] = p;
     const i = (y * width + x) * channels;
     const src = grey ? [0.299 * r + 0.587 * g + 0.114 * b] : [r, g, b];
     const n = src.length;
-    const da = alpha ? get(i + n) / max : 1;
-    const oa = a + da * (1 - a);
+    // A colour-keyed pixel is transparent and can only become opaque: it takes the
+    // watermark's own (unpremultiplied) colour where that covers at least half of it, and
+    // stays transparent elsewhere.
+    const keyed = isKey(i);
+    if (keyed && a < 0.5) return;
+    const da = keyed ? 0 : alpha ? get(i + n) / max : 1;
+    const oa = keyed ? 1 : a + da * (1 - a);
     for (let k = 0; k < n; k++) {
       const dc = get(i + k) / max;
-      set(i + k, q(oa ? (src[k] + dc * da * (1 - a)) / oa : 0));
+      set(i + k, q(keyed ? src[k] / a : oa ? (src[k] + dc * da * (1 - a)) / oa : 0));
     }
     if (alpha) set(i + n, q(oa));
+    // Painted pixels must stay visible: one that came out as the key colour is moved one
+    // level off it (in its last channel, blue for RGB).
+    if (isKey(i)) set(i + n - 1, key[n - 1] < max ? key[n - 1] + 1 : key[n - 1] - 1);
     changed = true;
   });
   return changed;
+}
+
+/** A PNG's tRNS colour key as samples (grey: 1, RGB: 3), or null. */
+export function colourKey(chunks, colorType) {
+  const n = colorType === 0 ? 1 : colorType === 2 ? 3 : 0;
+  const trns = n && chunks.find((ch) => ch.type === 'tRNS')?.data;
+  if (!trns || trns.length < 2 * n) return null;
+  return Array.from({ length: n }, (_, k) => (trns[2 * k] << 8) | trns[2 * k + 1]);
 }
 
 /**
@@ -295,12 +314,16 @@ export const overlayPixels = (patch) => (patch ? { x: patch.x, y: patch.y, width
 
 const CHANNELS = { 0: 1, 2: 3, 4: 2, 6: 4 };
 const DROP_WHEN_PROMOTED = new Set(['PLTE', 'tRNS', 'bKGD', 'hIST', 'sBIT']);
+// A greyscale image's ICC profile has a GRAY colour space, which an RGB(A) PNG cannot use
+// (decoders such as libpng discard it); it is dropped when the image becomes RGBA.
+const DROP_WHEN_GREY_PROMOTED = new Set([...DROP_WHEN_PROMOTED, 'iCCP']);
 
 /**
  * Paints the watermark into a restored PNG/APNG's frames (the IDAT image, and each
  * animation frame that holds the whole watermark). Palette and 1/2/4-bit images become
- * 8-bit RGBA first (their palette cannot hold the watermark's colours); everything else
- * keeps its colour type and bit depth, and every chunk.
+ * 8-bit RGBA first (their palette cannot hold the watermark's colours), losing the chunks
+ * that only fit their old colour type (PLTE, tRNS, bKGD, hIST, sBIT, and a grey image's
+ * iCCP); everything else keeps its colour type and bit depth, and every chunk.
  * @param {import('../formats/png/index.js').PngImage} img
  * @param {Uint8Array[]} frames  native samples, frame 0 first
  * @returns {{img: object, frames: Uint8Array[]}|null}  null: nothing drawn
@@ -319,9 +342,10 @@ export function paintPng(img, frames, c, o = 1, limits) {
     // Drop the palette's chunks, keeping frameChunks (indexes into chunks) in step.
     const index = [];
     const chunks = [];
+    const drop = colorType === 0 ? DROP_WHEN_GREY_PROMOTED : DROP_WHEN_PROMOTED;
     img.chunks.forEach((ch, i) => {
       index[i] = chunks.length;
-      if (!DROP_WHEN_PROMOTED.has(ch.type)) chunks.push(i === 0 ? { type: 'IHDR', data: ihdrBytes } : ch);
+      if (!drop.has(ch.type)) chunks.push(i === 0 ? { type: 'IHDR', data: ihdrBytes } : ch);
     });
     img = {
       ...img, ihdr: { ...img.ihdr, colorType: 6, depth: 8 }, pixelBytes: 4, chunks,
@@ -329,10 +353,11 @@ export function paintPng(img, frames, c, o = 1, limits) {
     };
   } else frames = frames.map((f) => f.slice());
   const { colorType: ct, depth: bits } = img.ihdr;
+  const key = colourKey(img.chunks, ct);
   frames.forEach((px, i) => {
     const f = img.frameSizes[i];
     if (i && !holds(f, patch)) return;
-    paintSamples(patch, { width: f.width, height: f.height, channels: CHANNELS[ct], depth: bits, data: px, x: f.x ?? 0, y: f.y ?? 0 });
+    paintSamples(patch, { width: f.width, height: f.height, channels: CHANNELS[ct], depth: bits, data: px, x: f.x ?? 0, y: f.y ?? 0, key });
   });
   return { img, frames };
 }
@@ -389,7 +414,7 @@ export function stashPng(img, frames, c, o, key, salt) {
     const f = img.frameSizes[r.frame];
     const target = { width: f.width, height: f.height, data: frames[r.frame], x: f.x ?? 0, y: f.y ?? 0 };
     if (colorType === 3) paintIndexed(patch, { ...target, palette: plte, alphas: trns });
-    else paintSamples(patch, { ...target, channels: CHANNELS[colorType], depth });
+    else paintSamples(patch, { ...target, channels: CHANNELS[colorType], depth, key: colourKey(img.chunks, colorType) });
   }
   return encodeStash({ watermark: c, regions, raw, key, salt });
 }

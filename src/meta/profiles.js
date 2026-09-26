@@ -2,11 +2,12 @@
 // file in canonical form (see normalizeProfile), so the directory can be committed and its
 // diffs stay clean. Ids are checked against a strict pattern before they become paths.
 
-import { readFile, writeFile, readdir, rename, rm, mkdir } from 'node:fs/promises';
+import { readFile, readdir, rm, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PixmixError } from '../core/params.js';
+import { atomicWrite } from '../core/files.js';
 import { normalizeProfile, formatProfile, PROFILE_ID, PRESET_NAMES } from './policy.js';
 
 /** The repository's metadata-profiles/ directory (or $PIXMIX_METADATA_PROFILES_DIR). */
@@ -46,13 +47,14 @@ export function metadataProfileStore(dir = DEFAULT_PROFILES_DIR) {
       return profile;
     },
 
-    /** Validates and writes a profile (atomically). @returns the canonical profile */
-    async save(profile) {
+    /**
+     * Validates and writes a profile (atomically). `create`: only if there is none with that
+     * id yet (else EXISTS, status 409). @returns the canonical profile
+     */
+    async save(profile, { create = false } = {}) {
       const normal = normalizeProfile(profile);
       await mkdir(root, { recursive: true });
-      const tmp = `${file(normal.id)}.${process.pid}.tmp`;
-      await writeFile(tmp, formatProfile(normal));
-      await rename(tmp, file(normal.id));
+      await atomicWrite(file(normal.id), formatProfile(normal), create && `Metadata profile "${normal.id}"`);
       return normal;
     },
 

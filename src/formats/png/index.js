@@ -15,16 +15,18 @@
 
 import { readChunks, writeChunks, isPng } from './chunks.js';
 import {
-  parseIhdr, pixelBytesOf, decodeRaster, encodeRaster, decodeRasterAsync, encodeRasterAsync,
+  parseIhdr, pixelBytesOf, rawSize, decodeRaster, encodeRaster, decodeRasterAsync, encodeRasterAsync,
 } from './raster.js';
-import { computeLayout, applyMap } from '../../core/layout.js';
+import { computeLayout, applyMap, fitParams } from '../../core/layout.js';
 import {
   makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError, FLAG_STASH, tileSize, tileTransforms,
 } from '../../core/params.js';
 import { readOrientation } from '../../meta/exif.js';
-import { WATERMARK_TAG, STASH_TAG, encodeWatermark, decodeWatermark, restorePixelStash } from '../../watermark/embed.js';
+import {
+  WATERMARK_TAG, STASH_TAG, encodeWatermark, readCarried, keptWatermark, carriedInfo, restorePixelStash,
+} from '../../watermark/embed.js';
 import { stashPng } from '../../watermark/paint.js';
-import { checkPixels, checkFrames } from '../../core/limits.js';
+import { checkPixels, checkFrames, resolveLimits, decompressedLimitError } from '../../core/limits.js';
 
 export const MARKER_CHUNK = 'pmIx';
 export { isPng };
@@ -204,7 +206,7 @@ export function scramblePng(bytes, { key, mode, block, transforms, level, salt, 
     throw new PixmixError('Image is already scrambled (decode it first, or use rekey)', 'ALREADY_SCRAMBLED');
   }
   if (mode === 'mcu') throw new PixmixError('Mode "mcu" only applies to JPEG and JPEG XL output', 'BAD_OPTION');
-  const params = makeParams({ mode, block, transforms, salt });
+  const params = fitParams(makeParams({ mode, block, transforms, salt }), img.frameSizes);
   const layouts = layoutsFor(key, params, img);
   return finishScramble(img, mapFrames(img, layouts, 'scramble'), params, layouts[0].check, { key, level, watermark, visibleWatermark });
 }
@@ -252,10 +254,12 @@ function unscrambled(img, key, limits) {
   return { marker, layouts, frames, visible };
 }
 
-/** The watermark a PNG carries for its restored image ({id, name, compiled}), or null. */
+/**
+ * The watermark a PNG carries for its restored image, read tolerantly (see readCarried in
+ * watermark/embed.js): {watermark: {id, name, compiled}|null, error, data}.
+ */
 export function pngWatermark(chunks, limits) {
-  const c = chunks.find((ch) => ch.type === WATERMARK_TAG);
-  return c ? decodeWatermark(c.data, limits) : null;
+  return readCarried(chunks.find((ch) => ch.type === WATERMARK_TAG)?.data, limits);
 }
 
 /**
@@ -281,7 +285,7 @@ export function unscramblePngDetailed(bytes, { key, level, limits } = {}) {
     layout: layouts[0],
     params: marker.params,
     pixels: frames[0],
-    watermark: pngWatermark(img.chunks, limits),
+    ...carriedFields(pngWatermark(img.chunks, limits)),
     /** Lazily encode, the deflate step is the slow part. `paint`: see painted(). */
     toPng: (paint) => { const p = painted(img, frames, paint); return writePng(p.img, p.frames, null, { level }); },
   };
@@ -299,7 +303,7 @@ export async function unscramblePngDetailedAsync(bytes, { key, level, limits } =
     layout: layouts[0],
     params: marker.params,
     pixels: frames[0],
-    watermark: pngWatermark(img.chunks, limits),
+    ...carriedFields(pngWatermark(img.chunks, limits)),
     toPng: (paint) => { const p = painted(img, frames, paint); return writePngAsync(p.img, p.frames, null, { level }); },
   };
 }
@@ -315,31 +319,55 @@ export function unscramblePng(bytes, opts) {
 export function rekeyPng(bytes, { from, to, mode, block, transforms, level, salt, limits, watermark, visibleWatermark } = {}) {
   const img = readPng(bytes, limits);
   const { marker, frames, visible } = unscrambled(img, from, limits);
-  const params = makeParams({
+  if (mode === 'mcu') throw new PixmixError('Mode "mcu" only applies to JPEG and JPEG XL', 'BAD_OPTION');
+  const params = fitParams(makeParams({
     mode: mode ?? marker.params.mode,
     block: block ?? (marker.params.mode === 'block' ? tileSize(marker.params) : undefined),
     transforms: transforms ?? (marker.params.mode === 'block' ? tileTransforms(marker.params) : undefined),
     salt,
-  });
+  }), img.frameSizes);
   const layouts = layoutsFor(to, params, img);
   const plain = { ...img, frames };
   return finishScramble(img, mapFrames(plain, layouts, 'scramble'), params, layouts[0].check, {
     key: to, level,
-    watermark: watermark === undefined ? carried(pngWatermark(img.chunks, limits)) : watermark,
-    visibleWatermark: visibleWatermark === undefined ? visible : visibleWatermark,
+    watermark: watermark === undefined ? keptWatermark(pngWatermark(img.chunks, limits)) : watermark,
+    visibleWatermark: visibleWatermark === undefined ? visible?.() ?? null : visibleWatermark,
   });
 }
 
-/** What rekey carries over: the compiled watermark, or just its id. */
-export const carried = (w) => (w ? w.compiled ?? { id: w.id } : null);
+/**
+ * For the detailed decodes: `watermark` ({id, name, compiled}) is null when the file carries
+ * none or it cannot be read; `watermarkError` then says why (decodeAsync throws it only when
+ * asked to draw the file's own watermark).
+ */
+export const carriedFields = (c) => ({ watermark: c.watermark, watermarkError: c.error });
+
+/**
+ * What decoding checks before inflating, from the chunks alone: the frames (the IDAT image,
+ * then each fcTL after it), their pixels together, and what each frame inflates to.
+ */
+function checkFrameSizes(chunks, ihdr, limits) {
+  const idat = chunks.findIndex((c) => c.type === 'IDAT');
+  const sizes = [{ width: ihdr.width, height: ihdr.height }];
+  chunks.forEach((c, i) => {
+    if (c.type !== 'fcTL' || i < idat || c.data.length !== 26) return;
+    const dv = new DataView(c.data.buffer, c.data.byteOffset, 26);
+    sizes.push({ width: dv.getUint32(4), height: dv.getUint32(8) });
+  });
+  if (sizes.length > 1) checkFrames(sizes.length, sizes.reduce((n, f) => n + f.width * f.height, 0), limits);
+  const { maxDecompressedBytes } = resolveLimits(limits);
+  for (const f of sizes) {
+    checkPixels(f.width, f.height, limits, 'APNG frame');
+    if (rawSize({ ...ihdr, ...f }) > maxDecompressedBytes) throw decompressedLimitError(maxDecompressedBytes);
+  }
+}
 
 /** Cheap: parses chunks only, no inflate. Checks the same size limits as decoding. */
 export function inspectPng(bytes, limits) {
   const chunks = readChunks(bytes, limits);
   const ihdr = parseIhdr(chunks[0].data);
   checkPixels(ihdr.width, ihdr.height, limits);
-  const fctl = chunks.filter((c) => c.type === 'fcTL').length;
-  if (fctl > 1) checkFrames(fctl, 0, limits);
+  checkFrameSizes(chunks, ihdr, limits);
   const marker = readPngMarker(chunks);
   const actl = chunks.find((c) => c.type === 'acTL');
   const dv = actl?.data.length === 8 ? new DataView(actl.data.buffer, actl.data.byteOffset, 8) : null;
@@ -370,10 +398,13 @@ function concat(parts) {
   return out;
 }
 
-/** For inspect(): which watermarks a scrambled file carries. */
-export function watermarkInfo(wm, marker) {
+/**
+ * For inspect(): which watermarks a scrambled file carries. `c` is what readCarried gave; a
+ * carried watermark that cannot be read is {unreadable: true, error}.
+ */
+export function watermarkInfo(c, marker) {
   return {
-    watermark: wm ? { id: wm.id, ...(wm.name ? { name: wm.name } : {}), embedded: !!wm.compiled } : null,
+    watermark: carriedInfo(c),
     visibleWatermark: !!(marker && marker.params.flags & FLAG_STASH),
   };
 }

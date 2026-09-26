@@ -64,7 +64,10 @@ pixmix encode photo.jpg --metadata vivi-web   # strip everything, credit Vivi (s
 ```
 
 For each file it reports how the input was decoded and what metadata was kept or dropped.
-It never overwrites a file unless you pass `-f`. Exit codes: 0 = success, 1 = some files
+It never overwrites a file unless you pass `-f` (or `rekey --in-place`, which keeps symlinks
+and permissions), and never writes two inputs to one output name in a run. A `--key-file` is
+used as bytes, without one trailing newline or a leading UTF-8 BOM. Options that do not
+apply to the command are usage errors. Exit codes: 0 = success, 1 = some files
 failed (the others are still processed), 2 = usage error. If `sharp` is installed, the CLI
 uses it for WebP, AVIF, HEIC and TIFF (turn this off with `--no-sharp`). `pixmix --help`
 lists every option.
@@ -131,10 +134,14 @@ Options:
   become PNG.
 - `mode`, `block`: `pixel`, or `block` with a tile size of 2–4096.
   - PNG and JPEG XL use them; JPEG is always `mcu`.
+  - An image (or animation frame) that would get only a few whole tiles, such as a 16×16
+    icon at the default size, gets the largest smaller tile size that shuffles it properly
+    (pixel mode when even 2 px tiles are too few). The marker, and `inspect`, give the size
+    used.
   - JPEG XL can also be `mcu`, the JPEG route. That's the default when the source is a
     JPEG, or a JPEG XL made from one.
 - `effort`: JPEG XL encoder effort, 1–9. Defaults to 2 in pixel mode and 7 in block mode.
-- `level`: PNG only, the zlib level.
+- `level`: PNG only, the zlib level, 0–9.
 - `transforms`: JPEG and JPEG-route JPEG XL, default `true`. Also flips and rotates each
   MCU, still lossless.
 - `quality`, `subsampling`, `background`: only when converting to JPEG from another format.
@@ -166,6 +173,13 @@ const out = await encodeAsync(webpBytes, {
 
 In browsers, `browserDecoder()` uses the browser's own decoders (WebP, AVIF, BMP, …).
 `convert` / `convertAsync` produce the plain, unscrambled file the encoder would scramble.
+
+Input that is already scrambled is refused with `ALREADY_SCRAMBLED` whatever the output
+format (decode it first, or use `rekey`): scrambling it again would lose the original.
+`convert` refuses it too when the format changes; converting to the same format keeps the
+marker, and the file stays restorable. Invalid option values (a `quality` that is not a
+number from 1 to 100, an unknown `subsampling`, a `transforms` that is not a boolean, …)
+throw `BAD_OPTION` before any work is done.
 
 ### Untrusted input
 
@@ -234,15 +248,23 @@ the limits to every upload, with its 64 MiB body limit as `maxInputBytes`, and a
 
 Several places inside an image file can hold a small copy of the picture, and that copy
 would show the unscrambled image to anyone who looks:
-- EXIF IFD1 thumbnails (JPEG and PNG);
+- EXIF IFD1 thumbnails (JPEG or uncompressed strips), in JPEG, PNG and JPEG XL;
+- JPEG previews inside the EXIF MakerNote (Olympus, Pentax, older Nikon and others);
+- XMP thumbnails (`xmp:Thumbnails`) and Google's original and depth images (`GImage:Data`,
+  `GDepth:Data`), in the XMP packet or in JPEG extended XMP;
 - JFIF and JFXX thumbnails;
-- Photoshop thumbnail resources;
+- Photoshop thumbnail resources, also when the resources continue over several APP13
+  segments;
 - MPF secondary images, motion-photo video and anything else after the JPEG's end marker.
 
-The encoder removes all of these by default and lists them under `dropped`. EXIF
-thumbnails are zeroed in place so every other EXIF offset stays valid. Pass
-`keepThumbnails: true` to keep them (trailing data after the end marker can't be kept
-either way).
+The encoder removes all of these by default, on every route (same format, converted, JPEG
+XL boxes including Brotli-compressed ones), and lists them under `dropped`. EXIF
+thumbnails and MakerNote previews are zeroed in place so every other offset stays valid;
+only complete, well-formed JPEG streams inside a MakerNote are touched. XMP previews are
+removed from the packet and the rest is written back as it was; extended XMP holding one
+goes entirely. Pass `keepThumbnails: true` to keep them. Data after the end marker can't be
+kept either way, so it is still dropped (and reported), and so is the MPF index pointing
+to it.
 
 ### Input formats and metadata
 
@@ -272,8 +294,8 @@ Where each kind of metadata ends up:
 | EXIF | `eXIf` | APP1 `Exif` | `Exif` box |
 | ICC profile | `iCCP` | APP2 `ICC_PROFILE`, split across segments | in the codestream |
 | XMP | `iTXt XML:com.adobe.xmp` | APP1 XMP | `xml ` box |
-| Density | `pHYs` | JFIF APP0 | dropped (no field) |
-| Comments | `tEXt Comment` | COM | dropped (no field) |
+| Density | `pHYs` | JFIF APP0 (dots per inch when whole, else per cm) | dropped (no field) |
+| Comments | `tEXt Comment` (`iTXt` beyond Latin-1) | COM (UTF-8) | dropped (no field) |
 
 The pixels stay exactly as stored. They aren't rotated (the EXIF orientation travels with
 the EXIF) and aren't converted to sRGB (the ICC profile travels with the image).
@@ -285,7 +307,13 @@ Some things are dropped, and the report says so:
 - precision above 8 bits when writing JPEG (PNG and JPEG XL keep 16 bits), and in
   animations;
 - PNG text chunks other than comments, and gamma without an ICC profile, when writing JPEG;
-- transparency when writing JPEG (flattened onto `background`).
+- transparency when writing JPEG (flattened onto `background`);
+- JPEG XL extra channels other than alpha (spot colours, depth, …), and the animation of a
+  one-frame animated JPEG XL (it becomes a still).
+
+Every report has `notes` (a list, often empty): a lossless output of a lossy source (JPEG,
+lossy WebP, AVIF unless coded as RGB, HEIC, lossy or recompressed-JPEG JPEG XL) gets a note
+that it will be several times larger, and what stays small.
 
 A PNG gets the smallest colour type that loses nothing: grey, palette (1–8 bit), RGB or
 RGBA. Palette output also compresses far better once the pixels are scrambled. A JPEG is
@@ -501,7 +529,10 @@ the watermark sits bottom-right of the image as displayed.
 
 Drawn on a restored file:
 - PNG keeps its colour type, bit depth and every chunk. Palette and 1/2/4-bit images become
-  8-bit RGBA. In an APNG, every frame that holds the whole watermark gets it.
+  8-bit RGBA, without the chunks that no longer fit (PLTE, tRNS, bKGD, hIST, sBIT, and a
+  grey image's ICC profile). With a tRNS colour key, keyed pixels count as transparent, and
+  painted pixels that would come out as the key colour are moved one level off it. In an
+  APNG, every frame that holds the whole watermark gets it.
 - JPEG is painted in the DCT domain: only the blocks under the watermark are decoded,
   painted and quantised again, with the file's own tables. Everything else keeps its exact
   coefficients, and the metadata stays.
@@ -523,7 +554,9 @@ const shown = await decodeAsync(bytes, { key, watermark: 'embedded' });     // N
 - Ids are looked up at `watermarkBase` (`data-watermark-base`, default `watermarks/` next
   to the page). The dev server serves the compiled ones there.
 - A watermark that cannot be loaded or drawn is skipped with a warning; the image still
-  shows.
+  shows. So is a carried watermark that cannot be read (damaged, or over
+  `maxMetadataBytes`): restoring never needs it, and `inspect` reports it as
+  `{ unreadable: true, error }`. Only asking for it (`watermark: 'embedded'`) is an error.
 - `decodeAsync`, `restoreForDisplay` and `decodeToURL` stay exact unless given `watermark`.
 
 ### Watermarks in scrambled files
@@ -533,9 +566,9 @@ chunks, JPEG APP15 segments, JPEG XL boxes). Restored files carry neither.
 
 **The watermark for the decoder** (`encode(…, { watermark })`, `--watermark`): a whole
 compiled watermark (2–3 KB), or just its id (`{ id }`, `--watermark-ref`), which the decoder
-looks up. The reveal then draws it without being told which. Rekey keeps it (`watermark:
-null` removes it, another value replaces it). It is not authenticated: like the image
-itself, anyone can change it.
+looks up. The reveal then draws it without being told which. Rekey keeps it as stored
+(`watermark: null` removes it, another value replaces it; a damaged one is dropped). It is
+not authenticated: like the image itself, anyone can change it.
 
 **A visible watermark on the scrambled image** (`visibleWatermark`, `--visible-watermark`):
 every viewer shows the scrambled image with the watermark on it, and pixmix still restores
@@ -547,7 +580,8 @@ the original exactly.
   (noisy content; JPEG less than PNG). It includes the watermark itself, 1–3 KB.
 - The marker becomes v2 (see below), so older pixmix versions refuse the file instead of
   restoring it with the watermark scattered over the image.
-- Rekey draws it again under the new key; `visibleWatermark: null` removes it.
+- Rekey draws it again under the new key; `visibleWatermark: null` removes it. Restoring
+  only needs the stashed pixels, not the watermark stored with them.
 - PNG: any colour type (palette images use their nearest palette colours); APNG frames that
   hold the whole watermark. JPEG: baseline, progressive, grey. JPEG XL: both routes, but on
   the pixel route only for 8-bit sRGB images (the browser reveals 8-bit sRGB pixels, and
@@ -563,9 +597,10 @@ Considered and left out:
 - Signing the carried watermark with the key: in the browser use case the key is public.
 
 Limits on untrusted input (see "Untrusted input"): compiled watermarks are validated (sizes,
-counts, path syntax); carried watermark JSON counts against `maxMetadataBytes`; stashed
-regions must lie inside the image (so `maxPixels` bounds them) and are inflated into a
-buffer of exactly their size; the renderer refuses a watermark covering more than 4
+counts, path syntax); watermark JSON counts against `maxMetadataBytes` when it is needed
+(a carried one to be drawn, a stashed one for rekey to draw it again); stashed regions must lie inside the image, one per
+frame (so they never add up to more than the image), and are inflated into a buffer of
+exactly their size, at most `maxDecompressedBytes`; the renderer refuses a watermark covering more than 4
 megapixels (or `maxPixels`) and caps outline and blur radii at 32 px. The fuzzer's seeds
 include files carrying watermarks (whole and by id) and visible watermarks on every format
 and route, and it mutates their payloads.

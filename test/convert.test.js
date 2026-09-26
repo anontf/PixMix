@@ -5,7 +5,8 @@ import jpeg from 'jpeg-js';
 import { GifWriter } from 'omggif';
 import sharp from 'sharp';
 import { PNG } from 'pngjs';
-import { encode, encodeAsync, decode, convert, inspect } from '../src/index.js';
+import { encode, encodeAsync, decode, convert, convertAsync, inspect } from '../src/index.js';
+import { loadJxlCodec } from '../src/formats/jxl/load.js';
 import { sharpDecoder } from '../src/plugins/sharp.js';
 import { buildPng } from '../src/convert/png-build.js';
 import { readChunks } from '../src/formats/png/chunks.js';
@@ -341,4 +342,60 @@ test('built-in JPEG decoder: CMYK is converted by formula, and the report says s
   }
   const ycck = writeSegments([app14(2), ...readSegments(cmyk).segments]);
   assert.ok(convert(ycck, { format: 'png' }).dropped.some((d) => d.startsWith('YCCK colours')));
+});
+
+test('size notes: always a list, right for WebP with extra chunks, lossless AVIF and recompressed JPEG XL', async () => {
+  const sd = sharpDecoder(sharp);
+  const img = sharp(Buffer.from(gradient()), { raw: { width: W, height: H, channels: 4 } });
+  const lossyWebp = await img.clone().withIccProfile('p3').withXmp(XMP).webp({ quality: 60 }).toBuffer();
+  assert.match((await convertAsync(lossyWebp, { decoders: [sd] })).notes[0], /webp is lossy/);
+  const losslessWebp = await img.clone().withIccProfile('p3').webp({ lossless: true }).toBuffer();
+  assert.deepEqual((await convertAsync(losslessWebp, { decoders: [sd] })).notes, []);
+  assert.deepEqual((await convertAsync(await img.clone().avif({ lossless: true }).toBuffer(), { decoders: [sd] })).notes, []);
+  assert.match((await convertAsync(await img.clone().avif({ quality: 50 }).toBuffer(), { decoders: [sd] })).notes[0], /avif is lossy/);
+
+  const jpg = jpegWithMetadata();
+  const jxl = await (await loadJxlCodec()).transcodeJpeg(jpg);
+  assert.match((await convertAsync(jxl, { format: 'png' })).notes[0], /recompressed JPEG\) is lossy.*"jxl" without a pixel\/block mode/);
+  // Same-format and JPEG-route reports have the field too.
+  for (const [input, opts] of [[jpg, {}], [convert(jpg, { format: 'png' }).bytes, {}], [jpg, { format: 'jxl' }]]) {
+    let report;
+    await encodeAsync(input, { key: 'k', ...opts, onConvert: (r) => { report = r; } });
+    assert.deepEqual(report.notes, [], JSON.stringify(opts));
+  }
+});
+
+test('JPEG XL to JPEG XL on the pixel route reports the decoder, what it carried and the size', async () => {
+  const jxl = await (await loadJxlCodec()).transcodeJpeg(jpegWithMetadata({ exif: tiffWithOrientation(1), xmp: XMP }));
+  let report;
+  await encodeAsync(jxl, { key: 'k', mode: 'block', onConvert: (r) => { report = r; } });
+  assert.equal(report.decoder, 'jxl-oxide');
+  assert.deepEqual(report.transferred, ['EXIF', 'XMP']);
+  assert.match(report.notes[0], /recompressed JPEG\) is lossy: lossless jxl output .*the JPEG route/);
+  assert.ok(report.dropped.includes('JPEG reconstruction data (no longer matches the image)'));
+
+  // A one-frame animation becomes a still image, and says so.
+  const one = await (await loadJxlCodec()).encode({ width: 8, height: 8, frames: [{ data: new Uint8Array(256).fill(200), delay: [500, 1000] }], plays: 3 });
+  await encodeAsync(one, { key: 'k', onConvert: (r) => { report = r; } });
+  assert.ok(report.dropped.some((d) => d.startsWith('animation (a single frame')), JSON.stringify(report.dropped));
+});
+
+test('sharp plugin: density only when the file has one (not libvips\' 72 dpi default)', async () => {
+  const sd = sharpDecoder(sharp);
+  const bare = await sharp(Buffer.from(gradient()), { raw: { width: W, height: H, channels: 4 } }).removeAlpha().jpeg().toBuffer();
+  const png = await convertAsync(bare, { format: 'png', decoders: [sd] });
+  assert.equal(chunk(png.bytes, 'pHYs'), undefined);
+  assert.ok(!png.transferred.includes('density'));
+  const jxl = await convertAsync(bare, { format: 'jxl', decoders: [sd] });
+  assert.ok(!jxl.dropped.some((d) => d.startsWith('density')));
+  const dpi = await convertAsync(jpegWithMetadata({ dpi: 300 }), { format: 'png', decoders: [sd] });
+  assert.equal(new DataView(chunk(dpi.bytes, 'pHYs').buffer, chunk(dpi.bytes, 'pHYs').byteOffset).getUint32(0), 11811);
+});
+
+test('PNG comments outside Latin-1 are written as iTXt', () => {
+  const { png } = buildPng({ width: 4, height: 4, data: new Uint8Array(64).fill(255) }, { comments: ['plain', 'naïve ✓'] });
+  const texts = readChunks(png).filter((c) => c.type === 'tEXt' || c.type === 'iTXt');
+  assert.deepEqual(texts.map((c) => c.type), ['tEXt', 'iTXt']);
+  assert.ok(Buffer.from(texts[1].data).includes(Buffer.from('naïve ✓')));
+  assert.deepEqual(convert(convert(png, { format: 'jpeg' }).bytes, { format: 'png' }).transferred.includes('comments'), true);
 });

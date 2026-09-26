@@ -6,7 +6,8 @@
 
 import { detectFormat, toBytes } from '../formats/index.js';
 import { PixmixError } from '../core/params.js';
-import { withLimits, checkPixels, checkFrames } from '../core/limits.js';
+import { checkOptions } from '../core/options.js';
+import { withLimits, checkPixels, checkFrames, resolveLimits } from '../core/limits.js';
 import { readJpegMetadata } from '../meta/jpeg.js';
 import { readWebpMetadata } from '../meta/webp.js';
 import { readJxlMetadata } from '../meta/jxl.js';
@@ -14,9 +15,10 @@ import { readJxl, writeJxl, wrapCodestream, readJxlHeader } from '../formats/jxl
 import { sanitizeBoxes } from '../formats/jxl/index.js';
 import { iccSpace, iccFits } from '../formats/jxl/icc.js';
 import { loadJxlCodec } from '../formats/jxl/load.js';
-import { stripExifThumbnail } from '../meta/thumbnails.js';
+import { stripExifPreviews, stripXmpPreviews } from '../meta/thumbnails.js';
+import { readPngText } from '../meta/read.js';
 import { readChunks, writeChunks } from '../formats/png/chunks.js';
-import { sanitizeJpeg } from '../formats/jpeg/index.js';
+import { sanitizeJpeg, jpegMarkerBytes } from '../formats/jpeg/index.js';
 import { buildPng } from './png-build.js';
 import { buildJpeg } from './jpeg-build.js';
 import { BUILTIN_DECODERS } from './decoders.js';
@@ -59,7 +61,7 @@ export function targetFormat(from, format) {
 /** Synchronous; built-in decoders or sync plugins only. @returns {ConvertResult} */
 export function convert(input, opts = {}) {
   const bytes = toBytes(input);
-  opts = withPolicy(withLimits(bytes, opts));
+  opts = withPolicy(withLimits(bytes, checkOptions(opts)));
   const job = prepare(bytes, opts);
   if (job.done) return applied(job.done, opts);
   if (job.target === 'jxl') throw new PixmixError('JPEG XL output needs encodeAsync/convertAsync', 'ASYNC_DECODER');
@@ -74,7 +76,7 @@ export function convert(input, opts = {}) {
 /** Accepts async decoder plugins (sharp, browser-native) and JPEG XL. @returns {Promise<ConvertResult>} */
 export async function convertAsync(input, opts = {}) {
   const bytes = toBytes(input);
-  opts = withPolicy(withLimits(bytes, opts));
+  opts = withPolicy(withLimits(bytes, checkOptions(opts)));
   const job = prepare(bytes, opts);
   if (job.done) {
     if (!opts.metadata) return job.done;
@@ -148,7 +150,7 @@ function checkDecoded(job, decoded, limits) {
  */
 export async function decodeForJxl(input, opts = {}) {
   const bytes = toBytes(input);
-  opts = withLimits(bytes, opts);
+  opts = withLimits(bytes, checkOptions(opts));
   const job = prepare(bytes, { ...opts, format: 'jxl' });
   if (job.done) throw new Error('decodeForJxl is for non-JXL input');
   return decodeJob(bytes, job, opts);
@@ -173,19 +175,54 @@ async function decodeJob(bytes, job, { keepThumbnails = false, limits, metadata 
  * Lossless output (PNG, or JPEG XL on the pixel route) of a lossy source is several times
  * larger than the source even before scrambling; say so, and what stays small.
  */
-function sizeNotes(bytes, from, target) {
-  const lossy = from === 'jpeg' || from === 'avif' || from === 'heic'
-    || (from === 'webp' && hasChunk(bytes, 'VP8 '))
+export function sizeNotes(bytes, from, target) {
+  const recompressed = from === 'jxl' && isRecompressedJpeg(bytes);
+  const lossy = from === 'jpeg' || from === 'heic' || recompressed
+    || (from === 'avif' && !isLosslessAvif(bytes))
+    || (from === 'webp' && webpChunks(bytes).includes('VP8 '))
     || (from === 'jxl' && isLossyJxl(bytes));
   if (!lossy || target === 'jpeg') return [];
-  const smaller = from === 'jpeg' ? 'format "jpeg" (or "jxl" without a pixel/block mode, the JPEG route)' : 'format "jpeg" with a quality setting';
-  return [`${from} is lossy: lossless ${target} output is typically 3-8 times its size even unscrambled; ${smaller} stays small`];
+  const smaller = from === 'jpeg' ? 'format "jpeg" (or "jxl" without a pixel/block mode, the JPEG route)'
+    : !recompressed ? 'format "jpeg" with a quality setting'
+      : target === 'jxl' ? 'the JPEG route (no pixel/block mode) or format "jpeg"'
+        : 'format "jxl" without a pixel/block mode (the JPEG route) or "jpeg"';
+  const what = recompressed ? 'jxl (a recompressed JPEG) is lossy' : `${from} is lossy`;
+  return [`${what}: lossless ${target} output is typically 3-8 times its size even unscrambled; ${smaller} stays small`];
 }
 
-function hasChunk(bytes, fourcc) {
-  const tag = [...fourcc].map((c) => c.charCodeAt(0));
-  for (let i = 12; i + 4 <= Math.min(bytes.length, 64); i++) if (tag.every((c, k) => bytes[i + k] === c)) return true;
+/** The chunk ids of a WebP (RIFF) file, in order. */
+function webpChunks(bytes) {
+  const ids = [];
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  for (let pos = 12; pos + 8 <= bytes.length && ids.length < 1024;) {
+    ids.push(String.fromCharCode(...bytes.subarray(pos, pos + 4)));
+    const len = dv.getUint32(pos + 4, true);
+    pos += 8 + len + (len & 1);
+  }
+  return ids;
+}
+
+/**
+ * AVIF is lossless only when coded as RGB (the identity matrix in its nclx colour box):
+ * every other lossless coding still loses to the YUV conversion.
+ */
+function isLosslessAvif(bytes) {
+  const end = Math.min(bytes.length, 1 << 16);
+  for (let i = 4; i + 15 <= end; i++) {
+    if (bytes[i] === 0x63 && bytes[i + 1] === 0x6f && bytes[i + 2] === 0x6c && bytes[i + 3] === 0x72 // colr
+      && bytes[i + 4] === 0x6e && bytes[i + 5] === 0x63 && bytes[i + 6] === 0x6c && bytes[i + 7] === 0x78) { // nclx
+      return ((bytes[i + 12] << 8) | bytes[i + 13]) === 0; // matrix_coefficients
+    }
+  }
   return false;
+}
+
+function isRecompressedJpeg(bytes) {
+  try {
+    return readJxl(bytes).boxes.some((b) => b.type === 'jbrd');
+  } catch {
+    return false;
+  }
 }
 
 function isLossyJxl(bytes) {
@@ -240,8 +277,13 @@ function prepare(bytes, { format, decoders = [], keepThumbnails = false, limits 
   if (!from) throw new PixmixError('Unrecognised image format', 'UNSUPPORTED');
   const target = targetFormat(from, format);
   if (from === target) {
-    const { bytes: out, dropped } = keepThumbnails ? { bytes, dropped: [] } : sanitize(from, bytes, limits);
-    return { done: { bytes: out, format: target, from, decoder: 'none', transferred: ['all metadata'], dropped } };
+    const { bytes: out, dropped } = sanitize(from, bytes, limits, keepThumbnails);
+    return { done: { bytes: out, format: target, from, decoder: 'none', transferred: ['all metadata'], dropped, notes: [] } };
+  }
+  // Decoding a scrambled image to another format would lose its marker (and with it the
+  // original): refuse, as encode does. The same format keeps the marker (see sanitize).
+  if (isScrambled(bytes, from, limits)) {
+    throw new PixmixError('Image is scrambled; converting it to another format would lose the original (decode it first)', 'ALREADY_SCRAMBLED');
   }
   // Plugins first, so a caller can override a built-in (e.g. sharp for faster JPEG).
   const decoder = [...decoders, ...BUILTIN_DECODERS].find((d) => d.formats.includes(from));
@@ -274,8 +316,12 @@ function mergedMeta(bytes, from, decoded, keepThumbnails, limits) {
   for (const k of Object.keys(extracted)) if (extracted[k] === undefined) meta[k] = fromDecoder[k];
   meta.dropped = [...(extracted.dropped ?? []), ...(fromDecoder.dropped ?? [])];
   if (meta.exif && !keepThumbnails) {
-    const stripped = stripExifThumbnail(meta.exif);
-    if (stripped) { meta.exif = stripped; meta.dropped.push('EXIF thumbnail'); }
+    const stripped = stripExifPreviews(meta.exif);
+    if (stripped) { meta.exif = stripped.tiff; meta.dropped.push(...stripped.dropped); }
+  }
+  if (meta.xmp && !keepThumbnails) {
+    const stripped = stripXmpPreviews(meta.xmp);
+    if (stripped) { meta.xmp = stripped.text ?? undefined; meta.dropped.push(...stripped.dropped); }
   }
   return meta;
 }
@@ -290,18 +336,50 @@ function finish(bytes, { from, target, decoder }, decoded, { keepThumbnails = fa
   return { bytes: built.bytes, format: target, from, decoder: decoder.name, transferred: built.transferred, dropped: [...new Set(built.dropped)], notes: sizeNotes(bytes, from, target) };
 }
 
-function sanitize(format, bytes, limits) {
-  if (format === 'jpeg') return sanitizeJpeg(bytes, limits);
+function sanitize(format, bytes, limits, keepThumbnails) {
+  if (format === 'jpeg') return sanitizeJpeg(bytes, limits, { keepThumbnails });
+  if (keepThumbnails) return { bytes, dropped: [] };
   if (format === 'jxl') {
+    // The codestream is copied as it is, so the boxes that belong to it stay.
     const { boxes, codestream } = readJxl(bytes, limits);
-    const clean = sanitizeBoxes(boxes, { limits });
+    const clean = sanitizeBoxes(boxes, { limits, sameCodestream: true });
     return { bytes: writeJxl(clean.boxes, codestream), dropped: clean.dropped };
   }
-  // PNG: only an EXIF thumbnail can leak; everything else stays byte for byte.
+  // PNG: only EXIF and XMP previews can leak; everything else stays byte for byte.
   const chunks = readChunks(bytes, limits);
+  const dropped = [];
+  let changed = false;
   const i = chunks.findIndex((c) => c.type === 'eXIf');
-  const stripped = i >= 0 ? stripExifThumbnail(chunks[i].data) : null;
-  if (!stripped) return { bytes, dropped: [] };
-  chunks[i] = { type: 'eXIf', data: stripped };
-  return { bytes: writeChunks(chunks), dropped: ['EXIF thumbnail'] };
+  const exif = i >= 0 ? stripExifPreviews(chunks[i].data) : null;
+  if (exif) { chunks[i] = { type: 'eXIf', data: exif.tiff }; dropped.push(...exif.dropped); changed = true; }
+  const { maxMetadataBytes } = resolveLimits(limits);
+  for (let k = 0; k < chunks.length; k++) {
+    const c = chunks[k];
+    if (!['iTXt', 'tEXt', 'zTXt'].includes(c.type) || !startsWithKeyword(c.data, 'XML:com.adobe.xmp')) continue;
+    const text = readPngText(c.type, c.data, maxMetadataBytes)?.text;
+    const xmp = text ? stripXmpPreviews(text) : null;
+    if (!xmp) continue;
+    chunks[k] = xmp.text === null ? null : { type: 'iTXt', data: xmpChunk(xmp.text) };
+    for (const d of xmp.dropped) if (!dropped.includes(d)) dropped.push(d);
+    changed = true;
+  }
+  if (!changed) return { bytes, dropped: [] };
+  return { bytes: writeChunks(chunks.filter(Boolean)), dropped };
+}
+
+const startsWithKeyword = (data, k) => data.length > k.length && data[k.length] === 0 && [...k].every((ch, i) => data[i] === ch.charCodeAt(0));
+const xmpChunk = (text) => {
+  const k = Uint8Array.from('XML:com.adobe.xmp', (c) => c.charCodeAt(0)), t = new TextEncoder().encode(text);
+  const out = new Uint8Array(k.length + 5 + t.length);
+  out.set(k);
+  out.set(t, k.length + 5);
+  return out;
+};
+
+/** Whether the file carries a pixmix marker (only its presence: nothing is parsed). */
+export function isScrambled(bytes, format, limits) {
+  if (format === 'png') return readChunks(bytes, limits).some((c) => c.type === 'pmIx');
+  if (format === 'jpeg') return !!jpegMarkerBytes(bytes);
+  if (format === 'jxl') return readJxl(bytes, limits).boxes.some((b) => b.type === 'pmIx');
+  return false;
 }

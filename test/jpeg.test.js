@@ -415,3 +415,71 @@ test('quantisation tables redefined between scans keep the image', async () => {
   const plain = new Uint8Array(await fromRaw(48, 32).jpeg().toBuffer());
   assert.deepEqual(nonCoding(decode(encode(plain, { key: 'k' }), { key: 'k' })), nonCoding(plain));
 });
+
+test('an uncompressed EXIF thumbnail in several strips is zeroed, not only unlinked', async () => {
+  const base = await fromRaw(48, 32).jpeg().toBuffer();
+  // IFD0 { Orientation } -> IFD1 { StripOffsets x3, StripByteCounts x3 } -> 3 strips of 16 bytes
+  const ifd1 = 26, arrays = ifd1 + 2 + 2 * 12 + 4, pix = arrays + 24;
+  const t = Buffer.alloc(pix + 48);
+  t.write('II', 0, 'latin1'); t.writeUInt16LE(42, 2); t.writeUInt32LE(8, 4);
+  t.writeUInt16LE(1, 8); t.writeUInt16LE(0x0112, 10); t.writeUInt16LE(3, 12); t.writeUInt32LE(1, 14); t.writeUInt16LE(1, 18);
+  t.writeUInt32LE(ifd1, 22);
+  t.writeUInt16LE(2, ifd1);
+  t.writeUInt16LE(0x0111, ifd1 + 2); t.writeUInt16LE(4, ifd1 + 4); t.writeUInt32LE(3, ifd1 + 6); t.writeUInt32LE(arrays, ifd1 + 10);
+  t.writeUInt16LE(0x0117, ifd1 + 14); t.writeUInt16LE(3, ifd1 + 16); t.writeUInt32LE(3, ifd1 + 18); t.writeUInt32LE(arrays + 12, ifd1 + 22);
+  for (let k = 0; k < 3; k++) { t.writeUInt32LE(pix + 16 * k, arrays + 4 * k); t.writeUInt16LE(16, arrays + 12 + 2 * k); }
+  t.fill(0xcd, pix);
+  const src = new Uint8Array(Buffer.concat([Buffer.from([0xff, 0xd8]), seg(0xe1, Buffer.concat([Buffer.from('Exif\0\0', 'latin1'), t])), base.subarray(2)]));
+  let report;
+  const scrambled = encode(src, { key: 'k', onConvert: (r) => { report = r; } });
+  assert.deepEqual(report.dropped, ['EXIF thumbnail']);
+  const exif = Buffer.from(readSegments(scrambled).segments.find((s) => s.marker === 0xe1).data.subarray(6));
+  assert.equal(exif.length, t.length);
+  assert.ok(!exif.includes(Buffer.alloc(4, 0xcd)), 'every strip zeroed');
+});
+
+test('keepThumbnails: data after the image is reported as dropped, and the MPF index to it goes too', async () => {
+  const base = await fromRaw(48, 32).jpeg().toBuffer();
+  const second = await fromRaw(16, 16).jpeg().toBuffer();
+  const src = new Uint8Array(Buffer.concat([Buffer.from([0xff, 0xd8]), seg(0xe2, Buffer.from('MPF\0MM\0\0', 'latin1')), base.subarray(2), second]));
+  let report;
+  const scrambled = encode(src, { key: 'k', keepThumbnails: true, onConvert: (r) => { report = r; } });
+  assert.deepEqual(report.dropped, [
+    'MPF index (the images it lists after the end of the image cannot be kept)',
+    `${second.length} bytes after the image (e.g. secondary images, motion-photo video)`,
+  ]);
+  assert.ok(!Buffer.from(scrambled).toString('latin1').includes('MPF\0'));
+  assert.equal(readSegments(scrambled).trailing.length, 0);
+  // Nothing to report: the file stays as it is.
+  const plain = convert(new Uint8Array(base), { keepThumbnails: true });
+  assert.deepEqual(plain.dropped, []);
+  assert.deepEqual(plain.notes, []);
+  assert.equal(plain.bytes.length, base.length);
+});
+
+test('density: a whole number of dots per inch is written in inches, anything else in cm', () => {
+  const jfifOf = (density) => {
+    const { png } = buildPng({ width: 8, height: 8, data: gradient(8, 8) }, { density });
+    const d = readSegments(convert(png, { format: 'jpeg' }).bytes).segments.find((s) => s.marker === M.APP0).data;
+    return [d[7], (d[8] << 8) | d[9], (d[10] << 8) | d[11]];
+  };
+  assert.deepEqual(jfifOf({ x: 2835, y: 2835, unit: 'meter' }), [1, 72, 72]);
+  assert.deepEqual(jfifOf({ x: 11811, y: 3780, unit: 'meter' }), [1, 300, 96]);
+  assert.deepEqual(jfifOf({ x: 11800, y: 11800, unit: 'meter' }), [2, 118, 118]); // 299.72 dpi
+  assert.deepEqual(jfifOf({ x: 2, y: 1, unit: 'none' }), [0, 2, 1]);
+});
+
+test('comments outside Latin-1 are written as UTF-8 to COM and read back', () => {
+  const text = 'Tōkyō 東京 ✓';
+  const { png } = buildPng({ width: 8, height: 8, data: gradient(8, 8) }, { comments: [text, 'café'] });
+  const jpeg = convert(png, { format: 'jpeg' }).bytes;
+  const coms = readSegments(jpeg).segments.filter((s) => s.marker === M.COM).map((s) => Buffer.from(s.data));
+  assert.deepEqual(coms.map((c) => c.toString('utf8')), [text, 'café']);
+  // Back to PNG: the reader takes UTF-8 COMs as such (and anything else as Latin-1).
+  const back = convert(jpeg, { format: 'png' }).bytes;
+  assert.ok(Buffer.from(back).includes(Buffer.concat([Buffer.from('iTXtComment\0\0\0\0\0', 'latin1'), Buffer.from(text)])), 'iTXt, UTF-8');
+  assert.ok(Buffer.from(back).includes(Buffer.from('tEXtComment\0caf\xe9', 'latin1')), 'tEXt, Latin-1');
+  // A metadata policy writes comments with the same encoder.
+  const set = convert(new Uint8Array(jpeg), { metadata: { set: { comment: [text] } } }).bytes;
+  assert.deepEqual(readSegments(set).segments.filter((s) => s.marker === M.COM).map((s) => Buffer.from(s.data).toString('utf8')), [text]);
+});

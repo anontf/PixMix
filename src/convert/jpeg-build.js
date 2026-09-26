@@ -3,6 +3,7 @@
 import { encodePixels } from '../formats/jpeg/fdct.js';
 import { assembleJpeg } from '../formats/jpeg/encode.js';
 import { M } from '../formats/jpeg/markers.js';
+import { commentBytes } from '../meta/text.js';
 
 const utf8 = new TextEncoder();
 const ascii = (s) => Uint8Array.from(s, (c) => c.charCodeAt(0) & 255);
@@ -55,12 +56,17 @@ export function buildJpeg(image, meta = {}, { quality = 90, subsampling = '4:2:0
   const header = [];
   const jfif = Uint8Array.from([...ascii('JFIF\0'), 1, 1, 0, 0, 1, 0, 1, 0, 0]);
   if (meta.density) {
-    // JPEG only has dots per cm/inch; pHYs is per metre.
+    // JPEG only has dots per inch or cm; pHYs is per metre. Inches when the density is a
+    // whole number of dots per inch (it maps back to the same pixels per metre), else cm.
     const d = meta.density;
-    const perCm = d.unit === 'meter';
-    const x = perCm ? Math.round(d.x / 100) : d.x, y = perCm ? Math.round(d.y / 100) : d.y;
+    const perMetre = d.unit === 'meter';
+    const inch = (v) => Math.round(v * 0.0254);
+    const dpi = perMetre && [d.x, d.y].every((v) => Math.round(inch(v) / 0.0254) === v);
+    const unit = !perMetre ? 0 : dpi ? 1 : 2;
+    const x = unit === 1 ? inch(d.x) : unit === 2 ? Math.round(d.x / 100) : d.x;
+    const y = unit === 1 ? inch(d.y) : unit === 2 ? Math.round(d.y / 100) : d.y;
     if (x > 0 && y > 0 && x < 65536 && y < 65536) {
-      jfif[7] = perCm ? 2 : 0;
+      jfif[7] = unit;
       jfif[8] = x >> 8; jfif[9] = x & 255; jfif[10] = y >> 8; jfif[11] = y & 255;
       transferred.push('density');
     }
@@ -90,7 +96,7 @@ export function buildJpeg(image, meta = {}, { quality = 90, subsampling = '4:2:0
     transferred.push('ICC profile');
   }
   for (const c of meta.comments ?? []) {
-    header.push({ marker: M.COM, data: ascii(c).subarray(0, MAX_PAYLOAD) });
+    header.push({ marker: M.COM, data: commentBytes(c) });
     if (!transferred.includes('comments')) transferred.push('comments');
   }
 

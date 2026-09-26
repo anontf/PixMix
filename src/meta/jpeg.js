@@ -1,8 +1,8 @@
 // Metadata from a JPEG's marker segments. Nothing here decodes pixels.
 
 import { PixmixError } from '../core/params.js';
+import { decodeComment } from './text.js';
 
-const latin1 = new TextDecoder('latin1');
 const startsWith = (bytes, s) => s.length <= bytes.length && [...s].every((c, i) => bytes[i] === c.charCodeAt(0));
 
 const EXIF = 'Exif\0\0';
@@ -53,7 +53,7 @@ export function readJpegMetadata(bytes) {
     } else if (marker === 0xe2 && startsWith(seg, ICC) && seg.length > ICC.length + 2) {
       iccParts.push({ seq: seg[ICC.length], data: seg.subarray(ICC.length + 2) });
     } else if (marker === 0xfe) {
-      meta.comments.push(latin1.decode(seg));
+      meta.comments.push(decodeComment(seg));
     } else if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
       meta.height = (seg[1] << 8) | seg[2];
       meta.width = (seg[3] << 8) | seg[4];

@@ -19,6 +19,7 @@ import { unscramblePngDetailedAsync } from '../formats/png/index.js';
 import { computeAnywhere } from './worker-client.js';
 import { readOrientation } from '../meta/exif.js';
 import { resolveLimits, checkInputSize } from '../core/limits.js';
+import { toBytes } from '../formats/index.js';
 import { orientationTransform, swapsAxes, browserHonoursPngOrientation } from './orient.js';
 
 export { decode, inspect, detectFormat, configureJxl, configureWatermarks, configureMetadata, PixmixError, WrongKeyError, DEFAULT_LIMITS };
@@ -33,7 +34,7 @@ const TYPES = { png: 'image/png', jpeg: 'image/jpeg' };
  * for display, decodeToURL (a PNG for JPEG XL) is cheaper.
  */
 export async function decodeAsync(input, { key, limits, watermark, watermarkBase, fetchOptions, metadata, onMetadata } = {}) {
-  let bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  let bytes = toBytes(input);
   const format = detectFormat(bytes);
   if (!watermark) {
     if (format === 'png') {
@@ -58,7 +59,7 @@ export async function decodeAsync(input, { key, limits, watermark, watermarkBase
  * @returns {Promise<{bytes: Uint8Array, type: string}>}
  */
 export async function restoreForDisplay(input, { key, worker, limits, watermark = false, watermarkBase, fetchOptions, metadata } = {}) {
-  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  const bytes = toBytes(input);
   const wm = await watermarkFor(watermark, bytes, watermarkBase, fetchOptions, limits);
   const job = await prepare(bytes, key, 'ignore', false, worker, limits, wm, metadata);
   return { bytes: job.restored(), type: job.type };
@@ -101,6 +102,7 @@ async function watermarkFor(spec, bytes, base, fetchOptions, limits) {
   if (spec === undefined || spec === true || spec === 'auto' || spec === 'embedded') {
     const info = inspect(bytes, { limits }).watermark;
     if (!info) return null;
+    if (info.unreadable) throw new PixmixError(`The watermark this file carries cannot be read: ${info.error}`, 'BAD_WATERMARK');
     return info.embedded ? 'embedded' : fetchWatermark(info.id, base, fetchOptions);
   }
   if (typeof spec === 'string') return fetchWatermark(spec, base, fetchOptions);

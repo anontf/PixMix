@@ -15,6 +15,7 @@ import { PixmixError } from '../core/params.js';
 import { settableTag, encodeEntry } from './tiff.js';
 import { knownProperty, XmpPacket } from './xmp.js';
 import { IFDS } from './exif-tags.js';
+import { XMP_PREVIEWS } from './thumbnails.js';
 
 export const KINDS = ['exif', 'xmp', 'icc', 'colour', 'text', 'density', 'orientation', 'other'];
 export const GROUPS = ['gps', 'serials', 'makernote', 'owner', 'timestamps', 'history', 'thumbnail', 'c2pa'];
@@ -59,7 +60,7 @@ const GROUP_XMP = {
   timestamps: ['xmp:CreateDate', 'xmp:ModifyDate', 'xmp:MetadataDate', 'photoshop:DateCreated', 'exif:DateTimeOriginal',
     'exif:DateTimeDigitized', 'tiff:DateTime', 'dc:date'],
   history: ['xmpMM:*', 'photoshop:DocumentAncestors', 'exif:ImageUniqueID'],
-  thumbnail: ['xmp:Thumbnails', 'GImage:*', 'GDepth:*'],
+  thumbnail: XMP_PREVIEWS,
 };
 const GROUP_IPTC = {
   gps: ['City', 'Sub-location', 'Province-State', 'Country-PrimaryLocationCode', 'Country-PrimaryLocationName', 'ContentLocationCode', 'ContentLocationName'],

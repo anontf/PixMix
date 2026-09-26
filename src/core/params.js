@@ -51,9 +51,13 @@ const utf8 = new TextEncoder();
 // output compresses almost like the unscrambled image; pixel mode turns it into incompressible
 // noise (about twice the size of a lossless original).
 export function makeParams({ mode = 'block', block = 16, transforms = true, progressive = false, salt } = {}) {
-  if (!MODES.includes(mode)) throw new PixmixError(`Unknown mode "${mode}" (expected pixel, block or mcu)`);
+  if (!MODES.includes(mode)) throw new PixmixError(`Unknown mode "${mode}" (expected pixel, block or mcu)`, 'BAD_OPTION');
   if (mode === 'block' && !(Number.isInteger(block) && block >= 2 && block <= 4096)) {
-    throw new PixmixError('Block size must be an integer between 2 and 4096');
+    throw new PixmixError('Block size must be an integer between 2 and 4096', 'BAD_OPTION');
+  }
+  // The marker stores the salt's length in one byte: a longer salt made unrestorable files.
+  if (salt !== undefined && !(salt instanceof Uint8Array && salt.length <= 255)) {
+    throw new PixmixError('salt must be a Uint8Array of at most 255 bytes', 'BAD_OPTION');
   }
   if (!salt) {
     salt = new Uint8Array(SALT_BYTES);
@@ -66,11 +70,27 @@ export function makeParams({ mode = 'block', block = 16, transforms = true, prog
 
 /** @param {string|Uint8Array} key */
 export function keyBytes(key) {
+  // UTF-8 turns every lone surrogate into U+FFFD, so keys differing only in them would be
+  // the same key: refuse them rather than let them collide.
+  if (typeof key === 'string' && hasLoneSurrogate(key)) {
+    throw new PixmixError('The key is not valid Unicode (it has a lone surrogate); use a Uint8Array for binary keys', 'BAD_OPTION');
+  }
   const bytes = typeof key === 'string' ? utf8.encode(key) : key;
   if (!(bytes instanceof Uint8Array) || bytes.length === 0) {
-    throw new PixmixError('A non-empty key (string or Uint8Array) is required');
+    throw new PixmixError('A non-empty key (string or Uint8Array) is required', 'BAD_OPTION');
   }
   return bytes;
+}
+
+function hasLoneSurrogate(s) {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0xd800 || c > 0xdfff) continue;
+    const next = s.charCodeAt(i + 1);
+    if (c > 0xdbff || !(next >= 0xdc00 && next <= 0xdfff)) return true;
+    i++;
+  }
+  return false;
 }
 
 /**

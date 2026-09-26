@@ -723,15 +723,6 @@ export function applyJxlParts({ boxes, icc }, policy, { limits, stripThumbnails 
   return { boxes: res.boxes, icc: res.icc, report };
 }
 
-/** The orientation a file will have once the policy is applied (1 = none). */
-export function orientationAfter(orientation, policy) {
-  const p = normalizePolicy(policy);
-  if (p.set.orientation) return p.set.orientation;
-  if (p.kinds.orientation === 'strip') return 1;
-  if (p.kinds.exif === 'strip' && p.kinds.orientation !== 'keep') return 1;
-  return orientation;
-}
-
 function concat(...parts) {
   const out = new Uint8Array(parts.reduce((n, x) => n + x.length, 0));
   let o = 0;

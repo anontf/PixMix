@@ -229,7 +229,7 @@ function withMetadata(bytes, opts) {
 }
 
 /** What the JPEG XL module needs to apply a policy where it decodes and encodes. */
-export const metaHook = (opts) => ({ tools: metadataTools, policy: opts.metadata, limits: opts.limits, onReport: opts.onMetadata });
+const metaHook = (opts) => ({ tools: metadataTools, policy: opts.metadata, limits: opts.limits, onReport: opts.onMetadata });
 
 /**
  * Describes an image and whether it carries a pixmix marker. Reads headers only, and checks

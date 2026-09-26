@@ -14,7 +14,7 @@ XL, and the same DCT coefficients for JPEG and JPEG-route JPEG XL.
 Output is PNG (and animated APNG), JPEG or JPEG XL. Input can be PNG/APNG, JPEG, GIF
 (animated GIFs become APNG), JPEG XL, and, with a decoder plugin, WebP, AVIF, HEIC or TIFF.
 EXIF, ICC, XMP, density and comments are carried over where the output format can hold
-them.
+them, or stripped, edited and set by a metadata policy (see "Metadata").
 
 This is obfuscation, not encryption: a permutation keeps the colour histogram, and in the
 browser use case the key ships to the visitor.
@@ -38,6 +38,8 @@ to the demo gallery. Only use `serve:lan` on a network you trust.
   - Encode it on the server or in the browser, and see what metadata was kept or dropped.
   - Watch it decode with each animation, compare chunks, rekey, try a wrong key.
   - Create and edit watermarks, with a live preview, and save them to `watermarks/`.
+  - Create and edit metadata profiles, with the image's metadata before and after, and save
+    them to `metadata-profiles/`; pick one when encoding and when decoding.
 - **Demo site** (`/site.html`): images published from the lab, served scrambled and
   revealed by the standalone `<script>` decoder as they scroll into view.
 
@@ -58,6 +60,7 @@ pixmix encode photo.jpg --watermark vivi-gold # carry a watermark for the decode
 pixmix encode photo.jpg --visible-watermark vivi-pixel   # drawn on the scrambled image too
 pixmix decode photo.scrambled.jpg --watermark embedded   # draw the one it carries
 pixmix decode photo.scrambled.jpg --watermark my-mark.json
+pixmix encode photo.jpg --metadata vivi-web   # strip everything, credit Vivi (see "Metadata")
 ```
 
 For each file it reports how the input was decoded and what metadata was kept or dropped.
@@ -76,6 +79,7 @@ lists every option.
 | `dist/pixmix-decoder.js` | ESM | bundlers / `<script type="module">` |
 | `dist/pixmix-worker.mjs` | ESM (Web Worker) | used by both decoders to decode off the main thread |
 | `dist/pixmix-watermark.mjs` | ESM | draws watermarks, loaded on demand (36 KB; 16 KB gzipped) |
+| `dist/pixmix-metadata.mjs` | ESM | metadata policies in the decoders, loaded on demand (83 KB; 32 KB gzipped) |
 | `dist/pixmix-encoder.mjs` | ESM, platform-neutral | Node, Deno, Bun, workers, browsers |
 | `dist/pixmix-encoder.cjs` | CommonJS | `require()`-based servers |
 | `dist/pixmix-jxl.mjs` + `pixmix-jxl-{enc,dec}.wasm` | ESM + WASM | JPEG XL support, loaded on demand |
@@ -83,7 +87,9 @@ lists every option.
 The decoder bundle contains no encoding code; the encoder bundle has no DOM code.
 
 Deploy `pixmix-watermark.mjs` next to the decoder if you use watermarks (or call
-`configureWatermarks({ moduleUrl })`); it is only fetched when one is drawn.
+`configureWatermarks({ moduleUrl })`); it is only fetched when one is drawn. Likewise
+`pixmix-metadata.mjs` (`configureMetadata`), fetched only when a decoder is given a metadata
+policy.
 
 Deploy `pixmix-worker.mjs` next to the decoder to keep large decodes off the main thread.
 If it's missing, or a CSP forbids workers, the decoder quietly decodes on the main thread.
@@ -139,6 +145,7 @@ Options:
 - `onConvert(report)`: reports how the input was decoded and what metadata was kept or
   dropped: `{ format, from, decoder, transferred, dropped }`.
 - `watermark`, `visibleWatermark`: see "Watermarks" below.
+- `metadata`: a metadata policy for the scrambled file, see "Metadata" below.
 - `limits`: resource limits, see "Untrusted input" below.
 
 `encode` is synchronous and handles PNG, JPEG and GIF on its own. JPEG XL, in or out,
@@ -569,6 +576,162 @@ In Node, `pixmix/watermarks` exports `compileWatermark`, `normalizeDefinition`,
 `formatDefinition`, `validateCompiled`, `watermarkStore`, `loadWatermark` and
 `renderWatermark`.
 
+## Metadata
+
+By default metadata travels as described in "Input formats and metadata". A metadata
+policy changes that: strip, keep, remove and set, the same way on PNG, JPEG and JPEG XL,
+without touching the pixels. The typical site strips everything from the images it serves
+and sets its own copyright:
+
+```js
+const out = await encodeAsync(photo, { key, metadata: { preset: 'web', set: { artist: 'Vivi', copyright: 'Vivi' } } });
+```
+
+```sh
+pixmix encode photos/*.jpg --metadata vivi-web -o scrambled/   # a saved profile
+pixmix decode photo.scrambled.jpg --metadata strip-all         # a preset
+pixmix inspect photo.jpg                                       # EXIF tags, XMP, ICC, text, IPTC, …
+```
+
+### Policies
+
+A policy is plain data (a preset name, or an object), so it can be saved, sent to a server
+or to a Web Worker:
+
+```js
+{
+  preset: 'privacy',                   // keep (default), strip-all, privacy, web
+  keep: ['icc'], strip: ['text'],      // kinds, over the preset
+  remove: ['serials', 'exif:Make', 'exif:GPS/*', 'xmp:dc:creator', 'iptc:City', 'text:Author', 'other:APP13'],
+  set: {
+    artist: 'Vivi', copyright: 'Vivi', title: '…', description: '…', software: '…',
+    comment: ['…'],                    // replaces every comment
+    orientation: 1,                    // the EXIF tag (pixels are never rotated)
+    icc: 'srgb',                       // tag as sRGB (pixels are not converted)
+    exif: { DateTime: '2025:01:31 12:00:00', XResolution: 72, Artist: null },  // null removes
+    xmp: { 'dc:subject': ['sun', 'sea'], 'xmpRights:Marked': 'True' },
+    xmpPacket: '<x:xmpmeta …>',        // replaces the whole packet
+    text: { Source: 'pixmix' },        // PNG text chunks
+  },
+}
+```
+
+Kinds, and where they live:
+
+| Kind | PNG | JPEG | JPEG XL |
+| --- | --- | --- | --- |
+| `exif` | `eXIf` | APP1 `Exif` | `Exif` box (or `brob`) |
+| `xmp` | `iTXt XML:com.adobe.xmp` | APP1 XMP (+ extended XMP) | `xml ` box (or `brob`) |
+| `icc` | `iCCP` | APP2 `ICC_PROFILE` | the codestream |
+| `colour` | `sRGB`, `gAMA`, `cHRM`, `cICP`, `mDCV`, `cLLI` | – | the codestream |
+| `text` | `tEXt`, `zTXt`, `iTXt` | COM | – |
+| `density` | `pHYs` | JFIF density | – |
+| `orientation` | EXIF Orientation | EXIF Orientation | the codestream |
+| `other` | every other ancillary chunk (`tIME`, `caBX`, unknown ones) | APP2–APP15 (Photoshop/IPTC, JUMBF/C2PA, MPF, …) | `jumb`, unknown boxes |
+
+Never touched: image data and structure (`PLTE`, `tRNS`, APNG chunks, unknown critical
+chunks, JFIF, Adobe APP14, DQT/DHT/SOF/SOS, `jbrd`, `jxll`, …) and pixmix's own marker,
+watermark and stash chunks. A block the policy leaves alone keeps its bytes, and without a
+policy (or with `keep`) files come out exactly as before.
+
+Presets:
+- `keep`: everything, as without a policy.
+- `strip-all`: only what displaying the pixels needs: the ICC profile, PNG colour chunks
+  and the orientation (EXIF is cut down to its Orientation tag, or goes when that is 1).
+  Density is dropped: browsers do not use it.
+- `privacy`: every removal group below; the rest (camera, exposure, copyright, keywords,
+  captions, the profile) stays.
+- `web`: `strip-all`, and a plain sRGB profile goes too (viewers assume sRGB). Meant to be
+  combined with `set`.
+
+Removal groups, across EXIF, XMP, IPTC, text and other chunks:
+
+| Group | Removes |
+| --- | --- |
+| `gps` | the GPS IFD, XMP `exif:GPS*`, city/state/country (XMP, IPTC) |
+| `serials` | body, lens and camera serial numbers, `aux:ImageNumber` |
+| `makernote` | the MakerNote, DNG private data |
+| `owner` | Artist, CameraOwnerName, XPAuthor, HostComputer, `dc:creator`, IPTC By-line, PNG `Author`, … |
+| `timestamps` | DateTime*, OffsetTime*, SubSecTime*, GPS date and time, XMP dates, IPTC dates, PNG `tIME` |
+| `history` | ImageUniqueID, `xmpMM:*` (document ids, history), `photoshop:DocumentAncestors` |
+| `thumbnail` | EXIF IFD1, XMP thumbnails, Photoshop thumbnails, JFXX, MPF, data after the image |
+| `c2pa` | JUMBF / C2PA manifests (PNG `caBX`, JPEG APP11, JPEG XL `jumb`) |
+
+Patterns are globs, case-insensitive: `exif:[IFD/]Name` (a name or `0x` number; IFDs:
+IFD0, Exif, GPS, Interop, IFD1, SubIFD), `xmp:prefix:Name` (namespaces are matched by URI,
+whatever prefix the file uses), `iptc:Name`, `text:Keyword` (JPEG comments are `Comment`),
+`other:Type` (a PNG chunk type, `APP13`, a box type).
+
+The convenience fields go into EXIF (created if needed: Artist, Copyright, ImageTitle,
+ImageDescription, Software), into the XMP packet if the file keeps one (`dc:creator`,
+`dc:rights`, `dc:title`, `dc:description`, `xmp:CreatorTool`), into PNG text if text is
+kept (Author, Copyright, Title, Description, Software) and over existing IPTC datasets.
+EXIF values get their tag's type (ASCII, SHORT, RATIONAL, …); bad ones are refused.
+
+Every entry point takes `metadata`: `encode`, `convert`, `decode`, `rekey` (which keeps
+the file's metadata without one), their async versions, and the browser's `reveal`,
+`revealAll`, `restoreForDisplay`, `decodeToURL` and `decodeAsync` (`data-metadata` on the
+script tag). Reports say what changed: `onConvert`'s report gets `metadata`, and
+`decode`/`rekey` call `onMetadata`, with `{ policy, removed, set, notes }`.
+The encoder's `inspect(bytes, { metadata: true })` adds `meta`, the parsed metadata.
+Invalid policies throw a PixmixError with code `BAD_METADATA` that names the problem.
+`applyMetadata` and `readMetadata` work on any PNG, JPEG or JPEG XL; `pixmix/metadata`
+exports the rest.
+
+### How it is edited
+
+- **EXIF** is parsed into IFD0, Exif, GPS, Interop, IFD1 and SubIFDs, with values kept as
+  bytes, so unknown tags survive, and written back in its own byte order with every
+  pointer and offset (thumbnail, strips, tiles) recomputed. The MakerNote stays opaque and
+  goes back to its old offset (padded), since vendors point into it from the TIFF header;
+  the report says when it had to move.
+- **XMP** is parsed as XML (no DTDs or custom entities, bounded depth), and what the policy
+  does not touch is written back as it was. Extended XMP is not rewritten: it goes when the
+  packet changes.
+- **ICC**: `icc: 'srgb'` writes PNG's `sRGB` chunk (replacing iCCP and the colour chunks),
+  a compact sRGB profile in JPEG, and the sRGB colour encoding in JPEG XL. Removing or
+  replacing a non-sRGB profile changes how the image looks, and the report says so.
+- **IPTC** in Photoshop APP13: datasets are removed or replaced, the IPTC digest dropped.
+  Copies of EXIF and XMP inside it, and ImageMagick's `Raw profile type …` text chunks,
+  cannot be cleaned and go when a policy changes their kind.
+- **Unreadable** EXIF, XMP or IPTC is removed, not kept, when the policy needs to change it
+  (so "remove the location" cannot quietly leave it in), and the report says so.
+
+What cannot be done, and is reported instead:
+- JPEG XL keeps its ICC profile, colour encoding and orientation in the codestream. The
+  pixel route encodes the codestream again, so `encode`, `decode` and `rekey` can change
+  the profile there; `convert` of a JPEG XL to JPEG XL does not re-encode, so it cannot.
+  JPEG XL has no text, comments or density; EXIF Orientation is ignored there (the
+  codestream's counts), so `strip-all` removes its EXIF entirely on the pixel route.
+- A JPEG XL made from a JPEG (the JPEG route) keeps comments and other segments inside its
+  reconstruction data: policies edit the JPEG, which is then recompressed, so it stays
+  exact and rebuildable (`applyMetadataAsync`; the sync version edits the boxes and drops
+  the reconstruction data).
+- JPEG has no keyword text (only comments); EXIF or XMP over 64 KB does not fit a segment.
+- Brotli-compressed JPEG XL boxes cannot be read in browsers: they go when the policy
+  touches their kind.
+- Orientation is a tag: stripping it (or setting 1) makes viewers show the pixels as
+  stored, so a phone photo may appear sideways. pixmix never rotates pixels, which would not
+  be lossless for JPEG.
+
+### Profiles
+
+Profiles live in `metadata-profiles/<id>.json`: a policy with an `id`, `name` and
+`description`, validated and written in a fixed key order (maps sorted), so diffs stay
+clean. Two defaults: `vivi-web` (the `web` preset with Vivi as artist and copyright) and
+`vivi-privacy` (`privacy`, same credit). Ids use `[a-z0-9-]` and cannot be a preset name.
+
+- CLI: `--metadata <preset|profile id|file.json>` on encode, decode and rekey;
+  `--metadata-profiles <dir>`.
+- Server (`PIXMIX_METADATA_PROFILES_DIR` overrides the directory):
+  `GET /api/metadata-profiles` (profiles, presets, kinds, groups),
+  `POST /api/metadata-profiles` creates, `GET/PUT/DELETE /api/metadata-profiles/<id>`;
+  `?metadata=<preset|id>` on `/api/encode`, `/api/decode` and `/api/rekey` (the latter two
+  report in `X-Pixmix-Metadata`), `?metadata=1` on `/api/inspect`.
+- Lab: a profile editor with a before/after table of the current image's metadata, and
+  metadata pickers for encoding and decoding.
+- Browsers: the decoders fetch `pixmix-metadata.mjs` only when a policy is used.
+
 ## How it works
 
 1. **Seed.** HKDF-SHA-256 over the key, with the per-image random salt, and info = version,
@@ -685,15 +848,19 @@ progressive, GIF, JPEG XL on both routes, WebP and TIFF for sharp), then mutates
 bit flips, byte and word replacements, truncation, insertions, chunk, segment and box
 length edits, duplicated, reordered and dropped chunks, header fields, garbage after valid
 headers, and splices of two files. PNG CRCs are usually repaired so mutants get past them.
+Metadata has its own seeds (EXIF in both byte orders with a MakerNote, GPS, Interop and a
+thumbnail; XMP; IPTC; JUMBF; PNG text and raw profiles; files scrambled with a policy) and
+mutations aimed at IFD entry types, counts, offsets and pointers, and at XML structure.
 
 Each mutant goes through `inspect`, `encode`, `encodeAsync`, `decode`, `decodeAsync`,
-`rekeyAsync`, `convertAsync` and the browser reveal's decoding, with the right key and
-small limits. The only acceptable outcomes are success or a `PixmixError`. It is a
+`rekeyAsync`, `convertAsync`, `inspect({ metadata: true })`, `applyMetadata(Async)` and
+the browser reveal's decoding (the last three with a metadata policy too), with the right
+key and small limits. The only acceptable outcomes are success or a `PixmixError`. It is a
 failure when anything else is thrown (a `PixmixError` wrapping a `TypeError` counts too),
 when a case runs past its time budget (cases run in worker threads, which are replaced),
 when a worker dies or runs out of heap, and when the process's memory runs away. A file
-`encode` accepts must also come back from `decode` with the same PNG pixels or JPEG
-coefficients.
+`encode` accepts (with or without a metadata policy) must also come back from `decode`
+with the same PNG pixels or JPEG coefficients.
 
 ```sh
 npm test                 # includes a smoke run: fixed seed, 300 cases
@@ -720,7 +887,8 @@ failing inputs. Every bug it has found has a regression test in
 - watermarks drawn by the reveal (exactly what Node draws), carried and visible ones,
   and the painter only being fetched when needed;
 - the lab (every input/output/mode, encoded on the server and in the browser, the watermark
-  editor) and the demo site.
+  and metadata profile editors, metadata policies when encoding and decoding) and the demo
+  site.
 
 Console errors fail a test.
 
@@ -767,6 +935,8 @@ ship.
 - [x] Phase 8: watermarks: committed definitions compiled to outlines, a deterministic
   renderer, drawn by the reveal, the server and the CLI; carried in scrambled files, or
   visible on them with exact restoring; lab editor
+- [x] Phase 9: metadata policies: EXIF/XMP/ICC/IPTC editing on every format, presets,
+  saved profiles, CLI, server and lab
 - [ ] Firefox in the browser suite
 
 ## Third-party code
@@ -781,6 +951,7 @@ Everything is bundled or loaded under permissive licences:
   brotli-decompressor (BSD-3-Clause/MIT).
 - sharp is an optional peer (Apache-2.0).
 - opentype.js (MIT) compiles watermark text; it is not in any bundle.
+- exifr (MIT) reads metadata back in the tests; it is not in any bundle.
 - Watermark fonts (SIL Open Font License 1.1, texts in `watermarks/fonts/`): Press Start 2P,
   Pixelify Sans (both by their project authors) and Cinzel Decorative (Natanael Gama), from
   the Google Fonts repository.

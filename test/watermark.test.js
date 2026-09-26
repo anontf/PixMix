@@ -19,7 +19,9 @@ import { toRGBA8 } from '../src/formats/png/rgba.js';
 import { readChunks, writeChunks } from '../src/formats/png/chunks.js';
 import { readSegments, writeSegments } from '../src/formats/jpeg/markers.js';
 import { decodeFrame } from '../src/formats/jpeg/decode.js';
-import { readJxl } from '../src/formats/jxl/container.js';
+import { readJxl, writeJxl } from '../src/formats/jxl/container.js';
+import { encodeRaster } from '../src/formats/png/raster.js';
+import { encodeStash } from '../src/watermark/embed.js';
 import { loadJxlCodec } from '../src/formats/jxl/load.js';
 import { readMarker } from '../src/core/params.js';
 
@@ -348,11 +350,89 @@ test('a scrambled file can carry its watermark: whole, or by id', async () => {
 
 test('a corrupt carried watermark is reported, not drawn', async () => {
   const s = encode(PHOTO, { key: 'k', watermark: gold });
-  const chunks = readChunks(s).map((c) => (c.type === 'pmWm' ? { type: 'pmWm', data: Uint8Array.of(1, 1, 0x7b, 0x7b) } : c));
-  const bad = writeChunks(chunks);
-  assert.throws(() => inspect(bad), { code: 'BAD_WATERMARK' });
   const hostile = writeChunks(readChunks(s).map((c) => (c.type === 'pmWm' ? { type: 'pmWm', data: new Uint8Array([1, 1, ...Buffer.from(JSON.stringify({ ...gold, shapes: [{ d: 'M0 0L1e9 1e9Z', fill: '#fff', outline: true, image: null }] }))]) } : c)));
   await assert.rejects(decodeAsync(hostile, { key: 'k', watermark: true }), { code: 'BAD_WATERMARK' });
+});
+
+/** The file with its carried watermark payload (pmWm chunk / APP15 pixmix-wm / pmWm box) swapped. */
+function withCarried(b, payload) {
+  const f = detectFormat(b);
+  if (f === 'png') return writeChunks(readChunks(b).map((c) => (c.type === 'pmWm' ? { type: 'pmWm', data: payload } : c)));
+  if (f === 'jpeg') {
+    const { segments, trailing } = readSegments(b);
+    const sig = Buffer.from('pixmix-wm\0');
+    return writeSegments(segments.map((x) => (x.marker === 0xef && sig.equals(Buffer.from(x.data.subarray(0, sig.length))) ? { ...x, data: new Uint8Array([...sig, ...payload]) } : x)), trailing);
+  }
+  const { boxes, codestream } = readJxl(b);
+  return writeJxl(boxes.filter((x) => x.type !== 'ftyp' && x.type !== 'jxlc').map((x) => (x.type === 'pmWm' ? { type: 'pmWm', data: payload } : x)), codestream);
+}
+
+test('a damaged or oversized carried watermark never stops restoring, inspect or rekey', async () => {
+  const damaged = Uint8Array.of(1, 1, 0x7b, 0x7b);
+  for (const [name, make] of [['PNG', () => encode(PHOTO, { key: 'k', watermark: gold })], ['JPEG', () => encode(JPEG, { key: 'k', watermark: gold })],
+    ['JPEG XL', () => encodeAsync(PHOTO, { key: 'k', format: 'jxl', mode: 'block', block: 8, effort: 1, watermark: gold })]]) {
+    const s = await make();
+    const want = await content(await decodeAsync(s, { key: 'k' }));
+    const bad = withCarried(s, damaged);
+    assert.equal(inspect(bad).watermark.unreadable, true, name);
+    assert.match(inspect(bad).watermark.error, /Corrupt/);
+    assert.ok((await content(await decodeAsync(bad, { key: 'k' }))).equals(want), `${name}: plain decode is exact`);
+    if (name !== 'JPEG XL') assert.ok((await content(decode(bad, { key: 'k' }))).equals(want), `${name}: sync decode`);
+    // Asking for the file's own watermark is an error; drawing another one is not.
+    await assert.rejects(decodeAsync(bad, { key: 'k', watermark: 'embedded' }), { code: 'BAD_WATERMARK' });
+    await decodeAsync(bad, { key: 'k', watermark: win });
+    // Rekey drops the damaged watermark, or replaces it.
+    const r = await rekeyAsync(bad, { from: 'k', to: 'j' });
+    assert.equal(inspect(r).watermark, null, `${name}: dropped by rekey`);
+    assert.ok((await content(await decodeAsync(r, { key: 'j' }))).equals(want));
+    assert.equal(inspect(await rekeyAsync(bad, { from: 'k', to: 'j', watermark: win })).watermark.id, 'vivi-window');
+    // Over maxMetadataBytes: restoring ignores it, inspect flags it, rekey keeps it as it is.
+    const limits = { maxMetadataBytes: 100 };
+    assert.ok((await content(await decodeAsync(s, { key: 'k', limits }))).equals(want), `${name}: limit only matters for drawing`);
+    assert.match(inspect(s, { limits }).watermark.error, /maxMetadataBytes/);
+    await assert.rejects(decodeAsync(s, { key: 'k', limits, watermark: true }), { code: 'LIMIT' });
+    assert.deepEqual(inspect(await rekeyAsync(s, { from: 'k', to: 'j', limits })).watermark, { id: 'vivi-gold', name: 'Vivi · gold', embedded: true });
+  }
+});
+
+test('a watermark on a 1/2/4-bit grey PNG drops its grey ICC profile with the promotion to RGBA', async () => {
+  const withIcc = (b) => writeChunks(readChunks(b).flatMap((c) => (c.type === 'IHDR' ? [c, { type: 'iCCP', data: new Uint8Array([...Buffer.from('p\0\0'), 0x78, 0x9c, 3, 0, 0, 0, 0, 1]) }] : [c])));
+  const grey = withIcc(readFileSync(join(FIX, 'basn0g04.png')));
+  const drawn = await decodeAsync(encode(grey, { key: 'k' }), { key: 'k', watermark: tiny });
+  assert.equal(inspect(drawn).colorType, 6);
+  assert.deepEqual(inspect(drawn).chunks.map((c) => c.type).filter((t) => t !== 'IDAT'), ['IHDR', 'gAMA', 'IEND']);
+  // A palette image's profile is an RGB one, which RGBA can keep.
+  const pal = withIcc(readFileSync(join(FIX, 'basn3p08.png')));
+  assert.ok(inspect(await decodeAsync(encode(pal, { key: 'k' }), { key: 'k', watermark: tiny })).chunks.some((c) => c.type === 'iCCP'));
+});
+
+test('a watermark on a PNG with a tRNS colour key: keyed pixels are transparent, painted ones never become the key', async () => {
+  const w = 48, h = 32;
+  const u16 = (...v) => new Uint8Array(v.flatMap((x) => [x >> 8, x & 255]));
+  const png = (colorType, depth, key, fill) => writeChunks([
+    { type: 'IHDR', data: new Uint8Array([0, 0, 0, w, 0, 0, 0, h, depth, colorType, 0, 0, 0]) },
+    { type: 'tRNS', data: u16(...key) },
+    { type: 'IDAT', data: encodeRaster({ width: w, height: h, depth, colorType, interlace: 0 }, fill) },
+    { type: 'IEND', data: new Uint8Array(0) },
+  ]);
+  // The key is the stroke colour of `tiny`: the whole image is transparent.
+  const rgb = png(2, 8, [0x20, 0x00, 0x40], new Uint8Array(w * h * 3).map((_, i) => [0x20, 0x00, 0x40][i % 3]));
+  const grey16 = png(0, 16, [0x1234], new Uint8Array(w * h * 2).map((_, i) => (i % 2 ? 0x34 : 0x12)));
+  const patch = renderWatermark(tiny, w, h);
+  let covering = 0;
+  for (let i = 3; i < patch.data.length; i += 4) if (patch.data[i] >= 0.5) covering++;
+  for (const [name, src] of [['RGB', rgb], ['grey 16-bit', grey16]]) {
+    for (const s of [encode(src, { key: 'k', watermark: tiny }), encode(src, { key: 'k', visibleWatermark: tiny })]) {
+      const visible = inspect(s).visibleWatermark;
+      const out = visible ? s : await decodeAsync(s, { key: 'k', watermark: true });
+      const img = readPng(out);
+      const rgba = toRGBA8(img, img.pixels);
+      let opaque = 0;
+      for (let i = 3; i < rgba.length; i += 4) if (rgba[i]) opaque++;
+      assert.equal(opaque, covering, `${name}${visible ? ', visible' : ''}: every pixel the watermark covers shows, nothing else`);
+      if (visible) assert.ok(samePng(await decodeAsync(s, { key: 'k' }), src), 'exact restore');
+    }
+  }
 });
 
 // --- visible watermarks on scrambled images ------------------------------------------
@@ -428,6 +508,22 @@ test('visible watermark: the stash is needed, bound to the key, and bounds-check
     return { type: 'pmWs', data: d };
   }));
   await assert.rejects(decodeAsync(tampered, { key: 'k' }), { code: 'BAD_WATERMARK' });
+  // One region per frame: a stash listing a frame again (so the regions could add up to far
+  // more than the image) is refused before anything is allocated.
+  const salt = readMarker(readChunks(s).find((c) => c.type === 'pmIx').data).params.salt;
+  const full = { frame: 0, x: 0, y: 0, width: 320, height: 200 };
+  const restash = (regions) => writeChunks(readChunks(s).map((c) => (c.type === 'pmWs' ? { type: 'pmWs', data: encodeStash({ watermark: win, regions, raw: new Uint8Array(regions.length * 320 * 200 * 3), key: 'k', salt }) } : c)));
+  await assert.rejects(decodeAsync(restash([full, full, full]), { key: 'k' }), { code: 'BAD_WATERMARK' });
+  await decodeAsync(restash([full]), { key: 'k' });
+  await assert.rejects(decodeAsync(restash([full]), { key: 'k', limits: { maxDecompressedBytes: 100_000 } }), { code: 'LIMIT' });
+  // The watermark in the stash is only needed to draw it again: restoring ignores it (and
+  // maxMetadataBytes), rekey keeping it needs it.
+  const badJson = writeChunks(readChunks(s).map((c) => (c.type === 'pmWs' ? { type: 'pmWs', data: Uint8Array.from(c.data, (v, i) => (i === 5 ? 0x78 : v)) } : c)));
+  assert.ok(samePng(await decodeAsync(badJson, { key: 'k' }), await decodeAsync(s, { key: 'k' })));
+  assert.throws(() => rekey(badJson, { from: 'k', to: 'j' }), { code: 'BAD_WATERMARK' });
+  assert.equal(inspect(rekey(badJson, { from: 'k', to: 'j', visibleWatermark: null })).visibleWatermark, false);
+  await decodeAsync(s, { key: 'k', limits: { maxMetadataBytes: 100 } });
+  assert.throws(() => rekey(s, { from: 'k', to: 'j', limits: { maxMetadataBytes: 100 } }), { code: 'LIMIT' });
   // JPEG: stash split across APP15 segments, which must all be there.
   const j = encode(await photo(1200, 800, { quality: 95 }), { key: 'k', visibleWatermark: gold });
   const segs = readSegments(j).segments;

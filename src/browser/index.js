@@ -101,6 +101,7 @@ async function watermarkFor(spec, bytes, base, fetchOptions, limits) {
   if (spec === undefined || spec === true || spec === 'auto' || spec === 'embedded') {
     const info = inspect(bytes, { limits }).watermark;
     if (!info) return null;
+    if (info.unreadable) throw new PixmixError(`The watermark this file carries cannot be read: ${info.error}`, 'BAD_WATERMARK');
     return info.embedded ? 'embedded' : fetchWatermark(info.id, base, fetchOptions);
   }
   if (typeof spec === 'string') return fetchWatermark(spec, base, fetchOptions);

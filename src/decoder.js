@@ -61,7 +61,9 @@ function policyApplied(tools, bytes, opts) {
  * Restoring is exact unless `watermark` asks for one to be drawn on the result:
  * - a compiled watermark (see watermark/compile.js), or {id} / an id string, looked up with
  *   `resolveWatermark(id)`;
- * - true or 'embedded': the one the file carries (nothing is drawn if it carries none).
+ * - true or 'embedded': the one the file carries (nothing is drawn if it carries none; one
+ *   that cannot be read is a BAD_WATERMARK or LIMIT error). Otherwise a carried watermark that
+ *   cannot be read (damaged, or over maxMetadataBytes) is ignored: it never stops restoring.
  * @param {{key: string|Uint8Array, level?: number, watermark?: object|string|boolean,
  *   resolveWatermark?: (id: string) => object|Promise<object>, metadata?: object|string,
  *   onMetadata?: (report: object) => void}} opts  metadata: a policy for the restored file
@@ -80,6 +82,9 @@ export async function decodeAsync(input, opts) {
   if (!opts.watermark) return d.unscramble ? d.unscramble(bytes, opts) : d.unscrambleAsync(bytes, opts);
   const detail = format === 'png' ? unscramblePngDetailed(bytes, opts)
     : format === 'jpeg' ? unscrambleJpegDetailed(bytes, opts) : await unscrambleJxlDetailed(bytes, opts);
+  // The file's own watermark was asked for and cannot be read: say so (restoring alone, or
+  // drawing another watermark, ignores it).
+  if ((opts.watermark === true || opts.watermark === 'embedded') && detail.watermarkError) throw detail.watermarkError;
   const watermark = await chooseWatermark(opts.watermark, detail.watermark, opts.resolveWatermark);
   const paint = watermark ? { painter: await loadPainter(), watermark, limits: opts.limits } : null;
   return format === 'png' ? detail.toPng(paint) : format === 'jpeg' ? detail.toJpeg(paint) : detail.toJxl(paint);

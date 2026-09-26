@@ -20,7 +20,8 @@ const USAGE = `Usage:
 Keys (prefer the file or environment forms; -k ends up in shell history):
   -k, --key <key>          key            --key-file <path>      read key from file (its bytes,
                                                                  without one trailing newline or a
-                                                                 leading UTF-8 BOM; binary is fine)
+                                                                 leading UTF-8 BOM, so a binary key
+                                                                 must not start with EF BB BF)
   $PIXMIX_KEY              key (encode/decode), old key (rekey)
   --to <key> | --to-file <path> | $PIXMIX_NEW_KEY     new key for rekey
 
@@ -28,13 +29,15 @@ Options:
   -o, --out <path>         output file, directory, or "-" for stdout (single input); never
                            the same path for two inputs (e.g. a/x.png and b/x.png) in one run
   --format <png|jpeg|jxl>  output format (default: same as the input when possible, else png)
-  --mode <pixel|block|mcu> PNG: block (default; small files) or pixel (~2x larger). JPEG: always mcu. JPEG XL: pixel/block
-                           (lossless pixels) or mcu (JPEG route: a DCT-scrambled JPEG inside
-                           the JXL; the default for JPEG sources)
+  --mode <pixel|block|mcu> PNG: block (default; small files) or pixel (~2x larger).
+                           JPEG: always mcu. JPEG XL: pixel/block (lossless pixels) or mcu
+                           (JPEG route: a DCT-scrambled JPEG inside the JXL; the default for
+                           JPEG sources)
   --block <n>              tile size in block mode (default 16)
   --effort <1-9>           JPEG XL encoder effort (default 2 in pixel mode, 7 in block mode)
   --no-transforms          shuffle tiles/MCUs only, without flipping/rotating them
-  --progressive | --baseline  JPEG scan structure (default: same as a JPEG source, else baseline)
+  --progressive | --baseline  JPEG scan structure (encode: default same as a JPEG source,
+                           else baseline; decode: default as the original)
   --quality <1-100>        JPEG quality when converting to JPEG (default 90)
   --subsampling <s>        JPEG chroma subsampling when converting: 4:2:0 (default), 4:2:2, 4:4:4
   --background <#rrggbb>   JPEG: colour transparency is flattened onto (default #ffffff)
@@ -68,7 +71,10 @@ metadata profiles directory; or a .json file holding a profile or a policy):
 Input "-" reads stdin. Without -o, outputs go next to the input:
   photo.jpg -> photo.scrambled.jpg   (encode; .png with --format png)
   photo.scrambled.jpg -> photo.jpg   (decode)
-  photo.scrambled.jpg -> photo.scrambled.rekeyed.jpg (rekey, unless --in-place)`;
+  photo.scrambled.jpg -> photo.scrambled.rekeyed.jpg (rekey, unless --in-place)
+
+Options that do not apply to the command are usage errors.
+Exit codes: 0 success, 1 some files failed (the others are still processed), 2 usage error.`;
 
 const OPTIONS = {
   key: { type: 'string', short: 'k' },

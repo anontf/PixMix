@@ -18,6 +18,17 @@ const acCategory = (v) => {
   return c;
 };
 
+// Decoders keep the DC predictor as an int and store it as a 16-bit coefficient, so only
+// a difference mod 2^16 matters. Corrupt data whose predictor overflowed decodes to
+// coefficients whose differences can need 16 bits, which no DC table codes: write the
+// difference wrapped into 15 bits instead, which decodes to the same coefficients. Only
+// a difference of exactly 2^15 has no such form.
+const dcDiff = (dc, pred) => {
+  const d = ((dc - pred + 0x8000) & 0xffff) - 0x8000;
+  if (d === -0x8000) throw new PixmixError('JPEG DC coefficient out of range (corrupt data)', 'BAD_JPEG');
+  return d;
+};
+
 /**
  * @param {import('./decode.js').Frame} frame
  * @param {{restartInterval?: number}} [opts]  restart markers are only for tests
@@ -62,7 +73,7 @@ export function encodeScan(frame, { restartInterval = 0 } = {}) {
     if (ci < 0) return;
     const coefs = comps[ci].coefs, t = tableOf(ci);
     const dc = coefs[blk];
-    dcFreq[t][category(dc - pred[ci])]++;
+    dcFreq[t][category(dcDiff(dc, pred[ci]))]++;
     pred[ci] = dc;
     let run = 0;
     for (let k = 1; k < 64; k++) {
@@ -92,7 +103,7 @@ export function encodeScan(frame, { restartInterval = 0 } = {}) {
     const coefs = comps[ci].coefs, t = tableOf(ci);
     const dcT = dcEnc[t], acT = acEnc[t];
     const dc = coefs[blk];
-    const diff = dc - pred[ci];
+    const diff = dcDiff(dc, pred[ci]);
     pred[ci] = dc;
     const s = category(diff);
     w.put(dcT.code[s], dcT.size[s]);
@@ -179,7 +190,7 @@ function codeScan(frame, { comps, ss, se }, put) {
     const pred = new Int32Array(cs.length);
     walkScan(frame, comps, (ci, blk) => {
       const dc = cs[ci].coefs[blk];
-      const diff = dc - pred[ci];
+      const diff = dcDiff(dc, pred[ci]);
       pred[ci] = dc;
       const s = category(diff);
       put(ci, s, diff < 0 ? diff - 1 : diff, s);

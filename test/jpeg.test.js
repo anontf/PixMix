@@ -6,6 +6,7 @@ import { readSegments, writeSegments, M } from '../src/formats/jpeg/markers.js';
 import { decodeFrame } from '../src/formats/jpeg/decode.js';
 import { assembleJpeg } from '../src/formats/jpeg/encode.js';
 import { encodePixels } from '../src/formats/jpeg/fdct.js';
+import { buildOptimalSpec, buildEncodeTable, writeDht, BitWriter } from '../src/formats/jpeg/huffman.js';
 import { buildPng } from '../src/convert/png-build.js';
 
 const coefs = (b) => decodeFrame(readSegments(b).segments).components.map((c) => Buffer.from(c.coefs.buffer));
@@ -237,5 +238,30 @@ test('stray bytes before a marker and Motion-JPEG frames without DHT decode like
     const restored = decode(scrambled, { key: 'k' });
     assert.ok(sameCoefs(restored, src), `${name}: coefficients`);
     assert.ok(ref.equals(await pixels(restored)), `${name}: libjpeg pixels`);
+  }
+});
+
+test('an overflowed DC predictor is written as wrapped differences libjpeg reads', async () => {
+  // Corrupt but libjpeg-decodable: every block adds 2047 to the DC, running past 16 bits.
+  const blocks = 40;
+  const dcFreq = new Uint32Array(257), acFreq = new Uint32Array(257);
+  dcFreq[11] = acFreq[0] = blocks;
+  const dcSpec = buildOptimalSpec(dcFreq), acSpec = buildOptimalSpec(acFreq);
+  const dcT = buildEncodeTable(dcSpec), acT = buildEncodeTable(acSpec);
+  const w = new BitWriter();
+  for (let b = 0; b < blocks; b++) { w.put(dcT.code[11], dcT.size[11]); w.put(2047, 11); w.put(acT.code[0], acT.size[0]); }
+  const src = writeSegments([
+    { marker: M.DQT, data: Uint8Array.from([0, ...Array(64).fill(1)]) },
+    { marker: M.SOF0, data: Uint8Array.from([8, 0, 8, (blocks * 8) >> 8, (blocks * 8) & 255, 1, 1, 0x11, 0]) },
+    { marker: M.DHT, data: writeDht([{ tableClass: 0, id: 0, spec: dcSpec }, { tableClass: 1, id: 0, spec: acSpec }]) },
+    { marker: M.SOS, data: Uint8Array.from([1, 1, 0, 0, 63, 0]), ecs: w.result() },
+  ]);
+  const ref = await pixels(src);
+  for (const progressive of [false, true]) {
+    const scrambled = encode(src, { key: 'k', progressive });
+    await pixels(scrambled); // libjpeg reads it
+    const restored = decode(scrambled, { key: 'k' });
+    assert.ok(sameCoefs(restored, src));
+    assert.ok(ref.equals(await pixels(restored)));
   }
 });

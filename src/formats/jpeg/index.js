@@ -36,9 +36,9 @@ import { readJpegMetadata } from '../../meta/jpeg.js';
 import { readOrientation } from '../../meta/exif.js';
 import { stripExifThumbnail, stripIrbThumbnails, stripJfifThumbnail } from '../../meta/thumbnails.js';
 import { FLAG_STASH } from '../../core/params.js';
-import { encodeWatermark, decodeWatermark, restoreJpegStash } from '../../watermark/embed.js';
+import { encodeWatermark, readCarried, keptWatermark, restoreJpegStash } from '../../watermark/embed.js';
 import { stashJpeg } from '../../watermark/paint.js';
-import { watermarkInfo, carried } from '../png/index.js';
+import { watermarkInfo, carriedFields } from '../png/index.js';
 
 export { isJpeg };
 
@@ -73,10 +73,13 @@ function headerSegments(segments) {
   return segments.filter((s) => !CODING.has(s.marker) && !isSof(s.marker) && !isOurs(s));
 }
 
-/** The watermark a JPEG carries for its restored image ({id, name, compiled}), or null. */
+/**
+ * The watermark a JPEG carries for its restored image, read tolerantly (see readCarried in
+ * watermark/embed.js): {watermark: {id, name, compiled}|null, error, data}.
+ */
 export function jpegWatermark(segments, limits) {
   const seg = segments.find((s) => s.marker === M.APP15 && startsWith(s.data, WM_SIG));
-  return seg ? decodeWatermark(seg.data.subarray(WM_SIG.length), limits) : null;
+  return readCarried(seg?.data.subarray(WM_SIG.length), limits);
 }
 
 function jpegOrientation(segments) {
@@ -242,7 +245,7 @@ export function unscrambleJpegDetailed(bytes, { key, progressive, limits } = {})
     layout,
     params: marker.params,
     segments: header,
-    watermark: jpegWatermark(segments, limits),
+    ...carriedFields(jpegWatermark(segments, limits)),
     /** `paint` ({painter, watermark}): draw a watermark on the restored image. */
     toJpeg: (paint) => {
       let out = restored;
@@ -274,8 +277,8 @@ export function rekeyJpeg(bytes, { from, to, transforms, salt, mode, progressive
   const layout = layoutFor(to, params, frame);
   return finishScramble(segments, applyMcuLayout(plain, layout, 'scramble'), params, layout.check, {
     key: to,
-    watermark: watermark === undefined ? carried(jpegWatermark(segments, limits)) : watermark,
-    visibleWatermark: visibleWatermark === undefined ? visible : visibleWatermark,
+    watermark: watermark === undefined ? keptWatermark(jpegWatermark(segments, limits)) : watermark,
+    visibleWatermark: visibleWatermark === undefined ? visible?.() ?? null : visibleWatermark,
     progressive: restoreProgressive && !hasPadding(frame),
   });
 }

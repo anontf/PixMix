@@ -256,7 +256,8 @@ async function runInspect(files, o, limits) {
       const parts = info.chunks ?? info.segments ?? info.boxes;
       if (parts) console.log(`  ${info.chunks ? 'chunks' : info.segments ? 'segments' : 'boxes'}: ${parts.map((c) => c.type).join(' ')}`);
       if (info.metadata) console.log(`  metadata: ${info.metadata.join(', ') || 'none'}${info.orientation > 1 ? ` (orientation ${info.orientation})` : ''}`);
-      if (info.watermark) console.log(`  watermark: ${info.watermark.id}${info.watermark.embedded ? '' : ' (id only)'}`);
+      if (info.watermark?.unreadable) console.log(`  watermark: unreadable (${info.watermark.error})`);
+      else if (info.watermark) console.log(`  watermark: ${info.watermark.id}${info.watermark.embedded ? '' : ' (id only)'}`);
       if (info.visibleWatermark) console.log('  visible watermark on the scrambled image');
       if (info.meta) for (const line of metadataLines(info.meta)) console.log(`  ${line}`);
     } catch (err) {

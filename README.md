@@ -501,7 +501,10 @@ the watermark sits bottom-right of the image as displayed.
 
 Drawn on a restored file:
 - PNG keeps its colour type, bit depth and every chunk. Palette and 1/2/4-bit images become
-  8-bit RGBA. In an APNG, every frame that holds the whole watermark gets it.
+  8-bit RGBA, without the chunks that no longer fit (PLTE, tRNS, bKGD, hIST, sBIT, and a
+  grey image's ICC profile). With a tRNS colour key, keyed pixels count as transparent, and
+  painted pixels that would come out as the key colour are moved one level off it. In an
+  APNG, every frame that holds the whole watermark gets it.
 - JPEG is painted in the DCT domain: only the blocks under the watermark are decoded,
   painted and quantised again, with the file's own tables. Everything else keeps its exact
   coefficients, and the metadata stays.
@@ -523,7 +526,9 @@ const shown = await decodeAsync(bytes, { key, watermark: 'embedded' });     // N
 - Ids are looked up at `watermarkBase` (`data-watermark-base`, default `watermarks/` next
   to the page). The dev server serves the compiled ones there.
 - A watermark that cannot be loaded or drawn is skipped with a warning; the image still
-  shows.
+  shows. So is a carried watermark that cannot be read (damaged, or over
+  `maxMetadataBytes`): restoring never needs it, and `inspect` reports it as
+  `{ unreadable: true, error }`. Only asking for it (`watermark: 'embedded'`) is an error.
 - `decodeAsync`, `restoreForDisplay` and `decodeToURL` stay exact unless given `watermark`.
 
 ### Watermarks in scrambled files
@@ -533,9 +538,9 @@ chunks, JPEG APP15 segments, JPEG XL boxes). Restored files carry neither.
 
 **The watermark for the decoder** (`encode(…, { watermark })`, `--watermark`): a whole
 compiled watermark (2–3 KB), or just its id (`{ id }`, `--watermark-ref`), which the decoder
-looks up. The reveal then draws it without being told which. Rekey keeps it (`watermark:
-null` removes it, another value replaces it). It is not authenticated: like the image
-itself, anyone can change it.
+looks up. The reveal then draws it without being told which. Rekey keeps it as stored
+(`watermark: null` removes it, another value replaces it; a damaged one is dropped). It is
+not authenticated: like the image itself, anyone can change it.
 
 **A visible watermark on the scrambled image** (`visibleWatermark`, `--visible-watermark`):
 every viewer shows the scrambled image with the watermark on it, and pixmix still restores
@@ -547,7 +552,8 @@ the original exactly.
   (noisy content; JPEG less than PNG). It includes the watermark itself, 1–3 KB.
 - The marker becomes v2 (see below), so older pixmix versions refuse the file instead of
   restoring it with the watermark scattered over the image.
-- Rekey draws it again under the new key; `visibleWatermark: null` removes it.
+- Rekey draws it again under the new key; `visibleWatermark: null` removes it. Restoring
+  only needs the stashed pixels, not the watermark stored with them.
 - PNG: any colour type (palette images use their nearest palette colours); APNG frames that
   hold the whole watermark. JPEG: baseline, progressive, grey. JPEG XL: both routes, but on
   the pixel route only for 8-bit sRGB images (the browser reveals 8-bit sRGB pixels, and
@@ -563,9 +569,10 @@ Considered and left out:
 - Signing the carried watermark with the key: in the browser use case the key is public.
 
 Limits on untrusted input (see "Untrusted input"): compiled watermarks are validated (sizes,
-counts, path syntax); carried watermark JSON counts against `maxMetadataBytes`; stashed
-regions must lie inside the image (so `maxPixels` bounds them) and are inflated into a
-buffer of exactly their size; the renderer refuses a watermark covering more than 4
+counts, path syntax); watermark JSON counts against `maxMetadataBytes` when it is needed
+(a carried one to be drawn, a stashed one for rekey to draw it again); stashed regions must lie inside the image, one per
+frame (so they never add up to more than the image), and are inflated into a buffer of
+exactly their size, at most `maxDecompressedBytes`; the renderer refuses a watermark covering more than 4
 megapixels (or `maxPixels`) and caps outline and blur radii at 32 px. The fuzzer's seeds
 include files carrying watermarks (whole and by id) and visible watermarks on every format
 and route, and it mutates their payloads.

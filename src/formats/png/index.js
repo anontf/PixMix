@@ -22,7 +22,9 @@ import {
   makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError, FLAG_STASH, tileSize, tileTransforms,
 } from '../../core/params.js';
 import { readOrientation } from '../../meta/exif.js';
-import { WATERMARK_TAG, STASH_TAG, encodeWatermark, decodeWatermark, restorePixelStash } from '../../watermark/embed.js';
+import {
+  WATERMARK_TAG, STASH_TAG, encodeWatermark, readCarried, keptWatermark, carriedInfo, restorePixelStash,
+} from '../../watermark/embed.js';
 import { stashPng } from '../../watermark/paint.js';
 import { checkPixels, checkFrames } from '../../core/limits.js';
 
@@ -252,10 +254,12 @@ function unscrambled(img, key, limits) {
   return { marker, layouts, frames, visible };
 }
 
-/** The watermark a PNG carries for its restored image ({id, name, compiled}), or null. */
+/**
+ * The watermark a PNG carries for its restored image, read tolerantly (see readCarried in
+ * watermark/embed.js): {watermark: {id, name, compiled}|null, error, data}.
+ */
 export function pngWatermark(chunks, limits) {
-  const c = chunks.find((ch) => ch.type === WATERMARK_TAG);
-  return c ? decodeWatermark(c.data, limits) : null;
+  return readCarried(chunks.find((ch) => ch.type === WATERMARK_TAG)?.data, limits);
 }
 
 /**
@@ -281,7 +285,7 @@ export function unscramblePngDetailed(bytes, { key, level, limits } = {}) {
     layout: layouts[0],
     params: marker.params,
     pixels: frames[0],
-    watermark: pngWatermark(img.chunks, limits),
+    ...carriedFields(pngWatermark(img.chunks, limits)),
     /** Lazily encode, the deflate step is the slow part. `paint`: see painted(). */
     toPng: (paint) => { const p = painted(img, frames, paint); return writePng(p.img, p.frames, null, { level }); },
   };
@@ -299,7 +303,7 @@ export async function unscramblePngDetailedAsync(bytes, { key, level, limits } =
     layout: layouts[0],
     params: marker.params,
     pixels: frames[0],
-    watermark: pngWatermark(img.chunks, limits),
+    ...carriedFields(pngWatermark(img.chunks, limits)),
     toPng: (paint) => { const p = painted(img, frames, paint); return writePngAsync(p.img, p.frames, null, { level }); },
   };
 }
@@ -325,13 +329,17 @@ export function rekeyPng(bytes, { from, to, mode, block, transforms, level, salt
   const plain = { ...img, frames };
   return finishScramble(img, mapFrames(plain, layouts, 'scramble'), params, layouts[0].check, {
     key: to, level,
-    watermark: watermark === undefined ? carried(pngWatermark(img.chunks, limits)) : watermark,
-    visibleWatermark: visibleWatermark === undefined ? visible : visibleWatermark,
+    watermark: watermark === undefined ? keptWatermark(pngWatermark(img.chunks, limits)) : watermark,
+    visibleWatermark: visibleWatermark === undefined ? visible?.() ?? null : visibleWatermark,
   });
 }
 
-/** What rekey carries over: the compiled watermark, or just its id. */
-export const carried = (w) => (w ? w.compiled ?? { id: w.id } : null);
+/**
+ * For the detailed decodes: `watermark` ({id, name, compiled}) is null when the file carries
+ * none or it cannot be read; `watermarkError` then says why (decodeAsync throws it only when
+ * asked to draw the file's own watermark).
+ */
+export const carriedFields = (c) => ({ watermark: c.watermark, watermarkError: c.error });
 
 /** Cheap: parses chunks only, no inflate. Checks the same size limits as decoding. */
 export function inspectPng(bytes, limits) {
@@ -370,10 +378,13 @@ function concat(parts) {
   return out;
 }
 
-/** For inspect(): which watermarks a scrambled file carries. */
-export function watermarkInfo(wm, marker) {
+/**
+ * For inspect(): which watermarks a scrambled file carries. `c` is what readCarried gave; a
+ * carried watermark that cannot be read is {unreadable: true, error}.
+ */
+export function watermarkInfo(c, marker) {
   return {
-    watermark: wm ? { id: wm.id, ...(wm.name ? { name: wm.name } : {}), embedded: !!wm.compiled } : null,
+    watermark: carriedInfo(c),
     visibleWatermark: !!(marker && marker.params.flags & FLAG_STASH),
   };
 }

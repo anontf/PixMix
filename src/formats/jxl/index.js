@@ -27,8 +27,10 @@ import { stripExifThumbnail } from '../../meta/thumbnails.js';
 import { exifTiff, unwrapBrob } from '../../meta/jxl.js';
 import { scrambleJpeg, unscrambleJpegDetailed, rekeyJpeg, jpegMarkerBytes, jpegWatermark } from '../jpeg/index.js';
 import { readSegments } from '../jpeg/markers.js';
-import { watermarkInfo, carried } from '../png/index.js';
-import { WATERMARK_TAG, STASH_TAG, encodeWatermark, decodeWatermark, restorePixelStash } from '../../watermark/embed.js';
+import { watermarkInfo, carriedFields } from '../png/index.js';
+import {
+  WATERMARK_TAG, STASH_TAG, encodeWatermark, readCarried, keptWatermark, restorePixelStash,
+} from '../../watermark/embed.js';
 import { stashRgba } from '../../watermark/paint.js';
 
 export { isJxl };
@@ -100,10 +102,12 @@ function readMarkerBox(boxes) {
   return box ? readMarker(box.data) : null;
 }
 
-/** The watermark a JPEG XL carries for its restored image ({id, name, compiled}), or null. */
+/**
+ * The watermark a JPEG XL carries for its restored image, read tolerantly (see readCarried
+ * in watermark/embed.js): {watermark: {id, name, compiled}|null, error, data}.
+ */
 export function jxlWatermark(boxes, limits) {
-  const box = boxes.find((b) => b.type === WATERMARK_TAG);
-  return box ? decodeWatermark(box.data, limits) : null;
+  return readCarried(boxes.find((b) => b.type === WATERMARK_TAG)?.data, limits);
 }
 
 const frameList = (image) => (image.frames ? image.frames.map((f) => f.data) : [image.data]);
@@ -288,8 +292,8 @@ async function toJxlWithMarker(scrambledJpeg, limits) {
   const { boxes, codestream } = readJxl(transcoded);
   const kept = boxes.filter((b) => !STRUCTURE.has(b.type)); // jbrd, Exif, xml from libjxl
   // The JPEG inside holds the watermark segments; a copy in a box lets inspect() see it.
-  const wm = jpegWatermark(readSegments(scrambledJpeg).segments);
-  const mirror = wm ? [{ type: WATERMARK_TAG, data: encodeWatermark(carried(wm)) }] : [];
+  const wm = jpegWatermark(readSegments(scrambledJpeg).segments, limits).data;
+  const mirror = wm ? [{ type: WATERMARK_TAG, data: wm }] : [];
   const out = writeJxl([...kept, { type: MARKER_BOX, data: jpegMarkerBytes(scrambledJpeg) }, ...mirror], codestream);
   // libjxl writes the file and jxl-oxide rebuilds the JPEG from it, and jxl-oxide 0.12 gets
   // some JPEGs wrong (e.g. 4:4:4 stored with 1x2 sampling factors). A file that cannot be
@@ -353,7 +357,7 @@ export async function unscrambleJxlDetailed(bytes, { key, effort, display = fals
   if (marker.params.mode === 'mcu') {
     const scrambledJpeg = policyOnJpeg(meta, await scrambledJpegOf(bytes, limits));
     const jpeg = unscrambleJpegDetailed(scrambledJpeg, { key, limits });
-    return { route: 'jpeg', params: marker.params, jpeg, watermark: jpeg.watermark, toJxl: (paint) => codec.transcodeJpeg(jpeg.toJpeg(paint)) };
+    return { route: 'jpeg', params: marker.params, jpeg, watermark: jpeg.watermark, watermarkError: jpeg.watermarkError, toJxl: (paint) => codec.transcodeJpeg(jpeg.toJpeg(paint)) };
   }
   const scrambled = await decodeJxlImage(bytes, { display, limits });
   restoreStash(boxes, marker, scrambled, key, limits);
@@ -373,7 +377,7 @@ export async function unscrambleJxlDetailed(bytes, { key, effort, display = fals
     scrambled: scrambled.data,
     pixels: image.data,
     image,
-    watermark: jxlWatermark(boxes, limits),
+    ...carriedFields(jxlWatermark(boxes, limits)),
     /** The restored image with a watermark drawn on a copy (`paint`: {painter, watermark}). */
     paint: paintImage,
     toJxl: display ? null : async (paint) => {
@@ -408,8 +412,8 @@ export async function rekeyJxl(bytes, { from, to, mode, block, salt, effort, tra
     mode: mode ?? marker.params.mode,
     block: block ?? (marker.params.mode === 'block' ? tileSize(marker.params) : undefined),
     transforms: transforms ?? (marker.params.mode === 'block' ? tileTransforms(marker.params) : undefined),
-    watermark: watermark === undefined ? carried(jxlWatermark(boxes, limits)) : watermark,
-    visibleWatermark: visibleWatermark === undefined ? visible : visibleWatermark,
+    watermark: watermark === undefined ? keptWatermark(jxlWatermark(boxes, limits)) : watermark,
+    visibleWatermark: visibleWatermark === undefined ? visible?.() ?? null : visibleWatermark,
   });
 }
 

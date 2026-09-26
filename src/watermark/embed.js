@@ -38,6 +38,7 @@ const bad = (what) => new PixmixError(`Corrupt pixmix watermark data (${what})`,
  * @returns {Uint8Array}
  */
 export function encodeWatermark(wm) {
+  if (wm instanceof Uint8Array) return wm; // a payload kept as stored (see keptWatermark)
   const idOnly = wm && Object.keys(wm).length === 1 && typeof wm.id === 'string';
   const body = utf8.encode(idOnly ? wm.id : JSON.stringify(wm));
   if (body.length > MAX_JSON) throw new PixmixError('Watermark too large to embed', 'BAD_WATERMARK');
@@ -64,6 +65,38 @@ export function decodeWatermark(data, limits) {
   return { id: obj.id, name: typeof obj.name === 'string' ? obj.name : undefined, compiled: obj };
 }
 
+/**
+ * Reads a carried watermark without letting it stop the image: restoring never needs it, so
+ * a damaged one, or one over maxMetadataBytes, comes back as `error`, which callers throw
+ * only when that watermark itself was asked for. `data` is the payload as stored.
+ * @param {Uint8Array|null|undefined} data
+ * @returns {{watermark: {id: string, name?: string, compiled: object|null}|null,
+ *   error: PixmixError|null, data: Uint8Array|null}}
+ */
+export function readCarried(data, limits) {
+  if (!data) return { watermark: null, error: null, data: null };
+  try {
+    return { watermark: decodeWatermark(data, limits), error: null, data };
+  } catch (err) {
+    if (err?.code !== 'BAD_WATERMARK' && err?.code !== 'LIMIT') throw err;
+    return { watermark: null, error: err, data };
+  }
+}
+
+/**
+ * What rekey keeps of a carried watermark (see readCarried): the payload as stored (it does
+ * not depend on the key), unless it is damaged, in which case it is dropped. One that is
+ * only over the caller's maxMetadataBytes is kept.
+ */
+export const keptWatermark = (c) => (c.data && c.error?.code !== 'BAD_WATERMARK' ? c.data : null);
+
+/** For inspect(): the carried watermark, or that it cannot be read (and why). */
+export function carriedInfo(c) {
+  if (c.error) return { unreadable: true, error: c.error.message };
+  const wm = c.watermark;
+  return wm ? { id: wm.id, ...(wm.name ? { name: wm.name } : {}), embedded: !!wm.compiled } : null;
+}
+
 function checkJson(n, limits) {
   const { maxMetadataBytes } = resolveLimits(limits);
   if (n > maxMetadataBytes) throw limitError(`Carried watermark is ${n} bytes, over the limit of ${maxMetadataBytes} (limits.maxMetadataBytes)`);
@@ -86,6 +119,9 @@ function crypt(data, key, salt) {
  *   height: number}[], raw: Uint8Array, key: string|Uint8Array, salt: Uint8Array}} s
  */
 export function encodeStash({ watermark, regions, raw, key, salt }) {
+  // Decoders refuse more than this by default (see decodeStash): never write such a file.
+  const { maxDecompressedBytes } = resolveLimits();
+  if (raw.length > maxDecompressedBytes) throw limitError(`The pixels under the visible watermark are ${raw.length} bytes, more than decoders accept by default (limits.maxDecompressedBytes)`);
   const json = utf8.encode(JSON.stringify(watermark));
   const data = crypt(zlibSync(raw, { level: 6 }), key, salt);
   // Version 1 stores the region count in one byte; version 2 (only written when there are
@@ -109,7 +145,11 @@ export function encodeStash({ watermark, regions, raw, key, salt }) {
 /**
  * Parses and decrypts a stash. `bytesOf(region)` gives each region's raw size, so the data
  * is inflated into a buffer of exactly the expected length (a hostile file cannot make it
- * grow further).
+ * grow further). Each frame has at most one region, in frame order (as pixmix writes them),
+ * so the regions never add up to more than the image itself. `watermark()` parses the
+ * watermark drawn (only rekey needs it, to draw it again), so restoring does not depend on
+ * it.
+ * @returns {{watermark: () => object, regions: object[], raw: Uint8Array}}
  */
 export function decodeStash(payload, key, salt, bytesOf, limits) {
   const dv = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
@@ -121,9 +161,11 @@ export function decodeStash(payload, key, salt, bytesOf, limits) {
   const countBytes = version === 1 ? 1 : 4;
   const jl = dv.getUint32(o); o += 4;
   need(o, jl + countBytes);
-  checkJson(jl, limits);
-  let watermark;
-  try { watermark = JSON.parse(fromUtf8.decode(payload.subarray(o, o + jl))); } catch { throw bad('JSON'); }
+  const json = payload.subarray(o, o + jl);
+  const watermark = () => {
+    checkJson(jl, limits);
+    try { return JSON.parse(fromUtf8.decode(json)); } catch { throw bad('JSON'); }
+  };
   o += jl;
   const count = version === 1 ? payload[o] : dv.getUint32(o);
   o += countBytes;
@@ -133,10 +175,13 @@ export function decodeStash(payload, key, salt, bytesOf, limits) {
   for (let i = 0; i < count; i++) {
     const [frame, x, y, width, height] = [0, 1, 2, 3, 4].map((k) => dv.getUint32(o + k * 4));
     o += 20;
+    if (i && frame <= regions[i - 1].frame) throw bad('regions');
     const r = { frame, x, y, width, height };
     total += bytesOf(r); // throws for a region outside the image
     regions.push(r);
   }
+  const { maxDecompressedBytes } = resolveLimits(limits);
+  if (total > maxDecompressedBytes) throw limitError(`Stashed pixels are ${total} bytes, over the limit of ${maxDecompressedBytes} (limits.maxDecompressedBytes)`);
   const dl = dv.getUint32(o); o += 4;
   need(o, dl);
   let raw;
@@ -174,7 +219,7 @@ export function jpegRect(frame, r, buf, toBuffer) {
   }
 }
 
-/** Puts a JPEG stash back into the (scrambled) frame. */
+/** Puts a JPEG stash back into the (scrambled) frame; returns watermark() (see decodeStash). */
 export function restoreJpegStash(frame, payload, key, salt, limits) {
   const { regions, raw, watermark } = decodeStash(payload, key, salt, (r) => jpegRectBytes(frame, r), limits);
   if (regions.length !== 1) throw bad('regions');
@@ -184,7 +229,7 @@ export function restoreJpegStash(frame, payload, key, salt, limits) {
 
 /**
  * Puts pixel stashes back: frames[i] is {pixels, width, height, bpp} (native PNG samples, or
- * JPEG XL RGBA bytes).
+ * JPEG XL RGBA bytes). Returns watermark() (see decodeStash).
  */
 export function restorePixelStash(frames, payload, key, salt, limits) {
   const size = (r) => {

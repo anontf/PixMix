@@ -64,7 +64,10 @@ pixmix encode photo.jpg --metadata vivi-web   # strip everything, credit Vivi (s
 ```
 
 For each file it reports how the input was decoded and what metadata was kept or dropped.
-It never overwrites a file unless you pass `-f`. Exit codes: 0 = success, 1 = some files
+It never overwrites a file unless you pass `-f` (or `rekey --in-place`, which keeps symlinks
+and permissions), and never writes two inputs to one output name in a run. A `--key-file` is
+used as bytes, without one trailing newline or a leading UTF-8 BOM. Options that do not
+apply to the command are usage errors. Exit codes: 0 = success, 1 = some files
 failed (the others are still processed), 2 = usage error. If `sharp` is installed, the CLI
 uses it for WebP, AVIF, HEIC and TIFF (turn this off with `--no-sharp`). `pixmix --help`
 lists every option.
@@ -131,10 +134,14 @@ Options:
   become PNG.
 - `mode`, `block`: `pixel`, or `block` with a tile size of 2–4096.
   - PNG and JPEG XL use them; JPEG is always `mcu`.
+  - An image (or animation frame) that would get only a few whole tiles, such as a 16×16
+    icon at the default size, gets the largest smaller tile size that shuffles it properly
+    (pixel mode when even 2 px tiles are too few). The marker, and `inspect`, give the size
+    used.
   - JPEG XL can also be `mcu`, the JPEG route. That's the default when the source is a
     JPEG, or a JPEG XL made from one.
 - `effort`: JPEG XL encoder effort, 1–9. Defaults to 2 in pixel mode and 7 in block mode.
-- `level`: PNG only, the zlib level.
+- `level`: PNG only, the zlib level, 0–9.
 - `transforms`: JPEG and JPEG-route JPEG XL, default `true`. Also flips and rotates each
   MCU, still lossless.
 - `quality`, `subsampling`, `background`: only when converting to JPEG from another format.
@@ -166,6 +173,13 @@ const out = await encodeAsync(webpBytes, {
 
 In browsers, `browserDecoder()` uses the browser's own decoders (WebP, AVIF, BMP, …).
 `convert` / `convertAsync` produce the plain, unscrambled file the encoder would scramble.
+
+Input that is already scrambled is refused with `ALREADY_SCRAMBLED` whatever the output
+format (decode it first, or use `rekey`): scrambling it again would lose the original.
+`convert` refuses it too when the format changes; converting to the same format keeps the
+marker, and the file stays restorable. Invalid option values (a `quality` that is not a
+number from 1 to 100, an unknown `subsampling`, a `transforms` that is not a boolean, …)
+throw `BAD_OPTION` before any work is done.
 
 ### Untrusted input
 

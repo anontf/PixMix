@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, createHmac, hkdfSync } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { sha256, hmacSha256, hkdf } from '../src/core/sha256.js';
 import { ChaChaRng } from '../src/core/prng.js';
 import { computeLayout, applyMap } from '../src/core/layout.js';
@@ -54,3 +55,11 @@ test('layout is deterministic and key-dependent', () => {
 });
 
 const PINNED_PIXEL_V1 = '36c1ca99d8b68327';
+
+test('package.json engines: the Node versions that have what pixmix needs', async () => {
+  // JPEG XL and native zlib use process.getBuiltinModule (Node 20.16 / 22.3), keys the global crypto.
+  const { engines } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(engines.node, '^20.16.0 || >=22.3.0');
+  assert.equal(typeof process.getBuiltinModule, 'function');
+  assert.equal(typeof globalThis.crypto?.getRandomValues, 'function');
+});

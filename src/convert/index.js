@@ -6,6 +6,7 @@
 
 import { detectFormat, toBytes } from '../formats/index.js';
 import { PixmixError } from '../core/params.js';
+import { checkOptions } from '../core/options.js';
 import { withLimits, checkPixels, checkFrames, resolveLimits } from '../core/limits.js';
 import { readJpegMetadata } from '../meta/jpeg.js';
 import { readWebpMetadata } from '../meta/webp.js';
@@ -17,7 +18,7 @@ import { loadJxlCodec } from '../formats/jxl/load.js';
 import { stripExifPreviews, stripXmpPreviews } from '../meta/thumbnails.js';
 import { readPngText } from '../meta/read.js';
 import { readChunks, writeChunks } from '../formats/png/chunks.js';
-import { sanitizeJpeg } from '../formats/jpeg/index.js';
+import { sanitizeJpeg, jpegMarkerBytes } from '../formats/jpeg/index.js';
 import { buildPng } from './png-build.js';
 import { buildJpeg } from './jpeg-build.js';
 import { BUILTIN_DECODERS } from './decoders.js';
@@ -60,7 +61,7 @@ export function targetFormat(from, format) {
 /** Synchronous; built-in decoders or sync plugins only. @returns {ConvertResult} */
 export function convert(input, opts = {}) {
   const bytes = toBytes(input);
-  opts = withPolicy(withLimits(bytes, opts));
+  opts = withPolicy(withLimits(bytes, checkOptions(opts)));
   const job = prepare(bytes, opts);
   if (job.done) return applied(job.done, opts);
   if (job.target === 'jxl') throw new PixmixError('JPEG XL output needs encodeAsync/convertAsync', 'ASYNC_DECODER');
@@ -75,7 +76,7 @@ export function convert(input, opts = {}) {
 /** Accepts async decoder plugins (sharp, browser-native) and JPEG XL. @returns {Promise<ConvertResult>} */
 export async function convertAsync(input, opts = {}) {
   const bytes = toBytes(input);
-  opts = withPolicy(withLimits(bytes, opts));
+  opts = withPolicy(withLimits(bytes, checkOptions(opts)));
   const job = prepare(bytes, opts);
   if (job.done) {
     if (!opts.metadata) return job.done;
@@ -149,7 +150,7 @@ function checkDecoded(job, decoded, limits) {
  */
 export async function decodeForJxl(input, opts = {}) {
   const bytes = toBytes(input);
-  opts = withLimits(bytes, opts);
+  opts = withLimits(bytes, checkOptions(opts));
   const job = prepare(bytes, { ...opts, format: 'jxl' });
   if (job.done) throw new Error('decodeForJxl is for non-JXL input');
   return decodeJob(bytes, job, opts);
@@ -279,6 +280,11 @@ function prepare(bytes, { format, decoders = [], keepThumbnails = false, limits 
     const { bytes: out, dropped } = sanitize(from, bytes, limits, keepThumbnails);
     return { done: { bytes: out, format: target, from, decoder: 'none', transferred: ['all metadata'], dropped, notes: [] } };
   }
+  // Decoding a scrambled image to another format would lose its marker (and with it the
+  // original): refuse, as encode does. The same format keeps the marker (see sanitize).
+  if (isScrambled(bytes, from, limits)) {
+    throw new PixmixError('Image is scrambled; converting it to another format would lose the original (decode it first)', 'ALREADY_SCRAMBLED');
+  }
   // Plugins first, so a caller can override a built-in (e.g. sharp for faster JPEG).
   const decoder = [...decoders, ...BUILTIN_DECODERS].find((d) => d.formats.includes(from));
   if (!decoder) {
@@ -334,8 +340,9 @@ function sanitize(format, bytes, limits, keepThumbnails) {
   if (format === 'jpeg') return sanitizeJpeg(bytes, limits, { keepThumbnails });
   if (keepThumbnails) return { bytes, dropped: [] };
   if (format === 'jxl') {
+    // The codestream is copied as it is, so the boxes that belong to it stay.
     const { boxes, codestream } = readJxl(bytes, limits);
-    const clean = sanitizeBoxes(boxes, { limits });
+    const clean = sanitizeBoxes(boxes, { limits, sameCodestream: true });
     return { bytes: writeJxl(clean.boxes, codestream), dropped: clean.dropped };
   }
   // PNG: only EXIF and XMP previews can leak; everything else stays byte for byte.
@@ -368,3 +375,11 @@ const xmpChunk = (text) => {
   out.set(t, k.length + 5);
   return out;
 };
+
+/** Whether the file carries a pixmix marker (only its presence: nothing is parsed). */
+export function isScrambled(bytes, format, limits) {
+  if (format === 'png') return readChunks(bytes, limits).some((c) => c.type === 'pmIx');
+  if (format === 'jpeg') return !!jpegMarkerBytes(bytes);
+  if (format === 'jxl') return readJxl(bytes, limits).boxes.some((b) => b.type === 'pmIx');
+  return false;
+}

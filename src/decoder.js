@@ -7,6 +7,8 @@ import { unscrambleJxl, unscrambleJxlDetailed, inspectJxl } from './formats/jxl/
 import { PixmixError } from './core/params.js';
 import { loadPainter } from './watermark/load.js';
 import { withLimits } from './core/limits.js';
+import { inspectOther } from './formats/other.js';
+import { checkOptions } from './core/options.js';
 import { loadMetadataTools, metadataToolsIfLoaded } from './meta/load.js';
 
 export { configureJxl } from './formats/jxl/load.js';
@@ -38,7 +40,7 @@ export function decode(input, opts) {
   const d = pick(DECODERS, bytes);
   if (opts?.watermark) throw new PixmixError('Drawing a watermark is async; use decodeAsync', 'ASYNC_DECODER');
   if (!d.unscramble) throw new PixmixError('JPEG XL decoding is async; use decodeAsync', 'ASYNC_DECODER');
-  opts = withLimits(bytes, opts);
+  opts = withLimits(bytes, checkOptions(opts));
   if (!opts.metadata) return d.unscramble(bytes, opts);
   const tools = metadataToolsIfLoaded();
   if (!tools) throw new PixmixError('A metadata policy needs pixmix\'s metadata module: use decodeAsync, or import pixmix (or pixmix/encoder)', 'ASYNC_DECODER');
@@ -71,7 +73,7 @@ function policyApplied(tools, bytes, opts) {
 export async function decodeAsync(input, opts) {
   let bytes = toBytes(input);
   const d = pick(DECODERS, bytes);
-  opts = withLimits(bytes, opts);
+  opts = withLimits(bytes, checkOptions(opts));
   const format = detectFormat(bytes);
   if (opts.metadata) {
     const tools = await loadMetadataTools();
@@ -114,5 +116,8 @@ export async function chooseWatermark(requested, embedded, resolve) {
 export function inspect(input, opts) {
   const bytes = toBytes(input);
   const { limits } = withLimits(bytes, opts);
-  return pick(DECODERS, bytes).inspect(bytes, limits);
+  const format = detectFormat(bytes);
+  if (!format) throw new PixmixError('Unrecognised image format', 'UNSUPPORTED');
+  // The formats pixmix only reads are described the same way as by pixmix/encoder.
+  return DECODERS[format] ? DECODERS[format].inspect(bytes, limits) : inspectOther(bytes, format, limits);
 }

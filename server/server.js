@@ -32,7 +32,11 @@ const LIMITS = {
   ...(process.env.PIXMIX_MAX_PIXELS ? { maxPixels: Number(process.env.PIXMIX_MAX_PIXELS) } : {}),
   ...(process.env.PIXMIX_MAX_FRAMES ? { maxFrames: Number(process.env.PIXMIX_MAX_FRAMES) } : {}),
 };
-const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.map': 'application/json', '.wasm': 'application/wasm', '.svg': 'image/svg+xml' };
+const TYPES = {
+  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.mjs': 'text/javascript', '.cjs': 'text/javascript', '.css': 'text/css',
+  '.png': 'image/png', '.map': 'application/json', '.json': 'application/json', '.wasm': 'application/wasm', '.svg': 'image/svg+xml',
+  '.txt': 'text/plain; charset=utf-8',
+};
 const IMAGE = { png: ['image/png', 'png'], jpeg: ['image/jpeg', 'jpg'], jxl: ['image/jxl', 'jxl'] };
 
 // sharp is optional: with it the server also accepts WebP, AVIF, HEIC and TIFF uploads.
@@ -44,7 +48,10 @@ const gallery = new Map();
 
 const watermarks = watermarkStore();
 const profiles = metadataProfileStore();
-const httpError = (status, message) => Object.assign(new Error(message), { status });
+const CODES = { 400: 'BAD_REQUEST', 404: 'NOT_FOUND', 409: 'EXISTS', 413: 'TOO_LARGE' };
+const httpError = (status, message) => Object.assign(new Error(message), { status, code: CODES[status] });
+// POST /api/watermarks/preview is a route of its own, so no watermark can have that id.
+const RESERVED_IDS = new Set(['preview']);
 
 /**
  * The ?metadata= parameter: a preset name or a profile id, as the policy to pass on (the
@@ -69,26 +76,38 @@ async function storedWatermark(id) {
   return watermarks.compiled(id);
 }
 
+/** Likewise, for carrying only the id: it must name a watermark in the store too. */
+async function storedWatermarkId(id) {
+  if (!ID_PATTERN.test(id)) throw httpError(400, `Invalid watermark id "${id}"`);
+  if (!(await watermarks.exists(id))) throw httpError(404, `Watermark "${id}" not found`);
+  return { id };
+}
+
+/**
+ * A numeric query parameter: absent or empty is the default; anything else goes to pixmix
+ * as a number, which answers 400 (BAD_OPTION) for one that is not valid (NaN included).
+ */
+const num = (q, k) => (q.get(k) ? Number(q.get(k)) : undefined);
+
 const routes = {
   // Any supported input; the X-Pixmix-Convert header reports what happened to it.
   'POST /api/encode': async (req, q) => {
     let report;
-    const num = (k) => (q.has(k) ? Number(q.get(k)) : undefined);
     const out = await encodeAsync(await body(req), {
       key: q.get('key'),
       mode: q.get('mode') || undefined,
-      block: num('block'),
-      level: num('level'),
-      effort: num('effort'),
+      block: num(q, 'block'),
+      level: num(q, 'level'),
+      effort: num(q, 'effort'),
       format: q.get('format') || undefined,
-      quality: num('quality'),
+      quality: num(q, 'quality'),
       transforms: q.get('transforms') !== '0',
       decoders,
       limits: LIMITS,
       onConvert: (r) => { report = r; },
       // watermark: carried for the decoder (whole, or just its id with watermarkEmbed=id);
       // visibleWatermark: drawn on the scrambled image.
-      watermark: q.get('watermarkEmbed') === 'id' && q.get('watermark') ? { id: q.get('watermark') } : await storedWatermark(q.get('watermark')),
+      watermark: q.get('watermarkEmbed') === 'id' && q.get('watermark') ? await storedWatermarkId(q.get('watermark')) : await storedWatermark(q.get('watermark')),
       visibleWatermark: await storedWatermark(q.get('visibleWatermark')),
       // ?metadata=<preset or profile id>: the scrambled file's metadata.
       metadata: await storedPolicy(q.get('metadata')),
@@ -117,7 +136,7 @@ const routes = {
       from: q.get('from'),
       to: q.get('to'),
       mode: q.get('mode') || undefined,
-      block: q.has('block') ? Number(q.get('block')) : undefined,
+      block: num(q, 'block'),
       transforms: q.has('transforms') ? q.get('transforms') !== '0' : undefined,
       limits: LIMITS,
       metadata: await storedPolicy(q.get('metadata')),
@@ -148,8 +167,8 @@ const routes = {
   }),
   'POST /api/watermarks': async (req) => {
     const def = await jsonBody(req);
-    if (ID_PATTERN.test(def?.id) && (await watermarks.exists(def.id))) throw httpError(409, `Watermark "${def.id}" already exists`);
-    return json(await watermarks.save(def), 201);
+    checkNotReserved(def.id);
+    return json(await watermarks.save(def, { create: true }), 201);
   },
   // Compiles without saving, for the lab's live preview.
   // (and gives the definition back normalised, defaults filled in).
@@ -162,8 +181,7 @@ const routes = {
   'GET /api/metadata-profiles': async () => json({ profiles: await profiles.list(), presets: PRESET_NAMES, kinds: KINDS, groups: GROUPS }),
   'POST /api/metadata-profiles': async (req) => {
     const profile = await jsonBody(req);
-    if (PROFILE_ID.test(profile?.id) && (await profiles.exists(profile.id))) throw httpError(409, `Metadata profile "${profile.id}" already exists`);
-    return json(await profiles.save(profile), 201);
+    return json(await profiles.save(profile, { create: true }), 201);
   },
 };
 
@@ -172,9 +190,8 @@ const profileRoutes = {
   GET: async (id) => json(await profiles.get(id)),
   PUT: async (id, req) => {
     const profile = await jsonBody(req);
-    if (profile?.id !== id) throw httpError(400, 'The profile\'s id must match the URL');
-    const created = !(await profiles.exists(id));
-    return json(await profiles.save(profile), created ? 201 : 200);
+    if (profile.id !== id) throw httpError(400, 'The profile\'s id must match the URL');
+    return saved((create) => profiles.save(profile, { create }));
   },
   DELETE: async (id) => { await profiles.remove(id); return json({ ok: true }); },
 };
@@ -184,12 +201,26 @@ const watermarkRoutes = {
   GET: async (id) => json({ definition: await watermarks.get(id), compiled: await watermarks.compiled(id) }),
   PUT: async (id, req) => {
     const def = await jsonBody(req);
-    if (def?.id !== id) throw httpError(400, 'The definition\'s id must match the URL');
-    const created = !(await watermarks.exists(id));
-    return json(await watermarks.save(def), created ? 201 : 200);
+    if (def.id !== id) throw httpError(400, 'The definition\'s id must match the URL');
+    checkNotReserved(id);
+    return saved((create) => watermarks.save(def, { create }));
   },
   DELETE: async (id) => { await watermarks.remove(id); return json({ ok: true }); },
 };
+
+/** PUT: 201 when this request created the file (decided atomically), else 200. */
+async function saved(save) {
+  try {
+    return json(await save(true), 201);
+  } catch (err) {
+    if (err?.code !== 'EXISTS') throw err;
+    return json(await save(false), 200);
+  }
+}
+
+function checkNotReserved(id) {
+  if (RESERVED_IDS.has(id)) throw httpError(400, `"${id}" is reserved and cannot be a watermark id`);
+}
 
 const pick = ({ format, width, height, mode, block, watermark, visibleWatermark }) => ({
   format, width, height, mode, block, carries: watermark?.id ?? null, visibleWatermark,
@@ -198,27 +229,30 @@ const urlFor = (id, bytes) => `/images/${id}.${IMAGE[detectFormat(bytes)][1]}`;
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
+  // HEAD is GET without the body (send() leaves it out), for static files and GET routes.
+  const method = req.method === 'HEAD' ? 'GET' : req.method;
   try {
-    const route = routes[`${req.method} ${url.pathname}`];
+    const route = routes[`${method} ${url.pathname}`];
     const wm = /^\/api\/watermarks\/([^/]+)$/.exec(url.pathname);
     const mp = /^\/api\/metadata-profiles\/([^/]+)$/.exec(url.pathname);
     let out;
     if (route) out = await route(req, url.searchParams);
-    else if (wm && watermarkRoutes[req.method]) {
+    else if (wm && watermarkRoutes[method]) {
       if (!ID_PATTERN.test(wm[1])) throw httpError(400, 'Invalid watermark id');
-      out = await watermarkRoutes[req.method](wm[1], req);
-    } else if (mp && profileRoutes[req.method]) {
+      out = await watermarkRoutes[method](wm[1], req);
+    } else if (mp && profileRoutes[method]) {
       if (!PROFILE_ID.test(mp[1])) throw httpError(400, 'Invalid metadata profile id');
-      out = await profileRoutes[req.method](mp[1], req);
-    } else if (req.method === 'GET') out = await staticFile(url.pathname);
+      out = await profileRoutes[method](mp[1], req);
+    } else if (method === 'GET') out = await staticFile(url.pathname);
     else out = json({ error: 'Not found' }, 404);
     send(res, out);
   } catch (err) {
     // PixmixErrors come from the bundle and from src/ (two classes): go by name.
     const pixmix = err instanceof PixmixError || err?.name === 'PixmixError' || err?.name === 'WrongKeyError';
     const status = err.status || (err.code === 'WRONG_KEY' ? 403 : err.code === 'LIMIT' ? 413 : pixmix ? 400 : 500);
+    // An unexpected error's message can hold file paths and the like: it stays in the log.
     if (status === 500) console.error(err);
-    send(res, json({ error: err.message, code: err.code }, status));
+    send(res, status === 500 ? json({ error: 'Internal server error', code: 'INTERNAL' }, 500) : json({ error: err.message, code: err.code }, status));
   }
 });
 server.listen(PORT, HOST, () => console.log(`pixmix dev server on http://${HOST}:${server.address().port}${sharp ? ' (sharp: on)' : ''}`));
@@ -227,7 +261,7 @@ async function staticFile(pathname) {
   const img = pathname.match(/^\/images\/([\w-]+)\.(png|jpg|jxl)$/);
   if (img) {
     const g = gallery.get(img[1]);
-    return g ? image(g.bytes) : json({ error: 'Not found' }, 404);
+    return g && urlFor(img[1], g.bytes) === pathname ? image(g.bytes) : json({ error: 'Not found' }, 404);
   }
   const wm = pathname.match(/^\/watermarks\/([a-z0-9-]+)\.(json|svg)$/);
   if (wm) {
@@ -251,9 +285,19 @@ function body(req, max = MAX_BODY) {
   return new Promise((resolve, reject) => {
     const parts = [];
     let size = 0;
+    // Answer 413 rather than resetting the connection: the rest of the upload is read and
+    // thrown away (resetting it made clients see a network error, not the answer), and the
+    // connection is closed after the response.
+    const tooLarge = () => {
+      req.tooLarge = true;
+      req.removeAllListeners('data');
+      req.resume();
+      reject(httpError(413, `The body is larger than ${max} bytes`));
+    };
+    if (Number(req.headers['content-length']) > max) { tooLarge(); return; }
     req.on('data', (c) => {
       size += c.length;
-      if (size > max) { reject(Object.assign(new Error('Body too large'), { status: 413 })); req.destroy(); }
+      if (size > max) tooLarge();
       else parts.push(c);
     });
     req.on('end', () => resolve(new Uint8Array(Buffer.concat(parts))));
@@ -261,20 +305,24 @@ function body(req, max = MAX_BODY) {
   });
 }
 
-/** A JSON request body (small), parsed. */
+/** A JSON request body (small), parsed: it must be an object. */
 async function jsonBody(req) {
   const bytes = await body(req, MAX_JSON);
+  let obj;
   try {
-    return JSON.parse(new TextDecoder().decode(bytes));
+    obj = JSON.parse(new TextDecoder().decode(bytes));
   } catch {
     throw httpError(400, 'The body is not valid JSON');
   }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) throw httpError(400, 'The body must be a JSON object');
+  return obj;
 }
 
 const image = (data) => ({ status: 200, type: IMAGE[detectFormat(data)][0], data, cache: 'no-store' });
 const json = (obj, status = 200) => ({ status, type: 'application/json', data: JSON.stringify(obj) });
 
 function send(res, { status, type, data, cache = 'no-store', headers = {} }) {
-  res.writeHead(status, { 'Content-Type': type, 'Cache-Control': cache, 'Content-Length': Buffer.byteLength(data), ...headers });
-  res.end(data);
+  const close = res.req.tooLarge ? { Connection: 'close' } : {};
+  res.writeHead(status, { 'Content-Type': type, 'Cache-Control': cache, 'Content-Length': Buffer.byteLength(data), ...close, ...headers });
+  res.end(res.req.method === 'HEAD' ? undefined : data);
 }

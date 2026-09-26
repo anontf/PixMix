@@ -15,9 +15,9 @@
 
 import { readChunks, writeChunks, isPng } from './chunks.js';
 import {
-  parseIhdr, pixelBytesOf, decodeRaster, encodeRaster, decodeRasterAsync, encodeRasterAsync,
+  parseIhdr, pixelBytesOf, rawSize, decodeRaster, encodeRaster, decodeRasterAsync, encodeRasterAsync,
 } from './raster.js';
-import { computeLayout, applyMap } from '../../core/layout.js';
+import { computeLayout, applyMap, fitParams } from '../../core/layout.js';
 import {
   makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError, FLAG_STASH, tileSize, tileTransforms,
 } from '../../core/params.js';
@@ -26,7 +26,7 @@ import {
   WATERMARK_TAG, STASH_TAG, encodeWatermark, readCarried, keptWatermark, carriedInfo, restorePixelStash,
 } from '../../watermark/embed.js';
 import { stashPng } from '../../watermark/paint.js';
-import { checkPixels, checkFrames } from '../../core/limits.js';
+import { checkPixels, checkFrames, resolveLimits, decompressedLimitError } from '../../core/limits.js';
 
 export const MARKER_CHUNK = 'pmIx';
 export { isPng };
@@ -206,7 +206,7 @@ export function scramblePng(bytes, { key, mode, block, transforms, level, salt, 
     throw new PixmixError('Image is already scrambled (decode it first, or use rekey)', 'ALREADY_SCRAMBLED');
   }
   if (mode === 'mcu') throw new PixmixError('Mode "mcu" only applies to JPEG and JPEG XL output', 'BAD_OPTION');
-  const params = makeParams({ mode, block, transforms, salt });
+  const params = fitParams(makeParams({ mode, block, transforms, salt }), img.frameSizes);
   const layouts = layoutsFor(key, params, img);
   return finishScramble(img, mapFrames(img, layouts, 'scramble'), params, layouts[0].check, { key, level, watermark, visibleWatermark });
 }
@@ -319,12 +319,13 @@ export function unscramblePng(bytes, opts) {
 export function rekeyPng(bytes, { from, to, mode, block, transforms, level, salt, limits, watermark, visibleWatermark } = {}) {
   const img = readPng(bytes, limits);
   const { marker, frames, visible } = unscrambled(img, from, limits);
-  const params = makeParams({
+  if (mode === 'mcu') throw new PixmixError('Mode "mcu" only applies to JPEG and JPEG XL', 'BAD_OPTION');
+  const params = fitParams(makeParams({
     mode: mode ?? marker.params.mode,
     block: block ?? (marker.params.mode === 'block' ? tileSize(marker.params) : undefined),
     transforms: transforms ?? (marker.params.mode === 'block' ? tileTransforms(marker.params) : undefined),
     salt,
-  });
+  }), img.frameSizes);
   const layouts = layoutsFor(to, params, img);
   const plain = { ...img, frames };
   return finishScramble(img, mapFrames(plain, layouts, 'scramble'), params, layouts[0].check, {
@@ -341,13 +342,32 @@ export function rekeyPng(bytes, { from, to, mode, block, transforms, level, salt
  */
 export const carriedFields = (c) => ({ watermark: c.watermark, watermarkError: c.error });
 
+/**
+ * What decoding checks before inflating, from the chunks alone: the frames (the IDAT image,
+ * then each fcTL after it), their pixels together, and what each frame inflates to.
+ */
+function checkFrameSizes(chunks, ihdr, limits) {
+  const idat = chunks.findIndex((c) => c.type === 'IDAT');
+  const sizes = [{ width: ihdr.width, height: ihdr.height }];
+  chunks.forEach((c, i) => {
+    if (c.type !== 'fcTL' || i < idat || c.data.length !== 26) return;
+    const dv = new DataView(c.data.buffer, c.data.byteOffset, 26);
+    sizes.push({ width: dv.getUint32(4), height: dv.getUint32(8) });
+  });
+  if (sizes.length > 1) checkFrames(sizes.length, sizes.reduce((n, f) => n + f.width * f.height, 0), limits);
+  const { maxDecompressedBytes } = resolveLimits(limits);
+  for (const f of sizes) {
+    checkPixels(f.width, f.height, limits, 'APNG frame');
+    if (rawSize({ ...ihdr, ...f }) > maxDecompressedBytes) throw decompressedLimitError(maxDecompressedBytes);
+  }
+}
+
 /** Cheap: parses chunks only, no inflate. Checks the same size limits as decoding. */
 export function inspectPng(bytes, limits) {
   const chunks = readChunks(bytes, limits);
   const ihdr = parseIhdr(chunks[0].data);
   checkPixels(ihdr.width, ihdr.height, limits);
-  const fctl = chunks.filter((c) => c.type === 'fcTL').length;
-  if (fctl > 1) checkFrames(fctl, 0, limits);
+  checkFrameSizes(chunks, ihdr, limits);
   const marker = readPngMarker(chunks);
   const actl = chunks.find((c) => c.type === 'acTL');
   const dv = actl?.data.length === 8 ? new DataView(actl.data.buffer, actl.data.byteOffset, 8) : null;

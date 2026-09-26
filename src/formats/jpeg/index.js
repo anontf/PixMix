@@ -31,7 +31,7 @@ import { computeGridLayout } from '../../core/layout.js';
 import {
   makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError, MCU_TRANSFORMS, MCU_PROGRESSIVE,
 } from '../../core/params.js';
-import { checkPixels } from '../../core/limits.js';
+import { checkPixels, resolveLimits, limitError } from '../../core/limits.js';
 import { readJpegMetadata } from '../../meta/jpeg.js';
 import { readOrientation } from '../../meta/exif.js';
 import {
@@ -329,6 +329,10 @@ export function rebuildJpeg(bytes, limits) {
 export function inspectJpeg(bytes, limits) {
   const { segments, trailing } = readSegments(bytes, limits);
   const sof = segments.find((s) => isSof(s.marker));
+  // Decoding checks the scan count before any entropy decoding; so does inspect.
+  const { maxScans } = resolveLimits(limits);
+  const scans = segments.reduce((n, s) => n + (s.marker === M.SOS), 0);
+  if (scans > maxScans) throw limitError(`JPEG has ${scans} scans, over the limit of ${maxScans} (limits.maxScans)`);
   const marker = readMarkerFrom(segments);
   const meta = readJpegMetadata(bytes);
   if (meta.width && meta.height) checkPixels(meta.width, meta.height, limits);

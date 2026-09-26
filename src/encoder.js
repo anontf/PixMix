@@ -8,9 +8,10 @@ import {
   rebuiltJpegMatches,
 } from './formats/jxl/index.js';
 import { readJxl, readJxlHeader } from './formats/jxl/container.js';
-import { convert, convertAsync, decodeForJxl, targetFormat, OUTPUT_FORMATS } from './convert/index.js';
+import { convert, convertAsync, decodeForJxl, targetFormat, isScrambled, OUTPUT_FORMATS } from './convert/index.js';
 import { PixmixError } from './core/params.js';
 import { withLimits } from './core/limits.js';
+import { checkOptions } from './core/options.js';
 import { readWebpMetadata } from './meta/webp.js';
 import { readOrientation } from './meta/exif.js';
 import { validateCompiled, ID_PATTERN } from './watermark/schema.js';
@@ -82,7 +83,7 @@ const needsAsync = (what) => new PixmixError(`JPEG XL ${what} is async; use ${wh
  */
 function checkWatermarks(opts) {
   if (!opts) return opts;
-  const out = { ...opts };
+  const out = checkOptions({ ...opts });
   if (opts.watermark) {
     const w = opts.watermark;
     if (typeof w === 'string' || (!w.format && typeof w.id === 'string' && Object.keys(w).length === 1)) {
@@ -106,6 +107,7 @@ export function encode(input, opts) {
   opts = checkWatermarks(withLimits(bytes, opts));
   const withFormat = withTarget(bytes, opts);
   if (withFormat.format === 'jxl' || detectFormat(bytes) === 'jxl') throw needsAsync('encode');
+  refuseScrambled(bytes, opts.limits);
   const converted = convert(bytes, withFormat);
   opts.onConvert?.(converted);
   return SCRAMBLERS[converted.format].scramble(converted.bytes, opts);
@@ -118,6 +120,7 @@ export async function encodeAsync(input, opts) {
   opts = withLimits(bytes, opts);
   const withFormat = withTarget(bytes, opts);
   const from = detectFormat(bytes);
+  refuseScrambled(bytes, opts.limits);
   // Why the default JPEG route was not taken for a JPEG source, for the report.
   let fallback = null;
   if (withFormat.format === 'jxl') {
@@ -151,7 +154,8 @@ export async function encodeAsync(input, opts) {
     // policy applies to the ICC profile as well as the boxes.
     const converted = await convertAsync(bytes, { ...withFormat, metadata: undefined });
     converted.dropped.push(...reencodeNotes(readJxlHeader(readJxl(converted.bytes, opts.limits).codestream, opts.limits)));
-    let { image, boxes } = await jxlForScramble(converted.bytes, opts);
+    let { image, boxes, dropped } = await jxlForScramble(converted.bytes, opts);
+    for (const d of dropped) if (!converted.dropped.includes(d)) converted.dropped.push(d);
     if (opts.metadata) {
       const parts = applyJxlParts({ boxes, icc: image.icc ?? null }, opts.metadata, { limits: opts.limits, stripThumbnails: !opts.keepThumbnails });
       ({ boxes } = parts);
@@ -196,6 +200,16 @@ async function jpegForJxl(bytes, from, { mode, limits }) {
   return { jpeg, decoder: 'jpeg reconstruction', notes: [] };
 }
 
+/**
+ * Scrambling a scrambled image again would bury its marker (or, converted to another format,
+ * lose it) and with it the original: checked first, whatever the output format.
+ */
+function refuseScrambled(bytes, limits) {
+  if (isScrambled(bytes, detectFormat(bytes), limits)) {
+    throw new PixmixError('Image is already scrambled (decode it first, or use rekey)', 'ALREADY_SCRAMBLED');
+  }
+}
+
 // Validates the output format and mode combination up front, before any decoding work.
 function withTarget(input, opts) {
   const from = detectFormat(toBytes(input));
@@ -225,6 +239,7 @@ export function rekey(input, opts) {
   opts = checkWatermarks(opts);
   const bytes = toBytes(input);
   const s = pick(SCRAMBLERS, bytes);
+  checkRekeyTarget(bytes, opts);
   if (!s.rekey) throw needsAsync('rekey');
   opts = withLimits(bytes, opts);
   return s.rekey(withMetadata(bytes, opts), opts);
@@ -235,9 +250,19 @@ export async function rekeyAsync(input, opts) {
   opts = checkWatermarks(opts);
   const bytes = toBytes(input);
   const s = pick(SCRAMBLERS, bytes);
+  checkRekeyTarget(bytes, opts);
   opts = withLimits(bytes, opts);
   if (s.rekey) return s.rekey(withMetadata(bytes, opts), opts);
   return s.rekeyAsync(bytes, opts.metadata ? { ...opts, meta: metaHook(opts) } : opts);
+}
+
+/** rekey keeps the format; a different `format`, or a mode the format has not, is an error. */
+function checkRekeyTarget(bytes, opts) {
+  const format = detectFormat(bytes);
+  if (opts?.format !== undefined && opts.format !== format) {
+    throw new PixmixError(`rekey keeps the image's format (${format}); decode and encode again to change it`, 'BAD_OPTION');
+  }
+  if (format === 'png' && opts?.mode === 'mcu') throw new PixmixError('Mode "mcu" only applies to JPEG and JPEG XL', 'BAD_OPTION');
 }
 
 /**

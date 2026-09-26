@@ -17,7 +17,7 @@ import { readChunks, writeChunks, isPng } from './chunks.js';
 import {
   parseIhdr, pixelBytesOf, decodeRaster, encodeRaster, decodeRasterAsync, encodeRasterAsync,
 } from './raster.js';
-import { computeLayout, applyMap } from '../../core/layout.js';
+import { computeLayout, applyMap, fitParams } from '../../core/layout.js';
 import {
   makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError, FLAG_STASH, tileSize, tileTransforms,
 } from '../../core/params.js';
@@ -204,7 +204,7 @@ export function scramblePng(bytes, { key, mode, block, transforms, level, salt, 
     throw new PixmixError('Image is already scrambled (decode it first, or use rekey)', 'ALREADY_SCRAMBLED');
   }
   if (mode === 'mcu') throw new PixmixError('Mode "mcu" only applies to JPEG and JPEG XL output', 'BAD_OPTION');
-  const params = makeParams({ mode, block, transforms, salt });
+  const params = fitParams(makeParams({ mode, block, transforms, salt }), img.frameSizes);
   const layouts = layoutsFor(key, params, img);
   return finishScramble(img, mapFrames(img, layouts, 'scramble'), params, layouts[0].check, { key, level, watermark, visibleWatermark });
 }
@@ -315,12 +315,13 @@ export function unscramblePng(bytes, opts) {
 export function rekeyPng(bytes, { from, to, mode, block, transforms, level, salt, limits, watermark, visibleWatermark } = {}) {
   const img = readPng(bytes, limits);
   const { marker, frames, visible } = unscrambled(img, from, limits);
-  const params = makeParams({
+  if (mode === 'mcu') throw new PixmixError('Mode "mcu" only applies to JPEG and JPEG XL', 'BAD_OPTION');
+  const params = fitParams(makeParams({
     mode: mode ?? marker.params.mode,
     block: block ?? (marker.params.mode === 'block' ? tileSize(marker.params) : undefined),
     transforms: transforms ?? (marker.params.mode === 'block' ? tileTransforms(marker.params) : undefined),
     salt,
-  });
+  }), img.frameSizes);
   const layouts = layoutsFor(to, params, img);
   const plain = { ...img, frames };
   return finishScramble(img, mapFrames(plain, layouts, 'scramble'), params, layouts[0].check, {

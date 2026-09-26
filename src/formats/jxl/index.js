@@ -19,7 +19,7 @@
 
 import { readJxl, writeJxl, wrapCodestream, readJxlHeader, isJxl } from './container.js';
 import { loadJxlCodec } from './load.js';
-import { computeLayout, applyMap } from '../../core/layout.js';
+import { computeLayout, applyMap, fitParams } from '../../core/layout.js';
 import {
   makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError, FLAG_STASH, tileSize, tileTransforms,
 } from '../../core/params.js';
@@ -40,14 +40,20 @@ const STALE = {
   jbrd: 'JPEG reconstruction data (no longer matches the image)',
   jhgm: 'HDR gain map (a second image)',
 };
+const KEPT_WITH_CODESTREAM = new Set(['jxll', MARKER_BOX, WATERMARK_TAG, STASH_TAG]);
 
 /**
  * Metadata boxes to carry over, with EXIF thumbnails removed unless kept.
+ * `sameCodestream`: the codestream is copied unchanged (not re-encoded), so what belongs to
+ * it stays too: its level box (jxll), a pixmix marker with its watermark boxes, and the JPEG
+ * reconstruction data (jbrd), unless removing a thumbnail changed the EXIF it rebuilds.
  * @returns {{boxes: import('./container.js').Box[], dropped: string[]}}
  */
-export function sanitizeBoxes(boxes, { keepThumbnails = false, limits } = {}) {
+export function sanitizeBoxes(boxes, { keepThumbnails = false, limits, sameCodestream = false } = {}) {
   const out = [], dropped = [];
+  let exifChanged = false;
   for (const box of boxes) {
+    if (sameCodestream && (KEPT_WITH_CODESTREAM.has(box.type) || box.type === 'jbrd')) { out.push(box); continue; }
     if (STRUCTURE.has(box.type)) continue;
     if (STALE[box.type]) { dropped.push(STALE[box.type]); continue; }
     if (keepThumbnails) { out.push(box); continue; }
@@ -56,19 +62,22 @@ export function sanitizeBoxes(boxes, { keepThumbnails = false, limits } = {}) {
       if (stripped) {
         out.push({ type: 'Exif', data: withOffset(stripped) });
         dropped.push('EXIF thumbnail');
+        exifChanged = true;
         continue;
       }
     } else if (box.type === 'brob' && String.fromCharCode(...box.data.subarray(0, 4)) === 'Exif') {
       const inner = unwrapBrob(box.data, limits);
-      if (!inner.data) { dropped.push('compressed EXIF (cannot be checked for a thumbnail here)'); continue; }
+      if (!inner.data) { dropped.push('compressed EXIF (cannot be checked for a thumbnail here)'); exifChanged = true; continue; }
       const stripped = stripExifThumbnail(exifTiff(inner.data));
       out.push(stripped ? { type: 'Exif', data: withOffset(stripped) } : box);
-      if (stripped) dropped.push('EXIF thumbnail');
+      if (stripped) { dropped.push('EXIF thumbnail'); exifChanged = true; }
       continue;
     }
     out.push(box);
   }
-  return { boxes: out, dropped };
+  if (!exifChanged || !out.some((b) => b.type === 'jbrd')) return { boxes: out, dropped };
+  dropped.push('JPEG reconstruction data (it rebuilds the EXIF thumbnail that was removed)');
+  return { boxes: out.filter((b) => b.type !== 'jbrd'), dropped };
 }
 
 function withOffset(tiff) {
@@ -180,7 +189,7 @@ const effortFor = (params, effort) => effort ?? (params.mode === 'pixel' ? 2 : 7
  */
 export async function scrambleJxlPixels(image, boxes, { key, mode, block, transforms, salt, effort, watermark, visibleWatermark } = {}) {
   if (mode === 'mcu') throw new PixmixError('Mode "mcu" needs a JPEG source', 'BAD_OPTION');
-  let params = makeParams({ mode, block, transforms, salt });
+  let params = fitParams(makeParams({ mode, block, transforms, salt }), [image]);
   const scrambled = mapFrames(key, params, image, 'scramble');
   const extra = [];
   if (watermark) extra.push({ type: WATERMARK_TAG, data: encodeWatermark(watermark) });
@@ -216,12 +225,16 @@ function restoreStash(boxes, marker, image, key, limits) {
   }
 }
 
-/** What the pixel route scrambles: the decoded image and the metadata boxes to carry. */
+/** What the pixel route scrambles: the decoded image, the metadata boxes to carry, and what was not carried. */
 export async function jxlForScramble(bytes, opts = {}) {
   const { limits } = opts;
-  const { boxes } = readChecked(bytes, limits);
+  const { boxes, codestream } = readChecked(bytes, limits);
   if (readMarkerBox(boxes)) throw new PixmixError('Image is already scrambled (decode it first, or use rekey)', 'ALREADY_SCRAMBLED');
-  return { image: await decodeJxlImage(bytes, { limits }), boxes: sanitizeBoxes(boxes, opts).boxes };
+  const clean = sanitizeBoxes(boxes, opts);
+  // Only the pixels are needed: JPEG reconstruction data the decoder cannot use (the reason
+  // the JPEG route was not taken) would fail the decode, so the bare codestream is decoded.
+  const pixels = boxes.some((b) => b.type === 'jbrd') ? codestream : bytes;
+  return { image: await decodeJxlImage(pixels, { limits }), boxes: clean.boxes, dropped: clean.dropped };
 }
 
 export async function scrambleJxl(bytes, opts = {}) {

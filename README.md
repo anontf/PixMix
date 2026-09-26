@@ -165,6 +165,10 @@ const out = await encodeAsync(webpBytes, {
 ```
 
 In browsers, `browserDecoder()` uses the browser's own decoders (WebP, AVIF, BMP, …).
+A plugin only claims formats it can decode (`sharpDecoder` checks libvips' loaders), and
+leaves GIF and JPEG XL to pixmix's exact built-in decoders unless `formats` says otherwise.
+If a plugin fails on a format pixmix decodes itself, the built-in decoder takes over and
+the report's `notes` say so.
 `convert` / `convertAsync` produce the plain, unscrambled file the encoder would scramble.
 
 ### Untrusted input
@@ -270,10 +274,13 @@ Where each kind of metadata ends up:
 | Comments | `tEXt Comment` | COM | dropped (no field) |
 
 The pixels stay exactly as stored. They aren't rotated (the EXIF orientation travels with
-the EXIF) and aren't converted to sRGB (the ICC profile travels with the image).
+the EXIF; a TIFF's orientation tag becomes EXIF) and aren't converted to sRGB (the ICC
+profile travels with the image). AVIF and HEIC are the exception: libheif always applies
+their rotation, so the EXIF orientation is set to 1 and the report says so.
 
 Some things are dropped, and the report says so:
 - animation frames after the first;
+- pages after the first of a multi-page TIFF (or HEIF collection);
 - CMYK and other non-RGB/grey profiles, and grey profiles on colour images;
 - extended XMP;
 - precision above 8 bits when writing JPEG (PNG and JPEG XL keep 16 bits), and in

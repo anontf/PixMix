@@ -37,7 +37,7 @@ const IMAGE = { png: ['image/png', 'png'], jpeg: ['image/jpeg', 'jpg'], jxl: ['i
 
 // sharp is optional: with it the server also accepts WebP, AVIF, HEIC and TIFF uploads.
 const sharp = await import('sharp').then((m) => m.default, () => null);
-const decoders = sharp ? [sharpDecoder(sharp, { formats: ['webp', 'avif', 'heic', 'tiff', 'jxl'] })] : [];
+const decoders = sharp ? [sharpDecoder(sharp, { formats: ['webp', 'avif', 'heic', 'tiff'] })] : [];
 
 /** In-memory "CDN" for the demo site: id -> {bytes, key, name, effect}. */
 const gallery = new Map();

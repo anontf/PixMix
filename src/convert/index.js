@@ -109,11 +109,25 @@ function decodeFailure(job, err) {
 }
 
 function callDecoder(job, bytes, limits) {
+  const again = () => callDecoder(job, bytes, limits);
   try {
-    return job.decoder.decode(bytes, job.from, { limits });
+    const decoded = job.decoder.decode(bytes, job.from, { limits });
+    return job.fallback && typeof decoded?.then === 'function' ? decoded.catch((err) => retry(job, err, again)) : decoded;
   } catch (err) {
-    throw decodeFailure(job, err);
+    return retry(job, err, again);
   }
+}
+
+/**
+ * A plugin that fails on a format pixmix decodes itself (sharp without a JPEG XL loader,
+ * say) hands over to the built-in decoder, and the report's notes say so. A limit is final.
+ */
+function retry(job, err, again) {
+  if (!job.fallback || err?.code === 'LIMIT') throw decodeFailure(job, err);
+  job.notes.push(`${job.decoder.name} could not decode this ${job.from.toUpperCase()} (${err?.message ?? err}); used the built-in decoder`);
+  job.decoder = job.fallback;
+  job.fallback = null;
+  return again();
 }
 
 async function decodeAsync(job, bytes, limits) {
@@ -158,7 +172,7 @@ async function decodeJob(bytes, job, { keepThumbnails = false, limits, metadata 
   const decoded = normalise(await decodeAsync(job, bytes, limits));
   const meta = mergedMeta(bytes, job.from, decoded, keepThumbnails, limits);
   let { image, boxes, transferred, dropped } = jxlImage(decoded, meta);
-  const report = { format: 'jxl', from: job.from, decoder: job.decoder.name, transferred, dropped, notes: sizeNotes(bytes, job.from, 'jxl') };
+  const report = { format: 'jxl', from: job.from, decoder: job.decoder.name, transferred, dropped, notes: [...job.notes, ...sizeNotes(bytes, job.from, 'jxl')] };
   if (metadata) {
     // The pixel route encodes the codestream, so the ICC profile can change here too.
     const parts = applyJxlParts({ boxes, icc: image.icc ?? null }, normalizePolicy(metadata), { limits, stripThumbnails: !keepThumbnails });
@@ -248,7 +262,8 @@ function prepare(bytes, { format, decoders = [], keepThumbnails = false, limits 
   if (!decoder) {
     throw new PixmixError(`No decoder for ${from.toUpperCase()} input; pass a decoder plugin (e.g. sharp)`, 'UNSUPPORTED');
   }
-  return { from, target, decoder };
+  const builtin = BUILTIN_DECODERS.find((d) => d.formats.includes(from)) ?? null;
+  return { from, target, decoder, fallback: builtin === decoder ? null : builtin, notes: [] };
 }
 
 /** Plugins may hand back Node Buffers; 16-bit data stays a Uint16Array. */
@@ -280,14 +295,14 @@ function mergedMeta(bytes, from, decoded, keepThumbnails, limits) {
   return meta;
 }
 
-function finish(bytes, { from, target, decoder }, decoded, { keepThumbnails = false, quality, subsampling, background, progressive, limits }) {
+function finish(bytes, { from, target, decoder, notes }, decoded, { keepThumbnails = false, quality, subsampling, background, progressive, limits }) {
   decoded = normalise(decoded);
   const meta = mergedMeta(bytes, from, decoded, keepThumbnails, limits);
   if (target !== 'png') decoded = to8bit(decoded, meta); // PNG keeps 16 bits; JPEG cannot
   const built = target === 'jpeg'
     ? (({ jpeg, ...r }) => ({ bytes: jpeg, ...r }))(buildJpeg(decoded, meta, { quality, subsampling, background, progressive }))
     : (({ png, ...r }) => ({ bytes: png, ...r }))(buildPng(decoded, meta));
-  return { bytes: built.bytes, format: target, from, decoder: decoder.name, transferred: built.transferred, dropped: [...new Set(built.dropped)], notes: sizeNotes(bytes, from, target) };
+  return { bytes: built.bytes, format: target, from, decoder: decoder.name, transferred: built.transferred, dropped: [...new Set(built.dropped)], notes: [...notes, ...sizeNotes(bytes, from, target)] };
 }
 
 function sanitize(format, bytes, limits) {

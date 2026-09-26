@@ -176,7 +176,7 @@ async function commandOptions(command, o) {
     const sharp = await import('sharp').then((m) => m.default, () => null);
     // JPEG and GIF stay on the built-in decoders so the CLI, servers and browsers agree
     // pixel for pixel; sharp fills in the formats pixmix cannot decode itself.
-    if (sharp) opts.decoders = [sharpDecoder(sharp, { formats: ['webp', 'avif', 'heic', 'tiff', 'jxl'] })];
+    if (sharp) opts.decoders = [sharpDecoder(sharp, { formats: ['webp', 'avif', 'heic', 'tiff'] })];
   }
   return opts;
 }

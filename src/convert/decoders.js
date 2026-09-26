@@ -35,6 +35,12 @@ export const pngDecoder = {
     const metadata = readPngMetadata(img.chunks, limits);
     const animation = img.animated ? apngFrames(img) : null;
     if (animation) metadata.dropped.push('animation (first frame kept)');
+    if (animation?.hidden) {
+      // The IDAT image is only for viewers without APNG support; the image is frame 0.
+      const { hidden, ...rest } = animation;
+      if (depth === 16) metadata.dropped.push('precision above 8 bits (animations are 8-bit)');
+      return { width, height, depth: 8, data: rest.frames[0].data, metadata, animation: rest };
+    }
     const data = depth === 16 ? toRGBA16(img, img.pixels) : new Uint8Array(toRGBA8(img, img.pixels).buffer);
     return { width, height, depth: depth === 16 ? 16 : 8, data, metadata, ...(animation ? { animation } : {}) };
   },
@@ -97,7 +103,7 @@ function apngFrames(img) {
     if (saved) canvas.set(saved);
     else if (dispose !== 0) for (let y = fy; y < fy + fh; y++) canvas.fill(0, (y * width + fx) * 4, (y * width + fx + fw) * 4);
   });
-  return frames.length ? { frames, plays } : null;
+  return frames.length ? { frames, plays, hidden: skip === 1 } : null;
 }
 
 export const jpegDecoder = {
@@ -163,10 +169,12 @@ export const gifDecoder = {
       if (info.disposal === 2) clearRect(canvas, width, height, info);
       else if (saved) canvas.set(saved);
     }
-    const loops = reader.loopCount(); // 0 = forever; null = no loop extension, play once
+    // The NETSCAPE extension counts repeats (0 = forever); browsers play the animation that
+    // many times more than once. No extension: play once.
+    const loops = reader.loopCount();
     return {
       width, height, data: frames[0].data,
-      animation: { frames: frames.map((f) => ({ data: f.data, delay: [f.delay, 100] })), plays: loops ?? 1 },
+      animation: { frames: frames.map((f) => ({ data: f.data, delay: [f.delay, 100] })), plays: loops === null ? 1 : loops && loops + 1 },
       metadata: { dropped: ['animation (first frame kept)'] },
     };
   },

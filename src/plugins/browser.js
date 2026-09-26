@@ -8,7 +8,10 @@ import { resolveLimits, checkPixels, checkFrames } from '../core/limits.js';
 
 import { readWebpLoopCount } from '../meta/webp.js';
 
-const DEFAULT_FORMATS = ['webp', 'avif', 'bmp', 'heic', 'jxl', 'tiff'];
+// JPEG XL is left to pixmix's own decoder, which is exact and works in every engine (most
+// cannot decode JPEG XL at all). A format pixmix decodes itself falls back to it anyway
+// when the browser fails.
+const DEFAULT_FORMATS = ['webp', 'avif', 'bmp', 'heic', 'tiff'];
 // Animated WebP/AVIF keep every frame (as APNG) where WebCodecs' ImageDecoder exists.
 
 export function browserDecoder({ formats = DEFAULT_FORMATS } = {}) {

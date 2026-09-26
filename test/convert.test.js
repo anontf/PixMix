@@ -177,7 +177,8 @@ test('animated GIF becomes an APNG with every frame, its delays and loop count',
   assert.deepEqual(r.dropped, []);
   assert.ok(r.transferred.includes('animation'));
   const info = inspect(r.bytes);
-  assert.deepEqual([info.animated, info.frames, info.plays, info.colorType], [true, 3, 2, 3]);
+  // NETSCAPE loop 2 = two repeats: browsers play it three times.
+  assert.deepEqual([info.animated, info.frames, info.plays, info.colorType], [true, 3, 3, 3]);
   const fctl = readChunks(r.bytes).filter((c) => c.type === 'fcTL').map((c) => [Buffer.from(c.data).readUInt16BE(20), Buffer.from(c.data).readUInt16BE(22)]);
   assert.deepEqual(fctl, [[20, 100], [10, 100], [5, 100]], 'delays, with 0 played as 10 like browsers do');
   const frames = readPng(r.bytes).frames;

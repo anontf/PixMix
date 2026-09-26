@@ -167,8 +167,9 @@ for (const { name: engine, skip } of await engines()) describe(engine, { skip },
       await p.selectOption('#decMetadata', where === 'server' ? '' : 'strip-all');
       await p.selectOption('#where', where);
       await p.fill('#duration', '200');
+      await p.evaluate(() => { for (const id of ['scrMeta', 'decMeta']) document.getElementById(id).textContent = ''; });
       await p.click('#encode');
-      await p.waitForFunction(() => /✓|✗|≈|Error|bad/i.test(document.querySelector('#decMeta').textContent) && document.querySelector('#decMeta').textContent !== 'decoding…', null, { timeout: 60000 });
+      await p.waitForFunction(() => /✓|✗|≈|Error/.test(document.querySelector('#decMeta').textContent + document.querySelector('#scrMeta').textContent), null, { timeout: 60000 });
       const scr = await p.textContent('#scrMeta'), dec = await p.textContent('#decMeta');
       assert.match(scr, new RegExp(`metadata ${id}: removed .*EXIF Artist.*GPS.*set EXIF Artist, EXIF Software`), scr);
       assert.match(dec, /✓ pixel-identical/, dec);

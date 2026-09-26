@@ -82,10 +82,11 @@ $('mdCopy').addEventListener('click', () => {
 $('mdDelete').addEventListener('click', async () => {
   if (!savedId || !confirm(`Delete metadata-profiles/${savedId}.json?`)) return;
   try {
-    await api(`/api/metadata-profiles/${savedId}`, { method: 'DELETE' });
-    status(`deleted ${savedId}`, 'ok');
+    const id = savedId;
+    await api(`/api/metadata-profiles/${id}`, { method: 'DELETE' });
     profile = null; savedId = null;
     await refresh();
+    status(`deleted ${id}`, 'ok');
   } catch (err) { status(err.message, 'bad'); }
 });
 $('mdSave').addEventListener('click', async () => {

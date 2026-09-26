@@ -4,7 +4,7 @@ import sharp from 'sharp';
 import { encode, decode, rekey, inspect, convert, WrongKeyError } from '../src/index.js';
 import { readSegments, writeSegments, M } from '../src/formats/jpeg/markers.js';
 import { decodeFrame } from '../src/formats/jpeg/decode.js';
-import { assembleJpeg } from '../src/formats/jpeg/encode.js';
+import { assembleJpeg, encodeScan } from '../src/formats/jpeg/encode.js';
 import { encodePixels } from '../src/formats/jpeg/fdct.js';
 import { buildOptimalSpec, buildEncodeTable, writeDht, BitWriter } from '../src/formats/jpeg/huffman.js';
 import { buildPng } from '../src/convert/png-build.js';
@@ -301,4 +301,33 @@ test('more than 10 blocks per MCU: one scan per component, which libjpeg reads',
   const src = assembleJpeg([odd.dqt], odd.frame);
   await pixels(src);
   assert.throws(() => encode(src, { key: 'k' }), (err) => err.code === 'UNSUPPORTED');
+});
+
+/** One scan per component, with a DQT redefining tables 0 and 1 before the second scan. */
+function dqtBetweenScans(w, h) {
+  const { frame, dqt } = encodePixels({ width: w, height: h, data: gradient(w, h) }, { subsampling: '4:4:4' });
+  const coarse = { marker: M.DQT, data: Uint8Array.from([0, ...Array(64).fill(40), 1, ...Array(64).fill(3)]) };
+  const segs = [dqt, { marker: M.SOF0, data: frame.sof }];
+  frame.components.forEach((_, only) => {
+    if (only === 1) segs.push(coarse);
+    const { dht, sos, ecs } = encodeScan(frame, { only });
+    segs.push({ marker: M.DHT, data: dht }, { marker: M.SOS, data: sos, ecs });
+  });
+  return writeSegments(segs);
+}
+
+test('quantisation tables redefined between scans keep the image', async () => {
+  const src = dqtBetweenScans(48, 32);
+  const ref = await pixels(src);
+  for (const progressive of [false, true]) {
+    const scrambled = encode(src, { key: 'k', progressive });
+    const restored = decode(scrambled, { key: 'k' });
+    assert.ok(sameCoefs(restored, src));
+    assert.ok(ref.equals(await pixels(restored)), 'libjpeg decodes the same image');
+    assert.equal(readSegments(restored).segments.filter((s) => s.marker === M.DQT).length, 1);
+    assert.ok(ref.equals(await pixels(decode(rekey(scrambled, { from: 'k', to: 'j' }), { key: 'j' }))));
+  }
+  // A plain file keeps its DQT segments byte for byte.
+  const plain = new Uint8Array(await fromRaw(48, 32).jpeg().toBuffer());
+  assert.deepEqual(nonCoding(decode(encode(plain, { key: 'k' }), { key: 'k' })), nonCoding(plain));
 });

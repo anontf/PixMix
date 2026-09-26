@@ -2,9 +2,11 @@
 // re-entropy-coded; nothing is requantized. APPn/COM/DQT segments and the SOF payload are
 // copied through unchanged. The scramble parameters go in an APP15 "pixmix\0" segment.
 //
-// What does change: Huffman tables are re-optimised, restart markers are dropped, and the
-// scans are rewritten: baseline files as one baseline scan, progressive files as progressive
-// scans with pixmix's own scan script (option `progressive` overrides either way).
+// What does change: Huffman tables are re-optimised, restart markers are dropped, DQT
+// segments that redefine a table between scans are merged into one (normalizeQuantTables:
+// same image, other table ids), and the scans are rewritten: baseline files as one
+// baseline scan, progressive files as progressive scans with pixmix's own scan script
+// (option `progressive` overrides either way).
 //
 // One catch: progressive AC scans only cover an image's real blocks, not the padding blocks
 // of partial edge MCUs. Scrambling can move real content into those, so a scrambled file is
@@ -22,7 +24,7 @@
 // holds the coefficients under a watermark drawn on the scrambled image.
 
 import { readSegments, writeSegments, isJpeg, isSof, isApp, startsWith, M } from './markers.js';
-import { decodeFrame } from './decode.js';
+import { decodeFrame, normalizeQuantTables } from './decode.js';
 import { assembleJpeg, interleavable } from './encode.js';
 import { applyMcuLayout, transformCount } from './transform.js';
 import { computeGridLayout } from '../../core/layout.js';
@@ -142,8 +144,7 @@ function restoreFrame(segments, frame, marker, key, limits) {
 
 function parse(bytes, limits) {
   const { segments, trailing } = readSegments(bytes, limits);
-  const frame = decodeFrame(segments, limits);
-  return { segments, trailing, frame };
+  return { ...normalizeQuantTables(segments, decodeFrame(segments, limits)), trailing };
 }
 
 function layoutFor(key, params, frame, expectedCheck) {

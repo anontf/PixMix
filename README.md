@@ -64,7 +64,10 @@ pixmix encode photo.jpg --metadata vivi-web   # strip everything, credit Vivi (s
 ```
 
 For each file it reports how the input was decoded and what metadata was kept or dropped.
-It never overwrites a file unless you pass `-f`. Exit codes: 0 = success, 1 = some files
+It never overwrites a file unless you pass `-f` (or `rekey --in-place`, which keeps symlinks
+and permissions), and never writes two inputs to one output name in a run. A `--key-file` is
+used as bytes, without one trailing newline or a leading UTF-8 BOM. Options that do not
+apply to the command are usage errors. Exit codes: 0 = success, 1 = some files
 failed (the others are still processed), 2 = usage error. If `sharp` is installed, the CLI
 uses it for WebP, AVIF, HEIC and TIFF (turn this off with `--no-sharp`). `pixmix --help`
 lists every option.

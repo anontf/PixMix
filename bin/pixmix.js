@@ -2,8 +2,8 @@
 // pixmix command line: encode / decode / rekey / inspect.
 
 import { parseArgs } from 'node:util';
-import { readFile, writeFile, rename, mkdir, stat } from 'node:fs/promises';
-import { basename, dirname, extname, join } from 'node:path';
+import { readFile, writeFile, rename, mkdir, stat, realpath, chmod, rm } from 'node:fs/promises';
+import { basename, dirname, extname, join, resolve } from 'node:path';
 import { encodeAsync, decodeAsync, rekeyAsync, inspect, detectFormat, PixmixError } from '../src/index.js';
 import { targetFormat } from '../src/convert/index.js';
 import { sharpDecoder } from '../src/plugins/sharp.js';
@@ -18,12 +18,15 @@ const USAGE = `Usage:
   pixmix inspect <file...> [--json]    show format, size, scramble info and the parsed metadata
 
 Keys (prefer the file or environment forms; -k ends up in shell history):
-  -k, --key <key>          key            --key-file <path>      read key from file
+  -k, --key <key>          key            --key-file <path>      read key from file (its bytes,
+                                                                 without one trailing newline or a
+                                                                 leading UTF-8 BOM; binary is fine)
   $PIXMIX_KEY              key (encode/decode), old key (rekey)
   --to <key> | --to-file <path> | $PIXMIX_NEW_KEY     new key for rekey
 
 Options:
-  -o, --out <path>         output file, directory, or "-" for stdout (single input)
+  -o, --out <path>         output file, directory, or "-" for stdout (single input); never
+                           the same path for two inputs (e.g. a/x.png and b/x.png) in one run
   --format <png|jpeg|jxl>  output format (default: same as the input when possible, else png)
   --mode <pixel|block|mcu> PNG: block (default; small files) or pixel (~2x larger). JPEG: always mcu. JPEG XL: pixel/block
                            (lossless pixels) or mcu (JPEG route: a DCT-scrambled JPEG inside
@@ -52,7 +55,7 @@ metadata profiles directory; or a .json file holding a profile or a policy):
   --metadata <policy>      encode: the scrambled file's metadata. decode: the restored
                            file's. rekey: apply it again (default: keep what the file has)
   --metadata-profiles <dir>  profiles directory (default: $PIXMIX_METADATA_PROFILES_DIR or pixmix's own)
-  --in-place               rekey: overwrite the input
+  --in-place               rekey: overwrite the input (a symlink's target; permissions kept)
   -f, --force              overwrite existing outputs
   --no-sharp               do not use sharp even if installed
   --max-pixels <n>         refuse images (or frames) larger than n pixels (default 100000000)
@@ -105,6 +108,25 @@ const OPTIONS = {
 
 class UsageError extends Error {}
 
+// Options each command uses (besides COMMON: keys, -o, -f, --no-sharp, --max-*, -q, -h); any other
+// is a usage error rather than silently ignored.
+const SCRAMBLE = ['mode', 'block', 'level', 'effort', 'no-transforms', 'progressive', 'baseline', 'watermark', 'watermark-ref',
+  'visible-watermark', 'watermarks', 'metadata', 'metadata-profiles'];
+const APPLIES = {
+  encode: [...SCRAMBLE, 'format', 'quality', 'subsampling', 'background', 'keep-thumbnails'],
+  decode: ['level', 'effort', 'progressive', 'baseline', 'watermark', 'watermarks', 'metadata', 'metadata-profiles'],
+  rekey: [...SCRAMBLE, 'no-watermark', 'in-place', 'to', 'to-file'],
+  inspect: ['json'],
+};
+const COMMON = ['key', 'key-file', 'out', 'force', 'no-sharp', 'max-pixels', 'max-frames', 'max-input-bytes', 'quiet', 'help'];
+
+function checkApplicable(command, o) {
+  const allowed = new Set([...APPLIES[command], ...(command === 'inspect' ? ['max-pixels', 'max-frames', 'max-input-bytes', 'quiet', 'help'] : COMMON)]);
+  const extra = Object.keys(o).filter((k) => !allowed.has(k));
+  if (extra.length) throw new UsageError(`${extra.map((k) => `--${k}`).join(', ')} ${extra.length > 1 ? 'do' : 'does'} not apply to ${command}`);
+  if (o['in-place'] && o.out !== undefined) throw new UsageError('Use either --in-place or -o');
+}
+
 const PAST = { encode: 'encoded', decode: 'decoded', rekey: 're-keyed' };
 
 async function main(argv) {
@@ -118,6 +140,7 @@ async function main(argv) {
   const [command, ...files] = positionals;
   if (o.help || !command) { console.log(USAGE); return 0; }
   if (!['encode', 'decode', 'rekey', 'inspect'].includes(command)) throw new UsageError(`Unknown command "${command}"`);
+  checkApplicable(command, o);
   if (!files.length) throw new UsageError('No input files');
   if (files.filter((f) => f === '-').length > 1) throw new UsageError('stdin ("-") can only be used once');
   if (o.out === '-' && files.length > 1) throw new UsageError('-o - (stdout) needs exactly one input');
@@ -128,13 +151,19 @@ async function main(argv) {
   const opts = await commandOptions(command, o);
   const outDir = await resolveOutDir(o.out, files.length);
   let failed = 0;
+  const written = new Map(); // output path -> the input it was written for, in this run
   for (const file of files) {
     try {
       const input = file === '-' ? await readStdin() : await readFile(file);
       const target = outputPath(command, file, o, outDir, outputFormat(command, input, opts));
+      // Two inputs with one output name (a/x.png and b/x.png into one directory, or x.png
+      // and x.gif): the second would overwrite the first's output, even with --force.
+      const key = target === '-' ? null : resolve(target);
+      if (key && written.has(key)) throw new PixmixError(`${target} was already written for ${written.get(key)} in this run`, 'EXISTS');
       if (target !== '-' && !o.force && !(command === 'rekey' && o['in-place']) && (await exists(target))) {
         throw new PixmixError(`${target} exists (use --force to overwrite)`, 'EXISTS');
       }
+      if (key) written.set(key, file);
       const { bytes, note } = await run(command, input, opts);
       await write(target, bytes, command === 'rekey' && o['in-place']);
       log(`${PAST[command]} ${file === '-' ? 'stdin' : file} -> ${target === '-' ? 'stdout' : target}  ${size(bytes.length)}${note ? `  (${note})` : ''}`);
@@ -149,12 +178,11 @@ async function main(argv) {
 async function commandOptions(command, o) {
   const opts = {};
   if (o.mode) opts.mode = o.mode;
-  if (o.block) opts.block = int(o.block, '--block');
-  if (o.level) opts.level = int(o.level, '--level');
-  if (o.effort) opts.effort = int(o.effort, '--effort');
+  if (o.block) opts.block = int(o.block, '--block', 2, 4096);
+  if (o.level) opts.level = int(o.level, '--level', 0, 9);
+  if (o.effort) opts.effort = int(o.effort, '--effort', 1, 9);
   if (o.format) opts.format = o.format === 'jpg' ? 'jpeg' : o.format;
-  if (command !== 'encode') delete opts.format;
-  if (o.quality) opts.quality = int(o.quality, '--quality');
+  if (o.quality) opts.quality = int(o.quality, '--quality', 1, 100);
   if (o.subsampling) opts.subsampling = o.subsampling;
   if (o.background) opts.background = o.background;
   if (o['no-transforms']) opts.transforms = false;
@@ -329,19 +357,50 @@ async function resolveOutDir(out, count) {
 }
 
 async function keyFrom(value, file, env, what) {
-  if (value !== undefined && file !== undefined) throw new UsageError(`Give the ${what.split(' (')[0]} only once`);
+  const name = what.split(' (')[0];
+  if (value !== undefined && file !== undefined) throw new UsageError(`Give the ${name} only once`);
+  if (value === '') throw new UsageError(`The ${name} is empty`);
   if (value !== undefined) return value;
-  if (file !== undefined) return (await readFile(file, 'utf8')).replace(/\r?\n$/, '');
+  if (file !== undefined) return keyFile(file, name);
   if (process.env[env]) return process.env[env];
   throw new UsageError(`Missing ${what}`);
 }
 
-async function write(target, bytes, atomic) {
+/**
+ * A key file's bytes, as they are (so binary keys work, and a text file gives the same key
+ * as the text itself): only one trailing newline and a leading UTF-8 BOM are removed.
+ */
+async function keyFile(file, name) {
+  let bytes;
+  try {
+    bytes = new Uint8Array(await readFile(file));
+  } catch (err) {
+    throw new UsageError(`Cannot read the ${name} file ${file}: ${err.code === 'ENOENT' ? 'no such file' : err.message}`);
+  }
+  if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) bytes = bytes.subarray(3);
+  if (bytes.at(-1) === 0x0a) bytes = bytes.subarray(0, bytes.at(-2) === 0x0d ? -2 : -1);
+  if (!bytes.length) throw new UsageError(`The ${name} file ${file} is empty`);
+  return bytes;
+}
+
+/**
+ * `inPlace` replaces the file atomically: a symlink's target (the link stays a link), with
+ * the permissions it had.
+ */
+async function write(target, bytes, inPlace) {
   if (target === '-') { process.stdout.write(bytes); return; }
-  if (!atomic) { await writeFile(target, bytes); return; }
-  const tmp = `${target}.pixmix-tmp`;
-  await writeFile(tmp, bytes);
-  await rename(tmp, target);
+  if (!inPlace) { await writeFile(target, bytes); return; }
+  const real = await realpath(target);
+  const { mode } = await stat(real);
+  const tmp = `${real}.pixmix-tmp`;
+  try {
+    await writeFile(tmp, bytes, { mode });
+    await chmod(tmp, mode); // writeFile's mode is filtered by the umask
+    await rename(tmp, real);
+  } catch (err) {
+    await rm(tmp, { force: true });
+    throw err;
+  }
 }
 
 async function readStdin() {
@@ -365,9 +424,9 @@ function limitsFrom(o) {
   return limits;
 }
 
-function int(v, name) {
+function int(v, name, min, max) {
   const n = Number(v);
-  if (!Number.isInteger(n)) throw new UsageError(`${name} must be an integer`);
+  if (!Number.isInteger(n) || n < min || n > max) throw new UsageError(`${name} must be an integer from ${min} to ${max}`);
   return n;
 }
 

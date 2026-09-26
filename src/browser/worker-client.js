@@ -5,11 +5,15 @@
 import { compute } from './compute.js';
 import { SCRIPT_BASE } from '../core/script-base.js';
 import { PixmixError, WrongKeyError } from '../core/params.js';
+import { jxlSettings } from '../formats/jxl/load.js';
+import { watermarkSettings } from '../watermark/load.js';
+import { metadataSettings } from '../meta/load.js';
 
 /* global __PIXMIX_WORKER__ */
 const WORKER = typeof __PIXMIX_WORKER__ !== 'undefined' ? __PIXMIX_WORKER__ : new URL('./worker.js', import.meta.url).href;
 
 let worker = null;
+let sent = {}; // the configure*() settings the worker has
 let broken = false;
 let nextId = 1;
 const pending = new Map();
@@ -31,6 +35,7 @@ function start(url) {
     e.preventDefault?.();
     broken = true;
     worker = null;
+    sent = {};
     for (const p of pending.values()) p.fallback();
     pending.clear();
   };
@@ -45,15 +50,26 @@ function rebuildError({ name, message, code }) {
 }
 
 /**
+ * What configureJxl / configureWatermarks / configureMetadata were given on this page and
+ * the worker has not seen yet (they would otherwise apply only to the page's copies).
+ */
+function newSettings() {
+  const now = { jxl: jxlSettings(), watermark: watermarkSettings(), metadata: metadataSettings() };
+  const changed = Object.fromEntries(Object.entries(now).filter(([k, v]) => v !== sent[k] && Object.keys(v).length));
+  sent = now;
+  return Object.keys(changed).length ? changed : undefined;
+}
+
+/**
  * @param {Uint8Array} bytes
- * @param {{animated?: boolean, worker?: boolean|string, limits?: object, watermark?: object|'embedded'|null,
- *   metadata?: object|string}} [opts]
+ * @param {{animated?: boolean, effect?: string, worker?: boolean|string, limits?: object,
+ *   watermark?: object|'embedded'|null, metadata?: object|string, pngOrientation?: boolean}} [opts]
  *        worker false: inline; a string: the worker script URL. limits: see core/limits.js (plain
  *        data, so it crosses). watermark: compiled, or 'embedded'. metadata: a policy as given
- *        (plain data too)
+ *        (plain data too). The rest: see compute()
  */
-export function computeAnywhere(bytes, key, { animated = true, worker: use = true, limits, watermark = null, metadata } = {}) {
-  const inline = () => compute(bytes, key, { animated, limits, watermark, metadata });
+export function computeAnywhere(bytes, key, { worker: use = true, ...opts } = {}) {
+  const inline = () => compute(bytes, key, opts);
   if (!use || broken || typeof Worker === 'undefined') return inline();
   try {
     worker ??= start(typeof use === 'string' ? use : undefined);
@@ -64,6 +80,7 @@ export function computeAnywhere(bytes, key, { animated = true, worker: use = tru
   return new Promise((resolve, reject) => {
     const id = nextId++;
     pending.set(id, { resolve, reject, fallback: () => inline().then(resolve, reject) });
-    worker.postMessage({ id, bytes, key, animated, limits, watermark, metadata }); // copied, so the fallback still has it
+    // Copied, so the fallback still has it.
+    worker.postMessage({ id, bytes, key, opts, settings: newSettings() });
   });
 }

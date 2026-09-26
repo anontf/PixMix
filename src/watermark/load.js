@@ -2,7 +2,7 @@
 // In the dist bundles it is a separate file (pixmix-watermark.mjs) next to the bundle, so
 // decoders only fetch it when a watermark is actually drawn.
 
-import { SCRIPT_BASE } from '../core/script-base.js';
+import { SCRIPT_BASE, absoluteModuleUrl } from '../core/script-base.js';
 
 /* global __PIXMIX_WATERMARK_CHUNK__ */
 const CHUNK = typeof __PIXMIX_WATERMARK_CHUNK__ !== 'undefined' ? __PIXMIX_WATERMARK_CHUNK__ : new URL('./paint.js', import.meta.url).href;
@@ -12,8 +12,12 @@ let pending = null;
 
 /** Points pixmix at pixmix-watermark.mjs when it is not served next to the bundle. */
 export function configureWatermarks({ moduleUrl: url } = {}) {
-  if (url) { moduleUrl = url; pending = null; }
+  if (url) { moduleUrl = absoluteModuleUrl(url, import.meta.url); pending = null; settings = { moduleUrl }; }
 }
+
+let settings = {};
+/** What configureWatermarks was given, as plain data (for the reveal's Web Worker). */
+export const watermarkSettings = () => settings;
 
 /** @returns {Promise<typeof import('./paint.js')>} */
 export function loadPainter() {

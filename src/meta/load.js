@@ -2,7 +2,7 @@
 // encoder imports them directly and registers them here; the browser decoder only fetches
 // them (dist/pixmix-metadata.mjs, next to the bundle) when a metadata policy is used.
 
-import { SCRIPT_BASE } from '../core/script-base.js';
+import { SCRIPT_BASE, absoluteModuleUrl } from '../core/script-base.js';
 
 /* global __PIXMIX_METADATA_CHUNK__ */
 const CHUNK = typeof __PIXMIX_METADATA_CHUNK__ !== 'undefined' ? __PIXMIX_METADATA_CHUNK__ : new URL('./apply.js', import.meta.url).href;
@@ -13,8 +13,12 @@ let pending = null;
 
 /** Points pixmix at pixmix-metadata.mjs when it is not served next to the bundle. */
 export function configureMetadata({ moduleUrl: url } = {}) {
-  if (url) { moduleUrl = url; pending = null; }
+  if (url) { moduleUrl = absoluteModuleUrl(url, import.meta.url); pending = null; settings = { moduleUrl }; }
 }
+
+let settings = {};
+/** What configureMetadata was given, as plain data (for the reveal's Web Worker). */
+export const metadataSettings = () => settings;
 
 /** For code that imports the tools itself: later loads (and sync callers) use these. */
 export function provideMetadataTools(tools) {

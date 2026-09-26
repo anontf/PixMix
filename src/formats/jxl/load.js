@@ -1,7 +1,7 @@
 // Lazy loader for the JPEG XL codec module. In the dist bundles the codec is a separate
 // file (pixmix-jxl.mjs) next to the bundle; from source it is ./codec.js.
 
-import { SCRIPT_BASE } from '../../core/script-base.js';
+import { SCRIPT_BASE, absoluteModuleUrl } from '../../core/script-base.js';
 
 /* global __PIXMIX_JXL_CHUNK__ */
 // From source, codec.js sits next to this file; in bundles the chunk sits next to the bundle.
@@ -10,6 +10,7 @@ const BASE = SCRIPT_BASE;
 
 let moduleUrl = null;
 let pending = null;
+let settings = {};
 
 /**
  * Points pixmix at the JPEG XL codec module (and optionally its .wasm files) when they are
@@ -18,9 +19,14 @@ let pending = null;
  *   decoderWasm?: string|Uint8Array}} opts  encoderWasmNoSimd: for engines without WebAssembly SIMD
  */
 export async function configureJxl({ moduleUrl: url, ...wasm } = {}) {
-  if (url) { moduleUrl = url; pending = null; }
+  if (url) { moduleUrl = absoluteModuleUrl(url, import.meta.url); pending = null; }
+  for (const k of Object.keys(wasm)) if (wasm[k] instanceof URL) wasm[k] = wasm[k].href;
+  if (url || Object.keys(wasm).length) settings = { ...settings, ...(url ? { moduleUrl } : {}), ...wasm };
   if (Object.keys(wasm).length) (await loadJxlCodec()).configure(wasm);
 }
+
+/** Everything configureJxl was given, as plain data (for the reveal's Web Worker). */
+export const jxlSettings = () => settings;
 
 /** @returns {Promise<typeof import('./codec.js')>} */
 export function loadJxlCodec() {

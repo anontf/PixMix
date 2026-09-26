@@ -17,7 +17,7 @@
 // image, a `pmWs` box holds the pixels under a watermark drawn on the scrambled image (pixel
 // route; the JPEG route keeps both in the JPEG's APP15 segments, and mirrors pmWm in a box).
 
-import { readJxl, writeJxl, wrapCodestream, readJxlHeader, isJxl } from './container.js';
+import { readJxl, writeJxl, wrapCodestream, readJxlHeader, isJxl, extraChannelsNote } from './container.js';
 import { loadJxlCodec } from './load.js';
 import { computeLayout, applyMap } from '../../core/layout.js';
 import {
@@ -88,6 +88,8 @@ export function reencodeNotes(header) {
   if (header.lossy) notes.push('lossy compression (re-encoded losslessly from the decoded pixels; the file grows)');
   if (highPrecision(header) && header.animated) notes.push(`${header.float ? 'floating-point' : `${header.bits}-bit`} precision (reduced to 8-bit; animations are 8-bit)`);
   else if (header.float || header.bits > 16) notes.push(`${header.float ? 'floating-point' : `${header.bits}-bit`} precision (reduced to 16-bit)`);
+  const extra = extraChannelsNote(header);
+  if (extra) notes.push(extra);
   return notes;
 }
 

@@ -8,7 +8,7 @@ import {
   rebuiltJpegMatches,
 } from './formats/jxl/index.js';
 import { readJxl, readJxlHeader } from './formats/jxl/container.js';
-import { convert, convertAsync, decodeForJxl, targetFormat, OUTPUT_FORMATS } from './convert/index.js';
+import { convert, convertAsync, decodeForJxl, targetFormat, OUTPUT_FORMATS, sizeNotes } from './convert/index.js';
 import { PixmixError } from './core/params.js';
 import { withLimits } from './core/limits.js';
 import { readWebpMetadata } from './meta/webp.js';
@@ -150,8 +150,12 @@ export async function encodeAsync(input, opts) {
     // JPEG XL to JPEG XL, pixel route: the codestream is encoded again, so a metadata
     // policy applies to the ICC profile as well as the boxes.
     const converted = await convertAsync(bytes, { ...withFormat, metadata: undefined });
-    converted.dropped.push(...reencodeNotes(readJxlHeader(readJxl(converted.bytes, opts.limits).codestream, opts.limits)));
+    const header = readJxlHeader(readJxl(converted.bytes, opts.limits).codestream, opts.limits);
+    converted.dropped.push(...reencodeNotes(header));
     let { image, boxes } = await jxlForScramble(converted.bytes, opts);
+    if (header.animated && !image.frames) converted.dropped.push('animation (a single frame: written as a still image, without its duration and loop count)');
+    // Decoded and encoded again: say what was carried, not "all metadata".
+    Object.assign(converted, { decoder: 'jxl-oxide', transferred: reencodedParts(image, boxes), notes: sizeNotes(bytes, 'jxl', 'jxl') });
     if (opts.metadata) {
       const parts = applyJxlParts({ boxes, icc: image.icc ?? null }, opts.metadata, { limits: opts.limits, stripThumbnails: !opts.keepThumbnails });
       ({ boxes } = parts);
@@ -164,6 +168,19 @@ export async function encodeAsync(input, opts) {
   const converted = await convertAsync(bytes, withFormat);
   opts.onConvert?.(converted);
   return SCRAMBLERS[converted.format].scramble(converted.bytes, opts);
+}
+
+/** What the pixel route carries into the re-encoded JPEG XL, for the report. */
+function reencodedParts(image, boxes) {
+  const names = { Exif: 'EXIF', 'xml ': 'XMP', jumb: 'JUMBF' };
+  const out = image.icc ? ['ICC profile'] : [];
+  if (image.frames) out.push('animation');
+  for (const b of boxes) {
+    const type = b.type === 'brob' ? String.fromCharCode(...b.data.subarray(0, 4)) : b.type;
+    const name = names[type] ?? `box ${type.trim()}`;
+    if (!out.includes(name)) out.push(name);
+  }
+  return out;
 }
 
 /**

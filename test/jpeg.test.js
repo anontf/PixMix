@@ -258,6 +258,7 @@ test('keepThumbnails: data after the image is reported as dropped, and the MPF i
   // Nothing to report: the file stays as it is.
   const plain = convert(new Uint8Array(base), { keepThumbnails: true });
   assert.deepEqual(plain.dropped, []);
+  assert.deepEqual(plain.notes, []);
   assert.equal(plain.bytes.length, base.length);
 });
 

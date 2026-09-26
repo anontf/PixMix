@@ -174,19 +174,54 @@ async function decodeJob(bytes, job, { keepThumbnails = false, limits, metadata 
  * Lossless output (PNG, or JPEG XL on the pixel route) of a lossy source is several times
  * larger than the source even before scrambling; say so, and what stays small.
  */
-function sizeNotes(bytes, from, target) {
-  const lossy = from === 'jpeg' || from === 'avif' || from === 'heic'
-    || (from === 'webp' && hasChunk(bytes, 'VP8 '))
+export function sizeNotes(bytes, from, target) {
+  const recompressed = from === 'jxl' && isRecompressedJpeg(bytes);
+  const lossy = from === 'jpeg' || from === 'heic' || recompressed
+    || (from === 'avif' && !isLosslessAvif(bytes))
+    || (from === 'webp' && webpChunks(bytes).includes('VP8 '))
     || (from === 'jxl' && isLossyJxl(bytes));
   if (!lossy || target === 'jpeg') return [];
-  const smaller = from === 'jpeg' ? 'format "jpeg" (or "jxl" without a pixel/block mode, the JPEG route)' : 'format "jpeg" with a quality setting';
-  return [`${from} is lossy: lossless ${target} output is typically 3-8 times its size even unscrambled; ${smaller} stays small`];
+  const smaller = from === 'jpeg' ? 'format "jpeg" (or "jxl" without a pixel/block mode, the JPEG route)'
+    : !recompressed ? 'format "jpeg" with a quality setting'
+      : target === 'jxl' ? 'the JPEG route (no pixel/block mode) or format "jpeg"'
+        : 'format "jxl" without a pixel/block mode (the JPEG route) or "jpeg"';
+  const what = recompressed ? 'jxl (a recompressed JPEG) is lossy' : `${from} is lossy`;
+  return [`${what}: lossless ${target} output is typically 3-8 times its size even unscrambled; ${smaller} stays small`];
 }
 
-function hasChunk(bytes, fourcc) {
-  const tag = [...fourcc].map((c) => c.charCodeAt(0));
-  for (let i = 12; i + 4 <= Math.min(bytes.length, 64); i++) if (tag.every((c, k) => bytes[i + k] === c)) return true;
+/** The chunk ids of a WebP (RIFF) file, in order. */
+function webpChunks(bytes) {
+  const ids = [];
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  for (let pos = 12; pos + 8 <= bytes.length && ids.length < 1024;) {
+    ids.push(String.fromCharCode(...bytes.subarray(pos, pos + 4)));
+    const len = dv.getUint32(pos + 4, true);
+    pos += 8 + len + (len & 1);
+  }
+  return ids;
+}
+
+/**
+ * AVIF is lossless only when coded as RGB (the identity matrix in its nclx colour box):
+ * every other lossless coding still loses to the YUV conversion.
+ */
+function isLosslessAvif(bytes) {
+  const end = Math.min(bytes.length, 1 << 16);
+  for (let i = 4; i + 15 <= end; i++) {
+    if (bytes[i] === 0x63 && bytes[i + 1] === 0x6f && bytes[i + 2] === 0x6c && bytes[i + 3] === 0x72 // colr
+      && bytes[i + 4] === 0x6e && bytes[i + 5] === 0x63 && bytes[i + 6] === 0x6c && bytes[i + 7] === 0x78) { // nclx
+      return ((bytes[i + 12] << 8) | bytes[i + 13]) === 0; // matrix_coefficients
+    }
+  }
   return false;
+}
+
+function isRecompressedJpeg(bytes) {
+  try {
+    return readJxl(bytes).boxes.some((b) => b.type === 'jbrd');
+  } catch {
+    return false;
+  }
 }
 
 function isLossyJxl(bytes) {
@@ -242,7 +277,7 @@ function prepare(bytes, { format, decoders = [], keepThumbnails = false, limits 
   const target = targetFormat(from, format);
   if (from === target) {
     const { bytes: out, dropped } = sanitize(from, bytes, limits, keepThumbnails);
-    return { done: { bytes: out, format: target, from, decoder: 'none', transferred: ['all metadata'], dropped } };
+    return { done: { bytes: out, format: target, from, decoder: 'none', transferred: ['all metadata'], dropped, notes: [] } };
   }
   // Plugins first, so a caller can override a built-in (e.g. sharp for faster JPEG).
   const decoder = [...decoders, ...BUILTIN_DECODERS].find((d) => d.formats.includes(from));

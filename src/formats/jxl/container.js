@@ -126,7 +126,7 @@ function bitDepth(r) {
 export function readJxlHeader(codestream, limits) {
   const r = new Bits(codestream);
   if (r.u(16) !== 0x0aff) throw new PixmixError('Not a JPEG XL codestream', 'BAD_JXL');
-  const info = { ...sizeHeader(r), orientation: 1, animated: false, bits: 8, float: false, alpha: false, lossy: null, srgb: null };
+  const info = { ...sizeHeader(r), orientation: 1, animated: false, bits: 8, float: false, alpha: false, extraChannels: [], lossy: null, srgb: null };
   checkPixels(info.width, info.height, limits);
   try {
     if (r.bool()) { info.lossy = true; info.srgb = true; return info; } // all_default: 8-bit sRGB, XYB
@@ -151,12 +151,14 @@ export function readJxlHeader(codestream, limits) {
     r.bool(); // modular_16_bit_buffer_sufficient
     const extra = r.u32([[0, 0], [1, 0], [2, 4], [1, 12]]);
     for (let i = 0; i < extra; i++) {
-      if (r.bool()) { info.alpha = true; continue; } // d_alpha: default alpha channel
+      if (r.bool()) { if (info.alpha) info.extraChannels.push('alpha'); info.alpha = true; continue; } // d_alpha: default alpha channel
       const type = r.enum();
       bitDepth(r);
       r.u32([[0, 0], [3, 0], [4, 0], [1, 3]]); // dim_shift
       const nameLen = r.u32([[0, 0], [0, 4], [16, 5], [48, 10]]);
       r.u(nameLen * 8);
+      // Only the first alpha channel is decoded; the others are named for the report.
+      if (type !== 0 || info.alpha) info.extraChannels.push(EXTRA_CHANNELS[type] ?? 'unknown');
       if (type === 0) { info.alpha = true; r.bool(); }
       else if (type === 2) r.u(64); // spot colour: 4 x f16
       else if (type === 5) r.u32([[1, 0], [0, 2], [3, 4], [19, 8]]);
@@ -167,6 +169,15 @@ export function readJxlHeader(codestream, limits) {
     // leave the remaining fields unknown
   }
   return info;
+}
+
+// Extra channel types other than alpha, by number (what decoding to RGBA leaves out).
+const EXTRA_CHANNELS = ['alpha', 'depth', 'spot colour', 'selection mask', 'black (CMYK)', 'CFA', 'thermal'];
+
+/** The report entry for extra channels that decoding to RGBA(+alpha) leaves out, or null. */
+export function extraChannelsNote(header) {
+  const names = [...new Set(header.extraChannels ?? [])];
+  return names.length ? `extra channels (${header.extraChannels.length}: ${names.join(', ')}; only colour and one alpha channel are kept)` : null;
 }
 
 const CUSTOM_XY = [[0, 19], [524288, 19], [1048576, 20], [2097152, 21]];

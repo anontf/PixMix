@@ -287,7 +287,13 @@ Some things are dropped, and the report says so:
 - precision above 8 bits when writing JPEG (PNG and JPEG XL keep 16 bits), and in
   animations;
 - PNG text chunks other than comments, and gamma without an ICC profile, when writing JPEG;
-- transparency when writing JPEG (flattened onto `background`).
+- transparency when writing JPEG (flattened onto `background`);
+- JPEG XL extra channels other than alpha (spot colours, depth, …), and the animation of a
+  one-frame animated JPEG XL (it becomes a still).
+
+Every report has `notes` (a list, often empty): a lossless output of a lossy source (JPEG,
+lossy WebP, AVIF unless coded as RGB, HEIC, lossy or recompressed-JPEG JPEG XL) gets a note
+that it will be several times larger, and what stays small.
 
 A PNG gets the smallest colour type that loses nothing: grey, palette (1–8 bit), RGB or
 RGBA. Palette output also compresses far better once the pixels are scrambled. A JPEG is

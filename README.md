@@ -2,7 +2,7 @@
 
 Keyed, reversible pixel scrambling. A scrambled image is still a completely valid image,
 so any viewer shows it, just shuffled:
-- same dimensions;
+- same dimensions (one exception: see "JPEG" under "How it works");
 - PNG: same bit depth and colour type, every metadata chunk copied byte for byte;
 - JPEG: same quantisation tables and metadata segments;
 - JPEG XL: same metadata boxes. It is either re-encoded losslessly, or it holds a
@@ -19,19 +19,39 @@ them, or stripped, edited and set by a metadata policy (see "Metadata").
 This is obfuscation, not encryption: a permutation keeps the colour histogram, and in the
 browser use case the key ships to the visitor.
 
+## Contents
+
+- [Quick start](#quick-start)
+- [CLI](#cli)
+- [Bundles](#bundles)
+- [Encoder (servers)](#encoder-servers): [options](#options), [errors](#errors),
+  [untrusted input](#untrusted-input), [animation](#animation),
+  [embedded previews](#embedded-previews), [input formats and metadata](#input-formats-and-metadata)
+- [Decoder (websites)](#decoder-websites)
+- [JPEG XL](#jpeg-xl)
+- [Watermarks](#watermarks)
+- [Metadata](#metadata)
+- [Dev server](#dev-server)
+- [How it works](#how-it-works), [size and speed](#size-and-speed)
+- [Fuzzing](#fuzzing), [browser tests](#browser-tests), [roadmap](#roadmap),
+  [third-party code](#third-party-code)
+
 ## Quick start
+
+Needs Node `^20.16.0 || >=22.3.0` (the `engines` field).
 
 ```sh
 npm install
-npm test            # PngSuite and JPEG round trips, conversion, CLI, browser reveal (fake DOM)
+npm test              # PngSuite and JPEG round trips, conversion, CLI, browser reveal (fake DOM)
 npm run test:browser  # the same in real Chromium and WebKit: decoder, worker, lab, demo site (see below)
-npm run fuzz        # the long fuzz run (see "Fuzzing")
-npm run serve       # builds dist/ and starts http://127.0.0.1:8080
-npm run serve:lan   # the same, reachable from other machines on the network (HOST=0.0.0.0)
+npm run fuzz          # the long fuzz run (see "Fuzzing")
+npm run serve         # builds dist/ and starts http://127.0.0.1:8080
+npm run serve:lan     # the same, reachable from other machines on the network (HOST=0.0.0.0)
 ```
 
-The dev server has no authentication: anyone who can reach it can encode, decode and publish
-to the demo gallery. Only use `serve:lan` on a network you trust.
+The dev server has no authentication: anyone who can reach it can encode, decode, publish
+to the demo gallery and change the watermarks and metadata profiles on disk. Only use
+`serve:lan` on a network you trust. Its API is described under "Dev server".
 
 - **Lab** (`/`): load an image in any format, or a generated PNG/JPEG/WebP sample (a PNG
   where the browser can't encode WebP, as in Safari).
@@ -40,9 +60,10 @@ to the demo gallery. Only use `serve:lan` on a network you trust.
   - Create and edit watermarks, with a live preview, and save them to `watermarks/`.
   - Create and edit metadata profiles, with the image's metadata before and after, and save
     them to `metadata-profiles/`; pick one when encoding and when decoding.
-  - In both editors, Save only replaces the file that was loaded: a new one, a duplicate or
-    a renamed one is saved under its own id (the original stays), and an id that is already
-    taken asks before replacing that file.
+  - In both editors, Save replaces only the file that was loaded. A new definition, a
+    duplicate, or a loaded one whose id was changed is saved as a new file under its id,
+    and the file it came from stays (a "save as", not a rename; delete the old one
+    separately). If that id is already taken, the lab asks before replacing that file.
 - **Demo site** (`/site.html`): images published from the lab, served scrambled and
   revealed by the standalone `<script>` decoder as they scroll into view.
 
@@ -54,9 +75,9 @@ pixmix encode photos/*.jpg -o scrambled/      # photo.jpg -> scrambled/photo.scr
 pixmix encode logo.png --mode block --block 16
 pixmix encode shot.png --format jpeg --quality 85
 pixmix encode art.png --format jxl --mode block --block 16
-pixmix encode photo.jpg --format jxl               # JPEG route: stays lossy-small
+pixmix encode photo.jpg --format jxl          # JPEG route: stays lossy-small
 pixmix decode scrambled/photo.scrambled.jpg   # -> scrambled/photo.jpg
-pixmix rekey --in-place --to-file new.key scrambled/*
+pixmix rekey --in-place --to-file new.key scrambled/*.scrambled.jpg
 pixmix inspect photo.jpg scrambled/photo.scrambled.jpg
 cat in.webp | pixmix encode -o - - > out.png  # stdin/stdout
 pixmix encode photo.jpg --watermark vivi-gold # carry a watermark for the decoder to draw
@@ -66,31 +87,42 @@ pixmix decode photo.scrambled.jpg --watermark my-mark.json
 pixmix encode photo.jpg --metadata vivi-web   # strip everything, credit Vivi (see "Metadata")
 ```
 
-For each file it reports how the input was decoded and what metadata was kept or dropped.
-It never overwrites a file unless you pass `-f` (or `rekey --in-place`, which keeps symlinks
-and permissions), and never writes two inputs to one output name in a run. A `--key-file` is
-used as bytes, without one trailing newline or a leading UTF-8 BOM. Options that do not
-apply to the command are usage errors. Exit codes: 0 = success, 1 = some files
-failed (the others are still processed), 2 = usage error. If `sharp` is installed, the CLI
-uses it for WebP, AVIF, HEIC and TIFF (turn this off with `--no-sharp`). `pixmix --help`
-lists every option.
+- For each file it reports how the input was decoded and what metadata was kept or dropped.
+- It never overwrites a file unless you pass `-f` (or `rekey --in-place`, which replaces
+  a symlink's target and keeps the permissions), and never writes two inputs to one output
+  name in a run.
+- A `--key-file` (and `--to-file`) is read as bytes, so binary keys work and a text file
+  gives the same key as its text. One trailing newline (LF or CRLF) and a leading UTF-8
+  BOM are removed. A binary key whose first bytes are `EF BB BF` loses them, so give such a
+  key another first byte, or pass it through the API as a `Uint8Array`.
+- Options are checked strictly: a flag that does not apply to the command (`--quality` on
+  decode, say) or a value out of range (`--effort 0`) is a usage error.
+- Exit codes: 0 = success, 1 = some files failed (the others are still processed), 2 =
+  usage error.
+- If `sharp` is installed, the CLI uses it for WebP, AVIF, HEIC and TIFF (turn this off
+  with `--no-sharp`).
+
+`pixmix --help` lists every option.
 
 ## Bundles
 
-`npm run build` writes self-contained files (fflate, jpeg-js and omggif inlined; no runtime deps):
+`npm run build` writes self-contained files (fflate, jpeg-js and omggif inlined; no runtime
+deps). Sizes as the build prints them (KiB), and gzipped:
 
-| File | Format | Use |
-| --- | --- | --- |
-| `dist/pixmix-decoder.min.js` | IIFE → `window.PixMix` | drop into any website |
-| `dist/pixmix-decoder.js` | ESM | bundlers / `<script type="module">` |
-| `dist/pixmix-worker.mjs` | ESM (Web Worker) | used by both decoders to decode off the main thread |
-| `dist/pixmix-watermark.mjs` | ESM | draws watermarks, loaded on demand (36 KB; 16 KB gzipped) |
-| `dist/pixmix-metadata.mjs` | ESM | metadata policies in the decoders, loaded on demand (83 KB; 32 KB gzipped) |
-| `dist/pixmix-encoder.mjs` | ESM, platform-neutral | Node, Deno, Bun, workers, browsers |
-| `dist/pixmix-encoder.cjs` | CommonJS | `require()`-based servers |
-| `dist/pixmix-jxl.mjs` + `pixmix-jxl-{enc,dec}.wasm` | ESM + WASM | JPEG XL support, loaded on demand |
+| File | Format | Size | Use |
+| --- | --- | --- | --- |
+| `dist/pixmix-decoder.min.js` | IIFE → `window.PixMix` | 102 KB; 40 KB gzipped | drop into any website |
+| `dist/pixmix-decoder.js` | ESM | 184 KB; 51 KB gzipped | bundlers / `<script type="module">` |
+| `dist/pixmix-worker.mjs` | ESM (Web Worker) | 83 KB; 32 KB gzipped | used by both decoders to decode off the main thread |
+| `dist/pixmix-watermark.mjs` | ESM | 38 KB; 18 KB gzipped | draws watermarks, loaded on demand |
+| `dist/pixmix-metadata.mjs` | ESM | 87 KB; 33 KB gzipped | metadata policies in the decoders, loaded on demand |
+| `dist/pixmix-encoder.mjs` | ESM, platform-neutral | 439 KB; 117 KB gzipped | Node, Deno, Bun, workers, browsers |
+| `dist/pixmix-encoder.cjs` | CommonJS | 441 KB; 118 KB gzipped | `require()`-based servers |
+| `dist/pixmix-jxl.mjs` + `pixmix-jxl-{enc,enc-nosimd,dec}.wasm` | ESM + WASM | see below | JPEG XL support, loaded on demand |
 
-The decoder bundle contains no encoding code; the encoder bundle has no DOM code.
+The decoder bundles contain no encoding code. The encoder bundles have no DOM code, and no
+decoding either: to restore images in Node, import the package itself (`pixmix`, which
+exports everything) or `pixmix/decoder`.
 
 Deploy `pixmix-watermark.mjs` next to the decoder if you use watermarks (or call
 `configureWatermarks({ moduleUrl })`); it is only fetched when one is drawn. Likewise
@@ -104,16 +136,18 @@ A decoder loaded from another origin (a CDN) starts the worker through a same-or
 
 JPEG XL support is optional:
 - Copy the `pixmix-jxl*` files next to whichever bundle you deploy, or call
-  `configureJxl({ moduleUrl, encoderWasm, encoderWasmNoSimd, decoderWasm })`.
+  `configureJxl({ moduleUrl, encoderWasm, encoderWasmNoSimd, decoderWasm })`. The
+  `configure*()` calls apply to the decoder's Web Worker too.
   (`pixmix-jxl-enc.LICENSES.txt` holds the encoder's third-party licences.)
-- Nothing is fetched until a JPEG XL image shows up.
-- Revealing images only needs the decoder WASM (1.8 MB; 580 KB gzipped, 420 KB with
-  Brotli). The encoder WASM is fetched only to write JPEG XL: encoding, including the JPEG
-  route, which works in browsers too, and `decodeAsync()` of a JPEG XL file, which returns
-  JPEG XL.
+- Nothing is fetched until a JPEG XL image shows up. `pixmix-jxl.mjs` itself is 20 KB (8 KB
+  gzipped).
+- Revealing images only needs the decoder WASM, `pixmix-jxl-dec.wasm` (1.8 MB; 590 KB
+  gzipped, 420 KB with Brotli). The encoder WASM is fetched only to write JPEG XL:
+  encoding, including the JPEG route, which works in browsers too, and `decodeAsync()` of a
+  JPEG XL file, which returns JPEG XL.
 - The encoder comes in two builds, and each engine fetches only the one it can run:
-  `pixmix-jxl-enc.wasm` uses WebAssembly SIMD (2.3 MB; 880 KB gzipped, 670 KB with
-  Brotli); `pixmix-jxl-enc-nosimd.wasm` (2.4 MB; 925 KB gzipped, 690 KB with Brotli) is for
+  `pixmix-jxl-enc.wasm` uses WebAssembly SIMD (2.3 MB; 890 KB gzipped, 670 KB with
+  Brotli); `pixmix-jxl-enc-nosimd.wasm` (2.4 MB; 935 KB gzipped, 690 KB with Brotli) is for
   engines without SIMD, such as some WebKit builds. pixmix checks with
   `WebAssembly.validate` on a tiny SIMD module.
 
@@ -123,45 +157,17 @@ JPEG XL support is optional:
 import { encode, rekey, inspect } from './dist/pixmix-encoder.mjs';
 
 const scrambled = encode(pngBytes, { key: 'site-key' });                      // PNG, 16 px tiles, flipped
-const tiles     = encode(pngBytes, { key: 'site-key', mode: 'block', block: 16 });
+const noise     = encode(pngBytes, { key: 'site-key', mode: 'pixel' });       // every pixel shuffled
 const photo     = encode(jpegBytes, { key: 'site-key' });                      // JPEG, lossless
 const asJpeg    = encode(gifBytes, { key: 'site-key', format: 'jpeg', quality: 85 });
 const rotated   = rekey(scrambled, { from: 'site-key', to: 'new-key' });       // lossless
-inspect(scrambled); // { format, width, height, scrambled: true, mode, … }
+inspect(scrambled); // { format, width, height, scrambled: true, mode, block, … }
 ```
-
-Options:
-- `key`: string or `Uint8Array`.
-- `format`: `png`, `jpeg` or `jxl`. The default is the input's own format when pixmix can
-  write it, otherwise PNG. So JPEG stays JPEG, JPEG XL stays JPEG XL, and GIF/WebP/AVIF
-  become PNG.
-- `mode`, `block`: `pixel`, or `block` with a tile size of 2–4096.
-  - PNG and JPEG XL use them; JPEG is always `mcu`.
-  - An image (or animation frame) that would get only a few whole tiles, such as a 16×16
-    icon at the default size, gets the largest smaller tile size that shuffles it properly
-    (pixel mode when even 2 px tiles are too few). The marker, and `inspect`, give the size
-    used.
-  - JPEG XL can also be `mcu`, the JPEG route. That's the default when the source is a
-    JPEG, or a JPEG XL made from one.
-- `effort`: JPEG XL encoder effort, 1–9. Defaults to 2 in pixel mode and 7 in block mode.
-- `level`: PNG only, the zlib level, 0–9.
-- `transforms`: JPEG and JPEG-route JPEG XL, default `true`. Also flips and rotates each
-  MCU, still lossless.
-- `quality`, `subsampling`, `background`: only when converting to JPEG from another format.
-  Defaults are 90, `4:2:0` (or `4:2:2` / `4:4:4`), and `#ffffff` as the colour transparency
-  is flattened onto.
-- `keepThumbnails`: default `false`. See "Embedded previews" below.
-- `decoders`: extra input decoders.
-- `onConvert(report)`: reports how the input was decoded and what metadata was kept or
-  dropped: `{ format, from, decoder, transferred, dropped }`.
-- `watermark`, `visibleWatermark`: see "Watermarks" below.
-- `metadata`: a metadata policy for the scrambled file, see "Metadata" below.
-- `limits`: resource limits, see "Untrusted input" below.
 
 `encode` is synchronous and handles PNG, JPEG and GIF on its own. JPEG XL, in or out,
 goes through `encodeAsync`, `decodeAsync` and `rekeyAsync`, because its codec is WASM loaded
-on first use. The sync functions throw a clear error pointing at the async ones. Use `encodeAsync` with a
-decoder plugin for everything else:
+on first use; the sync functions throw `ASYNC_DECODER`, pointing at the async ones. Use
+`encodeAsync` with a decoder plugin for everything else:
 
 ```js
 import sharp from 'sharp';
@@ -170,7 +176,7 @@ import { encodeAsync, sharpDecoder } from './dist/pixmix-encoder.mjs';
 const out = await encodeAsync(webpBytes, {
   key: 'site-key',
   decoders: [sharpDecoder(sharp)],        // you pass your own sharp; pixmix doesn't depend on it
-  onConvert: (r) => console.log(r.from, r.decoder, r.transferred, r.dropped),
+  onConvert: (r) => console.log(r.from, r.decoder, r.transferred, r.dropped, r.notes),
 });
 ```
 
@@ -179,17 +185,95 @@ A plugin only claims formats it can decode (`sharpDecoder` checks libvips' loade
 leaves GIF and JPEG XL to pixmix's exact built-in decoders unless `formats` says otherwise.
 If a plugin fails on a format pixmix decodes itself, the built-in decoder takes over and
 the report's `notes` say so.
+
 `convert` / `convertAsync` produce the plain, unscrambled file the encoder would scramble
 (for JPEG XL output, along the same route: a JPEG is recompressed as the JPEG route holds
 it, unless `mode` asks for pixels). A JPEG XL made from a JPEG converts back to that JPEG,
 bit for bit, when jxl-oxide rebuilds it verifiably.
 
-Input that is already scrambled is refused with `ALREADY_SCRAMBLED` whatever the output
-format (decode it first, or use `rekey`): scrambling it again would lose the original.
-`convert` refuses it too when the format changes; converting to the same format keeps the
-marker, and the file stays restorable. Invalid option values (a `quality` that is not a
-number from 1 to 100, an unknown `subsampling`, a `transforms` that is not a boolean, …)
-throw `BAD_OPTION` before any work is done.
+Restoring: `decode(bytes, { key })` (PNG, JPEG) and `decodeAsync` (every format; JPEG XL
+comes back as lossless JPEG XL), from `pixmix` or `pixmix/decoder`. They take `level` (PNG),
+`effort` (JPEG XL, default 7), `progressive` (JPEG, default: as the original), `limits`,
+`metadata` and `onMetadata`, and `decodeAsync` also `watermark` and `resolveWatermark`
+(see "Watermarks").
+
+### Options
+
+- `key`: string or `Uint8Array`, not empty. A string with a lone surrogate is refused
+  (UTF-8 would turn it into U+FFFD, so two keys would collide).
+- `format`: `png`, `jpeg` or `jxl`. The default is the input's own format when pixmix can
+  write it, otherwise PNG. So JPEG stays JPEG, JPEG XL stays JPEG XL, and GIF/WebP/AVIF
+  become PNG.
+- `mode`, `block`: `pixel`, or `block` with a tile size of 2–4096 (default 16).
+  - PNG and JPEG XL use them; JPEG is always `mcu`, and any other mode is a `BAD_OPTION`.
+  - An image (or animation frame) that would get only a few whole tiles, such as a 16×16
+    icon at the default size, gets the largest smaller tile size that shuffles it properly
+    (pixel mode when even 2 px tiles are too few). One narrower or shorter than a tile has
+    no whole tile at all: its pixels are shuffled one by one, like the leftover strips (see
+    "How it works"). The marker, and `inspect`, give the tile size used.
+  - JPEG XL can also be `mcu`, the JPEG route. That's the default when the source is a
+    JPEG, or a JPEG XL made from one.
+- `transforms`: default `true`. Also flips and rotates each block-mode tile and each JPEG
+  MCU (4:2:2 MCUs get the 4 flips), still lossless.
+- `effort`: JPEG XL encoder effort, 1–9. Defaults to 2 in pixel mode and 7 in block mode.
+- `level`: PNG only, the zlib level, 0–9. Defaults to 6, and 1 in pixel mode (noise gains
+  nothing from slow levels).
+- `progressive`: JPEG output, `true`, `false` or `'auto'` (the default: progressive when
+  the source is a progressive JPEG, else baseline). A file with partial edge MCUs is written
+  baseline anyway (see "Partial edge MCUs" under "How it works"). The JPEG inside a
+  JPEG-route JPEG XL is always baseline.
+- `quality`, `subsampling`, `background`: only when converting to JPEG from another format.
+  Quality is a number from 1 to 100 (default 90); subsampling `4:2:0` (default), `4:2:2` or
+  `4:4:4`; background the `#rgb` / `#rrggbb` colour transparency is flattened onto (default
+  `#ffffff`).
+- `salt`: a `Uint8Array` of up to 255 bytes. By default every image gets 16 random bytes,
+  so encoding the same image twice gives different files. A fixed salt makes the output
+  reproducible (tests, deterministic builds); with the same key and image size it also
+  gives the same permutation, so leave it random otherwise.
+- `keepThumbnails`: default `false`. See "Embedded previews" below.
+- `decoders`: extra input decoders.
+- `onConvert(report)`: reports how the input was decoded and what metadata was kept or
+  dropped: `{ format, from, decoder, transferred, dropped, notes }`, plus `metadata` when a
+  policy was applied.
+- `watermark`, `visibleWatermark`: see "Watermarks" below.
+- `metadata`: a metadata policy for the scrambled file, see "Metadata" below. (`decode` and
+  `rekey` report on it through `onMetadata(report)`; `encode` through `onConvert`.)
+- `limits`: resource limits, see "Untrusted input" below.
+
+Options are validated before any work is done: an invalid value (a `level` of 10, an
+`effort` of 0, a `quality` that is not a number from 1 to 100, an unknown `subsampling`, a
+`transforms` that is not a boolean, a callback that is not a function, an unknown limit, …)
+throws `BAD_OPTION`. `undefined` always means the default; any other value, `null`
+included, must be valid.
+
+Input that is already scrambled is refused with `ALREADY_SCRAMBLED`, whatever the input and
+output formats (decode it first, or use `rekey`): scrambling it again would bury its marker,
+and with it the original. `convert` refuses it too when the format changes; converting to
+the same format keeps the marker, and the file stays restorable.
+
+### Errors
+
+Everything pixmix throws on purpose is a `PixmixError` (exported), with a `code`:
+
+| Code | When |
+| --- | --- |
+| `BAD_OPTION` | An option is invalid or does not fit the call (see "Options"): values out of range, a mode the output format doesn't have, `mode: 'mcu'` without a JPEG source, an empty key or one with a lone surrogate, an unknown limit, `rekey` to another format. |
+| `ALREADY_SCRAMBLED` | `encode` of a file that carries a pixmix marker; `convert` of one to another format. |
+| `NOT_SCRAMBLED` | `decode` or `rekey` of a file without a marker. |
+| `WRONG_KEY` | The key does not match the file's key check. Thrown as `WrongKeyError`, a subclass. |
+| `LIMIT` | A resource limit was exceeded (see "Untrusted input"). |
+| `UNSUPPORTED` | The format is unknown, or needs a decoder plugin that wasn't given; a JPEG pixmix does not handle (12-bit, lossless, arithmetic-coded, hierarchical, several frames, DNL, 2 components); `mode: 'mcu'` for a JPEG the JPEG route can't carry; a visible watermark on a JPEG XL that isn't 8-bit sRGB; a watermark on a CMYK JPEG; a metadata policy on a format other than PNG, JPEG or JPEG XL. |
+| `BAD_PNG`, `BAD_JPEG`, `BAD_GIF`, `BAD_JXL`, `BAD_<FORMAT>` | The file is damaged. A decoder's own error (jpeg-js, omggif, libvips, the JPEG XL codecs, the browser) is wrapped as `BAD_` plus the input format, e.g. `BAD_WEBP`, with the original as `cause`. |
+| `BAD_METADATA` | An invalid metadata policy or profile; the message names the problem. |
+| `BAD_WATERMARK` | An invalid watermark definition, compiled watermark or id; a carried watermark that is damaged when it is asked for (`watermark: 'embedded'`); an id to look up without `resolveWatermark`. |
+| `ASYNC_DECODER` | A sync function was given JPEG XL, an async decoder plugin, a watermark to draw, or (`decode`) a metadata policy without pixmix's metadata module loaded. |
+| `DECODER` | A decoder plugin returned the wrong amount of pixel data. |
+| `JXL_ENCODE` | libjxl failed to encode. |
+| `FETCH` | Browser decoder: the image or watermark request answered with an HTTP error. |
+| `NOT_FOUND`, `EXISTS` | The watermark and metadata profile stores (and the CLI, for an output that exists without `-f`). |
+| `PIXMIX` | A damaged pixmix marker, or one from a newer version (unknown version or flags); input that is not bytes. |
+
+The dev server answers errors as JSON `{ error, code }`, see "Dev server".
 
 ### Untrusted input
 
@@ -214,9 +298,13 @@ They are checked from the headers before anything large is allocated: PNG `IHDR`
 decoder WASM checks the size and frame count again, and caps its own allocations).
 Inflating stops at the size the `IHDR` declares, so a decompression bomb costs nothing.
 `sharpDecoder` passes `maxPixels` on as sharp's `limitInputPixels`. A violation throws a
-`PixmixError` with code `LIMIT`; `inspect` checks the same limits, so it works as a cheap
-check before the real work. Anything wrong with the file itself also throws a `PixmixError`
-(`BAD_PNG`, `BAD_JPEG`, …), including errors from jpeg-js, libvips and the JPEG XL codecs.
+`PixmixError` with code `LIMIT`. Anything wrong with the file itself also throws a
+`PixmixError` (see "Errors").
+
+`inspect` checks the same limits from the same headers, so it works as a cheap check
+before the real work, with one gap: a JPEG XL's frame count is only known once its frames
+are decoded, so for JPEG XL `inspect` cannot check `maxFrames` (or `maxTotalPixels`); the
+decoder still does.
 
 The CLI has `--max-pixels`, `--max-frames` and `--max-input-bytes`. The dev server applies
 the limits to every upload, with its 64 MiB body limit as `maxInputBytes`, and answers 413.
@@ -248,7 +336,7 @@ the limits to every upload, with its 64 MiB body limit as `maxInputBytes`, and a
   - Every frame is scrambled with its own permutation, with the frame index in the seed,
     exactly as in APNG. A zero delay becomes one tick, since JPEG XL would merge the frame
     into the next one.
-  - Animations are 8-bit.
+- Animations are 8-bit in every output format.
 - **JPEG:** converting an animation to JPEG keeps the first frame, and the report says so.
 - **In the browser,** the reveal animates frame 0, then the `<img>` gets the restored
   APNG (for an animated JPEG XL too, since most browsers can't show JPEG XL), which plays
@@ -271,51 +359,60 @@ The encoder removes all of these by default, on every route (same format, conver
 XL boxes including Brotli-compressed ones), and lists them under `dropped`. EXIF
 thumbnails and MakerNote previews are zeroed in place so every other offset stays valid;
 only complete, well-formed JPEG streams inside a MakerNote are touched. XMP previews are
-removed from the packet and the rest is written back as it was; extended XMP holding one
-goes entirely. Pass `keepThumbnails: true` to keep them. Data after the end marker can't be
-kept either way, so it is still dropped (and reported), and so is the MPF index pointing
-to it.
+removed from the packet and the rest is written back as it was; extended XMP is never
+rewritten, so extended XMP that holds a preview is dropped whole. Pass
+`keepThumbnails: true` to keep them. Data after the end marker can't be kept either way, so
+it is still dropped (and reported), and so is the MPF index pointing to it.
 
 ### Input formats and metadata
 
 When the input and output formats match (PNG → PNG, JPEG → JPEG) nothing is decoded or
-re-encoded: the scramble is lossless and the metadata is kept byte for byte. Otherwise the
-input is decoded to pixels and re-encoded:
+re-encoded: the scramble is lossless and the metadata is kept byte for byte (apart from
+the previews above). Otherwise the input is decoded to pixels and re-encoded:
 
 | Input | Decoder | Metadata source |
 | --- | --- | --- |
 | PNG | built-in | pixmix's PNG reader |
 | JPEG | built-in (jpeg-js) | pixmix's JPEG reader |
 | JPEG XL | built-in (jxl-oxide, WASM) | pixmix's box reader; the ICC profile comes from the decoder |
-| GIF | built-in (omggif). All frames when writing PNG (as APNG), else the first | – |
+| GIF | built-in (omggif). All frames when writing PNG (as APNG) or JPEG XL, else the first | – |
 | WebP | `sharpDecoder` / `browserDecoder` | pixmix's WebP reader |
 | AVIF, HEIC, TIFF | `sharpDecoder` / `browserDecoder` | sharp |
 
-The built-in JPEG decoder refuses what pixmix's JPEG reader refuses (12-bit, lossless,
-arithmetic-coded, hierarchical: `UNSUPPORTED`) and picks the colour transform as libjpeg
-does (JFIF, else the Adobe APP14 transform, else component ids `R`,`G`,`B` mean RGB).
-CMYK and YCCK are converted by the usual profile-less formula (as libjpeg and browsers do
-without a profile), which `dropped` reports; `sharpDecoder` converts with the ICC profile.
+The built-in JPEG decoder:
+- refuses what pixmix's JPEG reader refuses (12-bit, lossless, arithmetic-coded,
+  hierarchical: `UNSUPPORTED`);
+- picks the colour transform as libjpeg does (JFIF, else the Adobe APP14 transform, else
+  component ids `R`,`G`,`B` mean RGB);
+- converts CMYK and YCCK by the usual profile-less formula (as libjpeg and browsers do
+  without a profile), which `dropped` reports; `sharpDecoder` converts with the ICC profile;
+- upsamples chroma by repeating samples (jpeg-js), where libjpeg and browsers interpolate.
+  So a 4:2:0 JPEG converted to PNG or JPEG XL by the built-in decoder differs slightly from
+  what they show (on a Kodak photo at q90, by 1.1 levels on average and up to 32 at sharp
+  colour edges; about 0.5 for 4:4:4, from the IDCT alone). `sharpDecoder` avoids it. JPEG →
+  JPEG and the JPEG route are not affected: they never decode to pixels.
 
 Where each kind of metadata ends up:
 
 | Metadata | PNG | JPEG | JPEG XL |
 | --- | --- | --- | --- |
 | EXIF | `eXIf` | APP1 `Exif` | `Exif` box |
-| ICC profile | `iCCP` | APP2 `ICC_PROFILE`, split across segments | in the codestream |
+| ICC profile | `iCCP` | APP2 `ICC_PROFILE`, split across segments | in the codestream (see "JPEG XL" for how) |
 | XMP | `iTXt XML:com.adobe.xmp` | APP1 XMP | `xml ` box |
 | Density | `pHYs` | JFIF APP0 (dots per inch when whole, else per cm) | dropped (no field) |
 | Comments | `tEXt Comment` (`iTXt` beyond Latin-1) | COM (UTF-8) | dropped (no field) |
 
-The pixels stay exactly as stored. They aren't rotated (the EXIF orientation travels with
-the EXIF; a TIFF's orientation tag becomes EXIF; JPEG XL keeps it in its header, which
-viewers follow rather than the EXIF, so JPEG XL output gets the EXIF orientation there and
-JPEG XL input hands its header's orientation to the EXIF) and aren't converted to sRGB (the ICC
-profile travels with the image). AVIF and HEIC are the exception: libheif always applies
-their rotation, so the EXIF orientation is set to 1 and the report says so.
+The pixels stay exactly as stored. They aren't rotated: the EXIF orientation travels with
+the EXIF, a TIFF's orientation tag becomes EXIF, and JPEG XL, whose viewers follow the
+orientation in its header rather than the EXIF, gets the EXIF orientation written there
+(and JPEG XL input hands its header's orientation to the EXIF). They aren't converted to
+sRGB either: the ICC profile travels with the image. AVIF and HEIC are the exception:
+libheif always applies their rotation, so the EXIF orientation is set to 1 and the report
+says so.
 
 Some things are dropped, and the report says so:
-- animation frames after the first;
+- animation frames after the first, when writing JPEG (or when the decoder can't give
+  them, as `browserDecoder` without `ImageDecoder`);
 - pages after the first of a multi-page TIFF (or HEIF collection);
 - CMYK and other non-RGB/grey profiles, and grey profiles on colour images;
 - extended XMP;
@@ -337,23 +434,26 @@ scrambled. A JPEG is written as a single component when the image is grey.
 Sources deeper than 8 bits become 16-bit PNGs or JPEG XLs:
 - 16-bit PNG, 16-bit TIFF/PNG/AVIF/HEIF through sharp, and 10/12/16-bit or float JPEG XL.
 - If every sample is exactly an 8-bit value, the output is 8-bit, since that loses nothing.
-- Animations are 8-bit.
 - A 16-bit lossless JPEG XL needs codestream level 10, so it carries a `jxll` box.
 
 ## Decoder (websites)
 
 ```html
-<img data-pixmix src="/img/photo.jpg" alt="…">     <!-- PNG or JPEG -->
+<img data-pixmix src="/img/photo.jpg" alt="…">     <!-- PNG, JPEG or JPEG XL -->
 <script src="pixmix-decoder.min.js" data-key="site-key" data-effect="dissolve"></script>
 ```
 
-Or from code:
+With `data-key` on the script tag, every `img[data-pixmix]` reveals itself. The tag also
+takes `data-effect`, `data-duration`, `data-selector`, `data-worker="false"`,
+`data-watermark`, `data-watermark-base` and `data-metadata`. Without `data-key` nothing runs
+on its own; call it from code:
 
 ```js
 PixMix.revealAll({ key: 'site-key', effect: 'blocks', duration: 1500 });
 await PixMix.reveal(imgElement, { key, effect: 'scan', onProgress: (p) => … });
 const original = await PixMix.decodeAsync(bytes, { key });   // just the bytes
 const { bytes: shown, type } = await PixMix.restoreForDisplay(bytes, { key });
+const url = await PixMix.decodeToURL('/img/photo.jxl', { key }); // a blob: URL of that
 ```
 
 `restoreForDisplay` returns what an `<img>` can show:
@@ -363,83 +463,103 @@ const { bytes: shown, type } = await PixMix.restoreForDisplay(bytes, { key });
 
 It needs only the JPEG XL decoder, not the encoder.
 
-- Effects:
-  - `dissolve`, `scan`.
-  - `blocks`: tiles fly home. For JPEG, flipped or rotated MCUs spin and turn back over
-    as they go. It works with PNG block mode and all JPEGs up to 12,000 tiles; otherwise
-    it falls back to `dissolve`.
-  - `none`.
-  - `prefers-reduced-motion` forces `none`; an unknown effect plays `dissolve`, with a
-    warning.
-  - Big images (over 1 MP) animate at a reduced size, no finer than the screen shows them;
-    the `<img>` then gets the full image (and `final: 'canvas'` a full-size canvas).
+`reveal(img, options)` and `revealAll({ selector = 'img[data-pixmix]', root, lazy = true,
+…options })`:
+- `key`; `effect` (default `dissolve`); `duration` (ms, default 1200); `final`: `'image'`
+  (default: the `<img>` gets the restored file) or `'canvas'` (keep the canvas); `src`;
+  `onProgress(p)`; `fetchOptions`; `orientation`; `worker`; `watermark`, `watermarkBase`;
+  `limits`; `metadata`.
 - Per-image overrides: `data-pixmix-key`, `data-pixmix-effect`, `data-pixmix-src` (fetch from
   here instead of `src`, e.g. to show a placeholder first), `data-pixmix-watermark`.
-- Watermarks (see below): `watermark` / `data-watermark` on the script tag.
-- EXIF orientation: the animation is drawn rotated or flipped the same way the browser will
-  show the final `<img>`. Browsers differ on EXIF in PNGs, so this is detected once with a
-  2×1 test image. Override it with `orientation: 'apply' | 'ignore'`.
+
+Effects:
+- `dissolve`, `scan`, `none`.
+- `blocks`: tiles fly home. For JPEG, flipped or rotated MCUs spin and turn back over as
+  they go. It works with block mode (PNG, JPEG XL) and every JPEG, up to 12,000 tiles;
+  otherwise it falls back to `dissolve`.
+- `prefers-reduced-motion` forces `none`; an unknown effect plays `dissolve`, with a
+  warning.
+- Big images (over 1 MP) animate at a reduced size, no finer than the screen shows them;
+  the `<img>` then gets the full image (and `final: 'canvas'` a full-size canvas).
+
+How a reveal runs:
 - `revealAll` is lazy by default: each image decodes when it scrolls into view.
 - A reveal of an image already in flight (or waiting to scroll into view for an earlier
   `revealAll`) joins it; `reveal()` of an image that shows its restored file does nothing.
 - Decoding runs in a Web Worker by default: unscrambling, inflate/deflate, JPEG entropy
-  coding and JPEG XL.
-  - The page only draws the animation: the worker sends its first and last frames.
+  coding and JPEG XL. All reveals share one worker.
+  - The worker also prepares the animation: it sends the first and last frames (and the
+    dissolve order), at the reduced size for big images, and the page only draws them.
+    JPEG frames come from the engine's own JPEG decoder, in the worker through
+    `OffscreenCanvas`, or on the page where the worker has none. The page still hands
+    the restored file to the `<img>`, so a big image can stall it briefly (see "Size and
+    speed").
   - `configureJxl`, `configureWatermarks` and `configureMetadata` apply to the worker too.
-  - `worker: false` (or `data-worker="false"` on the script tag) keeps it on the main
-    thread; a string gives the worker's URL.
-  - All reveals share one worker.
+  - `worker: false` (or `data-worker="false"`) keeps everything on the main thread; a
+    string gives the worker's URL.
 - The animation runs on a temporary canvas with the `<img>`'s classes, style and rendered
-  box. Afterwards the `<img>` gets the exact restored file as a `blob:` URL, so ICC/gamma
-  handling, CSS, alt text and "save image" behave normally.
+  box (its content box, so CSS sizes, `width`/`height` attributes and srcset densities all
+  carry over). Afterwards the `<img>` gets the exact restored file as a `blob:` URL, so
+  ICC/gamma handling, CSS, alt text and "save image" behave normally.
   - It keeps its size: a srcset density or width descriptor carries over to the blob.
   - In a `<picture>`, the `<source>`s lose their `srcset` (kept in `data-pixmix-srcset`),
     or they would pick the scrambled file again.
   - The `blob:` URL is revoked once the `<img>` gets another `src` or is garbage-collected.
-- A watermark on an EXIF-rotated PNG is laid out for the image as the browser shows it
-  (WebKit ignores PNG orientation).
+- EXIF orientation: the animation is drawn rotated or flipped the same way the browser will
+  show the final `<img>`. Browsers differ on EXIF in PNGs, so this is detected once with a
+  2×1 test image. Override it with `orientation: 'apply' | 'ignore'`.
 - State goes in `data-pixmix-state`: `decoding` → `done` | `error`. On error the scrambled
   image stays and a warning is logged.
 - Cross-origin images need CORS, since the decoder `fetch`es the bytes.
 
-### JPEG XL
+A JPEG XL on the pixel route is shown as a lossless PNG of its restored pixels (see "JPEG
+XL" below); that PNG carries no metadata, only what a metadata policy sets.
+
+## JPEG XL
 
 There are two routes.
 
 **JPEG route** (`mode: 'mcu'`), for photos. It's the default when the source is a JPEG, or
 a JPEG XL made by recompressing one (it has a `jbrd` box):
 - The JPEG is scrambled in the DCT domain exactly as in JPEG → JPEG. Nothing is
-  requantised.
+  requantised. The JPEG inside is always baseline.
 - It's then losslessly recompressed into JPEG XL by libjxl (`JxlEncoderAddJPEGFrame` with
-  reconstruction data, in WASM). So the file stays as small as a lossy JPEG XL; a 12 MP
-  photo is 28% smaller than its JPEG. Like `cjxl`, the JPEG's EXIF, XMP and JUMBF become
-  `Exif`, `xml ` and `jumb` boxes.
+  reconstruction data, in WASM). So the file stays as small as a lossy JPEG XL: about 10%
+  smaller than the scrambled JPEG in "Size and speed". Like `cjxl`, the JPEG's EXIF, XMP and
+  JUMBF become `Exif`, `xml ` and `jumb` boxes; everything else (ICC profile, comments,
+  other segments) travels in the reconstruction data, byte for byte.
 - Decoding rebuilds that JPEG bit for bit from the JPEG XL, unscrambles it, and either
   recompresses it (`decodeAsync`) or shows it (the reveal gives the `<img>` the original
   JPEG).
-- Speed at 12 MP: about 1.2 s to encode, 1.0 s to reveal in a browser, 1.7 s to restore to
-  JPEG XL.
 - It works everywhere, browsers included, since the encoder is plain WASM.
-- Reconstruction uses jxl-oxide (0.12, with a patch for JPEGs with comments). It gets
-  some JPEGs wrong, so both ends are checked, and anything that fails falls back to the
-  pixel route. The report's `notes` then say why, and the file is several times larger.
-  Asking for `mode: 'mcu'` gives an `UNSUPPORTED` error instead.
+- Reconstruction uses jxl-oxide 0.12, with a patch so JPEGs with comments (COM segments)
+  rebuild exactly (`native/jxl/patches`). jxl-oxide gets some JPEGs wrong, so both ends
+  are checked, and a JPEG that fails falls back to the pixel route: the report's `notes`
+  then say why, and the file is several times larger. Asking for `mode: 'mcu'` gives an
+  `UNSUPPORTED` error instead.
   - For a JPEG XL made from a JPEG by another tool, the rebuilt JPEG is recompressed and
     must decode to exactly the same pixels. Some progressive JPEGs fail this: jxl-oxide
     either stops with an error or silently rebuilds different coefficients.
   - Every file pixmix writes must rebuild bit for bit before it is returned. This catches
-    JPEGs jxl-oxide can't rebuild, such as 4:4:4 stored with 1×2 sampling factors, and
-    ones libjxl can't recompress, such as CMYK and 4:1:1.
+    JPEGs jxl-oxide can't rebuild, such as 4:4:4 stored with 1×2 sampling factors and any
+    JPEG with more than 10 blocks per MCU (its non-interleaved scans), and ones libjxl can't
+    recompress, such as CMYK and 4:1:1.
 
 **Pixel route** (`mode: 'pixel' | 'block'`), for everything else:
 - Decode JPEG XL with pixmix → the exact samples the input decodes to: 8- or 16-bit, in
   its own colour space (never converted), on the stored pixel grid (the header's
   orientation isn't applied), every frame of an animation.
 - Scramble in `pixel` or `block` mode (each animation frame with its own permutation).
-- Encode losslessly with libjxl, with the same colour encoding (the same enum values when
-  the input has them, else its ICC profile, else sRGB), orientation, bit depth, frames,
-  exact frame durations and loop count. Grey and opaque images are stored with fewer
-  channels.
+- Encode losslessly with libjxl, with the same orientation, bit depth, frames, exact frame
+  durations and loop count. Grey and opaque images are stored with fewer channels.
+- Colour: a JPEG XL input's enum colour encoding is written back exactly. An ICC profile
+  (from a PNG, a JPEG, a JPEG XL that has one, …) is handed to libjxl, which may store an
+  equivalent of its own instead (for colour spaces it can describe itself), so JPEG XL
+  decoders then get a profile that describes the same colours but not the original bytes:
+  a PNG with sharp's `p3` profile came back byte for byte, one with a parametric Display
+  P3 profile as 648 bytes instead of 584. Without either, sRGB. (The JPEG route's
+  codestream carries libjxl's version too, but the JPEG it rebuilds keeps the original
+  profile.)
 
 So the key always gives back exactly those samples. What the report lists under `dropped`
 when re-encoding a JPEG XL input on the pixel route:
@@ -454,6 +574,19 @@ when re-encoding a JPEG XL input on the pixel route:
   `Exif`, `xml `, `jumb`, Brotli-compressed `brob` boxes and unknown boxes are copied
   unchanged. EXIF thumbnails are stripped as for the other formats.
 
+In the browser, most engines can't display JPEG XL. So the pixel route decodes it in WASM
+(as 8-bit sRGB), animates frame 0 like PNG, and gives the `<img>` a lossless PNG of the
+restored pixels (turned the way the header's orientation says), or an APNG of every frame
+for an animation. The JPEG route shows the restored JPEG. Safari could show JPEG XL itself,
+but gets the PNG too, so every engine shows the same exact pixels.
+
+Speed is under "Size and speed". In short: the JPEG route takes about a second each way at
+12 MP; the pixel route's block mode, and restoring to JPEG XL with `decodeAsync` (which
+encodes again, at effort 7 unless `effort` says otherwise), take 20–30 s at 12 MP. Revealing
+in a browser does not encode JPEG XL.
+
+### The codec
+
 The codec has two parts, both pixmix's own WASM bindings:
 - **libjxl 0.12's encoder** (`native/libjxl`) for lossless encoding and JPEG
   recompression. A small C layer exposes:
@@ -464,9 +597,9 @@ The codec has two parts, both pixmix's own WASM bindings:
   - an effort setting.
 
   It's built single-threaded, twice: with WebAssembly SIMD (Node and most browsers) and
-  without (engines that can't compile SIMD, such as Playwright's WebKit). Both runs are
-  lossless, so they give back the same pixels. Without SIMD, 2 MP block mode is about 15%
-  slower and the JPEG route about 50% slower; pixel mode is about the same.
+  without (engines that can't compile SIMD, such as Playwright's WebKit). Both are
+  lossless, so they give back the same pixels. Without SIMD, block mode (effort 7) is
+  about 30% slower; pixel mode and the JPEG route are about the same (within 10%).
 - **pixmix's own jxl-oxide binding** (`native/jxl`) for decoding and JPEG reconstruction.
   - It returns raw 8- or 16-bit pixels, the ICC profile, the enum colour encoding and the
     orientation, converting colour (only where asked, for display) with `moxcms`, a
@@ -475,13 +608,6 @@ The codec has two parts, both pixmix's own WASM bindings:
   - Neither published option would do. `@jsquash/jxl`'s libjxl decoder isn't bit-exact:
     it colour-converts even sRGB images and turns (4,255,0) into (3,255,0). The
     `jxl-oxide-wasm` package can't reconstruct JPEGs. A test guards the exactness.
-
-In the browser, most engines can't display JPEG XL. So the pixel route decodes it in WASM
-(as 8-bit sRGB), animates frame 0 like PNG, and gives the `<img>` a lossless PNG of the
-restored pixels (turned the way the header's orientation says), or an APNG of every frame
-for an animation. The JPEG route shows the
-restored JPEG. Safari could show JPEG XL itself, but gets the PNG too, so every engine
-shows the same exact pixels.
 
 #### Rebuilding the encoder WASM
 
@@ -500,11 +626,12 @@ release tarball (checked against its SHA-256) and the dependency commits that re
 to neutral prefixes and debug info is left out, so the binary carries no local paths (the
 script checks); both builds are byte-for-byte reproducible, and share one glue module
 (the script checks that too). `-Os` is the default: `-O3` (`BUILD_OPT=-O3`) makes the SIMD
-WASM 3% larger (2.44 MB instead of 2.38 MB) and was no faster in the benchmarks below.
+WASM 3% larger (2.44 MB instead of 2.38 MB) and was no faster in the original benchmarks.
 
 #### Rebuilding the decoder WASM
 
-`native/jxl/pkg` is committed, so this is only needed after changing `native/jxl`:
+`native/jxl/pkg` is committed, so this is only needed after changing `native/jxl` (its
+`patches/` hold the jxl-oxide patch):
 
 ```sh
 rustup target add wasm32-unknown-unknown
@@ -556,8 +683,14 @@ Rendering is plain JavaScript: a scanline rasteriser for the outlines, the outli
 dilation, the shadow as an offset, box-blurred copy. It uses only exactly specified maths
 (no `Math.sin`, no canvas), so Node, Chromium and WebKit draw the same pixels; the browser
 tests check that the `<img>` shows exactly what Node draws (the same JPEG file, byte for
-byte; for PNG the same pixels, as each engine deflates its own way). EXIF orientation is respected:
-the watermark sits bottom-right of the image as displayed.
+byte; for PNG the same pixels, as each engine deflates its own way).
+
+EXIF orientation is respected: the watermark sits bottom-right of the image as displayed.
+One exception, in the browser reveal: engines that ignore a PNG's EXIF orientation (WebKit)
+show the PNG unrotated, so the reveal lays the watermark out for the unrotated image, where
+it looks right in that engine. The restored file then differs from the one Node (or
+another engine) draws, and where the orientation is applied the watermark shows turned,
+in another corner.
 
 Drawn on a restored file:
 - PNG keeps its colour type, bit depth and every chunk. Palette and 1/2/4-bit images become
@@ -579,12 +712,27 @@ PixMix.revealAll({ key, watermark: 'vivi-gold' });   // an id: fetched from wate
 PixMix.revealAll({ key, watermark: compiled });      // or a compiled watermark object
 PixMix.revealAll({ key, watermark: false });         // none, even if the file carries one
 const exact = await PixMix.decodeAsync(bytes, { key });                     // never watermarked
-const shown = await decodeAsync(bytes, { key, watermark: 'embedded' });     // Node: the file's own
+const drawn = await PixMix.decodeAsync(bytes, { key, watermark: 'embedded' });  // the file's own
 ```
 
-- The default (`'auto'`) draws the watermark the file carries, if any.
+In Node:
+
+```js
+import { decodeAsync } from 'pixmix';
+import { loadWatermark } from 'pixmix/watermarks';
+
+const drawn = await decodeAsync(bytes, {
+  key,
+  watermark: 'embedded',                      // or an id, or a compiled watermark
+  resolveWatermark: (id) => loadWatermark(id), // for ids: the file may carry only one
+});
+```
+
+- The default in the browser (`'auto'`) draws the watermark the file carries, if any.
 - Ids are looked up at `watermarkBase` (`data-watermark-base`, default `watermarks/` next
-  to the page). The dev server serves the compiled ones there.
+  to the page). The dev server serves the compiled ones there. In Node, `decodeAsync`
+  looks ids up with `resolveWatermark(id)`, which it needs whenever a watermark is given by
+  id, or `'embedded'` finds a file that carries only an id (`BAD_WATERMARK` without it).
 - A watermark that cannot be loaded or drawn is skipped with a warning; the image still
   shows. So is a carried watermark that cannot be read (damaged, or over
   `maxMetadataBytes`): restoring never needs it, and `inspect` reports it as
@@ -610,15 +758,16 @@ the original exactly.
   can't be taken off without the key. The decoder puts them back before unscrambling.
 - It costs a few KB: with the defaults, 2–6 KB on an 800×500 image, 7–23 KB at 4000×2600
   (noisy content; JPEG less than PNG). It includes the watermark itself, 1–3 KB.
-- The marker becomes v2 (see below), so older pixmix versions refuse the file instead of
-  restoring it with the watermark scattered over the image.
+- The marker becomes v2 (see "How it works"), so older pixmix versions refuse the file
+  instead of restoring it with the watermark scattered over the image.
 - Rekey draws it again under the new key; `visibleWatermark: null` removes it. Restoring
   only needs the stashed pixels, not the watermark stored with them.
 - PNG: any colour type (palette images use their nearest palette colours); APNG frames that
-  hold the whole watermark. JPEG: baseline, progressive, grey. JPEG XL: both routes, but on
-  the pixel route only for 8-bit sRGB images (the browser reveals 8-bit sRGB pixels, and
-  the stored ones must be the same; a plain sRGB ICC profile is replaced by the sRGB
-  colour encoding); others are refused.
+  hold the whole watermark. JPEG: baseline, progressive, grey; on a JPEG enlarged to whole
+  MCUs, it is placed on the original area. JPEG XL: both routes, but on the pixel route
+  only for 8-bit sRGB images (the browser reveals 8-bit sRGB pixels, and the stored ones
+  must be the same; a plain sRGB ICC profile is replaced by the sRGB colour encoding);
+  others are refused (`UNSUPPORTED`).
 - Tests check that pngjs, sharp (libpng, libjpeg) and jxl-oxide still read these files.
 
 Considered and left out:
@@ -629,33 +778,29 @@ Considered and left out:
   converted 8-bit pixels, which the stash cannot match.
 - Signing the carried watermark with the key: in the browser use case the key is public.
 
-Limits on untrusted input (see "Untrusted input"): compiled watermarks are validated (sizes,
-counts, path syntax); watermark JSON counts against `maxMetadataBytes` when it is needed
-(a carried one to be drawn, a stashed one for rekey to draw it again); stashed regions must lie inside the image, one per
-frame (so they never add up to more than the image), and are inflated into a buffer of
-exactly their size, at most `maxDecompressedBytes`; the renderer refuses a watermark covering more than 4
-megapixels (or `maxPixels`) and caps outline and blur radii at 32 px. The fuzzer's seeds
-include files carrying watermarks (whole and by id) and visible watermarks on every format
-and route, and it mutates their payloads.
+Limits on untrusted input (see "Untrusted input"):
+- compiled watermarks are validated (sizes, counts, path syntax);
+- watermark JSON counts against `maxMetadataBytes` when it is needed (a carried one to be
+  drawn, a stashed one for rekey to draw it again);
+- stashed regions must lie inside the image, one per frame (so they never add up to more
+  than the image), and are inflated into a buffer of exactly their size, at most
+  `maxDecompressedBytes`;
+- the renderer refuses a watermark covering more than 4 megapixels (or `maxPixels`) and
+  caps outline and blur radii at 32 px.
 
-### Server and CLI
+The fuzzer's seeds include files carrying watermarks (whole and by id) and visible
+watermarks on every format and route, and it mutates their payloads.
 
-The dev server keeps definitions in `watermarks/` (`PIXMIX_WATERMARKS_DIR` overrides it):
-- `GET /api/watermarks` (definitions, fonts, assets), `GET /api/watermarks/<id>`;
-  `POST /api/watermarks` creates, `PUT /api/watermarks/<id>` creates or replaces,
-  `DELETE /api/watermarks/<id>`; `POST /api/watermarks/preview` compiles without saving.
-- `GET /watermarks/<id>.json` (compiled) and `.svg`.
-- `/api/encode` takes `watermark`, `watermarkEmbed=id` and `visibleWatermark`;
-  `/api/decode` takes `watermark=<id>` or `watermark=embedded`.
-- Ids must match `[a-z0-9-]`, bodies are limited to 256 KB and validated strictly.
+### CLI and Node
 
 CLI: `--watermark <id|file|embedded>`, `--watermark-ref`, `--visible-watermark <id|file>`,
-`--no-watermark` (rekey) and `--watermarks <dir>`. A file is a definition (compiled with
-the directory's fonts) or a compiled watermark.
+`--no-watermark` (rekey) and `--watermarks <dir>` (default `$PIXMIX_WATERMARKS_DIR`, or
+pixmix's own `watermarks/`). A file is a definition (compiled with the directory's fonts)
+or a compiled watermark.
 
 In Node, `pixmix/watermarks` exports `compileWatermark`, `normalizeDefinition`,
 `formatDefinition`, `validateCompiled`, `watermarkStore`, `loadWatermark` and
-`renderWatermark`.
+`renderWatermark`. The dev server's watermark API is under "Dev server".
 
 ## Metadata
 
@@ -707,7 +852,7 @@ Kinds, and where they live:
 | `colour` | `sRGB`, `gAMA`, `cHRM`, `cICP`, `mDCV`, `cLLI` | – | the codestream |
 | `text` | `tEXt`, `zTXt`, `iTXt` | COM | – |
 | `density` | `pHYs` | JFIF density | – |
-| `orientation` | EXIF Orientation | EXIF Orientation | the codestream |
+| `orientation` | EXIF Orientation | EXIF Orientation | the codestream (see "What cannot be done" below) |
 | `other` | every other ancillary chunk (`tIME`, `caBX`, unknown ones) | APP2–APP15 (Photoshop/IPTC, JUMBF/C2PA, MPF, …) | `jumb`, unknown boxes |
 
 Never touched: image data and structure (`PLTE`, `tRNS`, APNG chunks, unknown critical
@@ -752,12 +897,12 @@ EXIF values get their tag's type (ASCII, SHORT, RATIONAL, …); bad ones are ref
 Every entry point takes `metadata`: `encode`, `convert`, `decode`, `rekey` (which keeps
 the file's metadata without one), their async versions, and the browser's `reveal`,
 `revealAll`, `restoreForDisplay`, `decodeToURL` and `decodeAsync` (`data-metadata` on the
-script tag). Reports say what changed: `onConvert`'s report gets `metadata`, and
-`decode`/`rekey` call `onMetadata`, with `{ policy, removed, set, notes }`.
-The encoder's `inspect(bytes, { metadata: true })` adds `meta`, the parsed metadata.
-Invalid policies throw a PixmixError with code `BAD_METADATA` that names the problem.
-`applyMetadata` and `readMetadata` work on any PNG, JPEG or JPEG XL; `pixmix/metadata`
-exports the rest.
+script tag). Reports say what changed, as `{ policy, removed, set, notes }`: `onConvert`'s
+report gets it as `metadata`, and `decode`/`rekey` (and the browser's `decodeAsync`) call
+`onMetadata` with it. The encoder's `inspect(bytes, { metadata: true })` adds `meta`, the
+parsed metadata. Invalid policies throw a `PixmixError` with code `BAD_METADATA` that names
+the problem. `applyMetadata` and `readMetadata` work on any PNG, JPEG or JPEG XL;
+`pixmix/metadata` exports the rest.
 
 ### How it is edited
 
@@ -767,8 +912,9 @@ exports the rest.
   goes back to its old offset (padded), since vendors point into it from the TIFF header;
   the report says when it had to move.
 - **XMP** is parsed as XML (no DTDs or custom entities, bounded depth), and what the policy
-  does not touch is written back as it was. Extended XMP is not rewritten: it goes when the
-  packet changes.
+  does not touch is written back as it was. Extended XMP is never rewritten: it is kept as
+  it is, or removed whole, when the policy changes the main packet (and by the encoder,
+  when it holds a preview; see "Embedded previews").
 - **ICC**: `icc: 'srgb'` writes PNG's `sRGB` chunk (replacing iCCP and the colour chunks),
   a compact sRGB profile in JPEG, and the sRGB colour encoding in JPEG XL. Removing or
   replacing a non-sRGB profile changes how the image looks, and the report says so.
@@ -782,13 +928,20 @@ What cannot be done, and is reported instead:
 - JPEG XL keeps its ICC profile, colour encoding and orientation in the codestream. The
   pixel route encodes the codestream again, so `encode`, `decode` and `rekey` can change
   the profile there; `convert` of a JPEG XL to JPEG XL does not re-encode, so it cannot.
-  JPEG XL has no text, comments or density; EXIF Orientation is ignored there (the
-  codestream's counts), so `strip-all` removes its EXIF entirely on the pixel route.
+  JPEG XL has no text, comments or density.
+- The pixel route's orientation is never changed by a policy: `set.orientation` does
+  nothing (the report's `notes` say so), and neither `strip: ['orientation']` nor
+  `strip-all` touches the header. EXIF Orientation is ignored there (the header's counts),
+  so `strip-all` removes its EXIF entirely.
 - A JPEG XL made from a JPEG (the JPEG route) keeps comments and other segments inside its
   reconstruction data: policies edit the JPEG, which is then recompressed, so it stays
   exact and rebuildable (`applyMetadataAsync`; the sync version edits the boxes and drops
-  the reconstruction data).
+  the reconstruction data). Its header orientation follows the JPEG's EXIF, so there
+  `set.orientation` and stripping the orientation do apply.
 - JPEG has no keyword text (only comments); EXIF or XMP over 64 KB does not fit a segment.
+- IPTC is edited one APP13 segment at a time. Photoshop resources that continue into the
+  next APP13 segment (large IPTC blocks) can't be parsed that way, so when the policy
+  touches IPTC, those segments are removed as "unreadable IPTC".
 - Brotli-compressed JPEG XL boxes cannot be read in browsers: they go when the policy
   touches their kind.
 - Orientation is a tag: stripping it (or setting 1) makes viewers show the pixels as
@@ -803,15 +956,51 @@ clean. Two defaults: `vivi-web` (the `web` preset with Vivi as artist and copyri
 `vivi-privacy` (`privacy`, same credit). Ids use `[a-z0-9-]` and cannot be a preset name.
 
 - CLI: `--metadata <preset|profile id|file.json>` on encode, decode and rekey;
-  `--metadata-profiles <dir>`.
-- Server (`PIXMIX_METADATA_PROFILES_DIR` overrides the directory):
-  `GET /api/metadata-profiles` (profiles, presets, kinds, groups),
-  `POST /api/metadata-profiles` creates, `GET/PUT/DELETE /api/metadata-profiles/<id>`;
-  `?metadata=<preset|id>` on `/api/encode`, `/api/decode` and `/api/rekey` (the latter two
-  report in `X-Pixmix-Metadata`), `?metadata=1` on `/api/inspect`.
+  `--metadata-profiles <dir>` (default `$PIXMIX_METADATA_PROFILES_DIR`, or pixmix's own).
+- Server: see "Dev server".
 - Lab: a profile editor with a before/after table of the current image's metadata, and
   metadata pickers for encoding and decoding.
 - Browsers: the decoders fetch `pixmix-metadata.mjs` only when a policy is used.
+
+## Dev server
+
+`server/server.js` (`npm run serve`) serves the lab, the demo site, `dist/`, and a small
+API. It uses the built encoder bundle, as a real image server would. Settings come from
+the environment: `PORT` (default 8080; 0 picks a free port), `HOST` (default `127.0.0.1`),
+`PIXMIX_MAX_PIXELS` and `PIXMIX_MAX_FRAMES` (limits), `PIXMIX_WATERMARKS_DIR` and
+`PIXMIX_METADATA_PROFILES_DIR`.
+
+Images are posted as the raw request body (up to 64 MiB; JSON bodies up to 256 KB), with
+options in the query string:
+
+| Route | Query | Answer |
+| --- | --- | --- |
+| `POST /api/encode` | `key`, `format`, `mode`, `block`, `level`, `effort`, `quality`, `transforms=0`, `watermark=<id>` (with `watermarkEmbed=id` only its id is carried), `visibleWatermark=<id>`, `metadata=<preset or profile id>` | the scrambled image; the conversion report in `X-Pixmix-Convert` |
+| `POST /api/decode` | `key`, `watermark=<id>` or `watermark=embedded`, `metadata` | the restored image; the policy's report in `X-Pixmix-Metadata` |
+| `POST /api/rekey` | `from`, `to`, `mode`, `block`, `transforms`, `metadata` | the rekeyed image; `X-Pixmix-Metadata` |
+| `POST /api/inspect` | `metadata=1` adds the parsed metadata | `inspect()`'s JSON |
+| `POST /api/gallery` | `key`, `name`, `effect`, `watermark` | publishes a scrambled image to the demo site: `{ id, url }` (201) |
+| `GET /api/gallery` | | `[{ id, url, key, name, effect, watermark, format, width, height, orientation, mode, block, carries, visibleWatermark }]` |
+| `DELETE /api/gallery` | | empties the gallery |
+| `GET /images/<id>.<png\|jpg\|jxl>` | | a published image |
+| `GET /api/watermarks`, `GET /api/watermarks/<id>` | | definitions, fonts and assets; one definition and its compiled form |
+| `POST /api/watermarks`, `PUT /api/watermarks/<id>`, `DELETE /api/watermarks/<id>` | | create (409 if the id exists), create or replace (201 or 200), delete |
+| `POST /api/watermarks/preview` | | compiles a definition without saving it |
+| `GET /watermarks/<id>.json`, `.svg` | | a compiled watermark (what decoders fetch), its preview |
+| `GET /api/metadata-profiles` | | profiles, presets, kinds and groups |
+| `POST /api/metadata-profiles`, `GET/PUT/DELETE /api/metadata-profiles/<id>` | | like the watermark routes |
+
+- The gallery lives in memory, so it is empty after a restart. `orientation` is the
+  orientation `inspect` reports for a JPEG or JPEG XL (1 when there is none, and always 1
+  for PNG, for which `inspect` reports none), so the demo site can lay the image out as it
+  will be shown before it loads; `carries` is the id of the watermark the file carries, if
+  any.
+- Watermark and profile ids must match `[a-z0-9-]` (`preview` is reserved), and bodies are
+  validated strictly; a PUT's body must have the id of its URL.
+- Errors are JSON, `{ error, code }`: 400 for invalid requests (`BAD_REQUEST`) and for
+  pixmix errors (their own code, e.g. `BAD_OPTION`), 403 `WRONG_KEY`, 404 `NOT_FOUND`, 409
+  `EXISTS`, 413 for `LIMIT` and for bodies over the limit (`TOO_LARGE`), and 500
+  `INTERNAL` for anything unexpected (logged, never sent).
 
 ## How it works
 
@@ -821,17 +1010,15 @@ clean. Two defaults: `vivi-web` (the `web` preset with Vivi as artist and copyri
 2. **Permutation.** A Fisher–Yates shuffle driven by ChaCha20 with unbiased
    rejection sampling, integer-only so every engine agrees.
    - `pixel` mode shuffles all pixels.
-   - `block` mode (the default for PNG and JPEG XL, 16 px) shuffles tiles, and with
-     `transforms` (on by default) also gives each tile one of the 8 flips/rotations. The
-     transform flag is the top bit of the marker's tile-size field.
-   - `block` mode shuffles whole B×B tiles. The right/bottom leftover strips are shuffled
-     pixel by pixel among themselves.
+   - `block` mode (the default for PNG and JPEG XL, 16 px) shuffles whole B×B tiles, and
+     with `transforms` (on by default) also gives each tile one of the 8 flips/rotations.
+     The right/bottom leftover strips are shuffled pixel by pixel among themselves.
    - `mcu` mode (JPEG) shuffles the grid of MCUs, then draws a transform per slot.
 3. **PNG.** Chunks are parsed and CRC-checked. The raster is inflated, unfiltered and
    de-interlaced into native samples; 16-bit, palette and 1/2/4-bit data are all kept as
    they are. Whole pixels are moved, then the raster is re-filtered, re-interlaced and
    deflated. Only `IDAT` changes. A `pmIx` chunk (ancillary, private, safe-to-copy) holding
-   the version, mode, block size, salt and key check goes right before it.
+   the marker goes right before it.
 4. **JPEG.** The entropy-coded data is decoded to quantised DCT coefficients, with no IDCT.
    Baseline, extended and progressive files are supported, along with restart markers,
    truncated data (read as libjpeg does), stray bytes between segments and scans without
@@ -857,38 +1044,43 @@ clean. Two defaults: `vivi-web` (the `web` preset with Vivi as artist and copyri
    - DC differences are written mod 2^16 (as decoders read them), so corrupt files whose
      DC predictor overflowed stay readable.
    - Restart markers are not kept.
-   - **Progressive caveat.** Progressive AC scans can't store the padding blocks of partial
-     edge MCUs, and scrambling may move real content into them. So a scrambled file is
-     progressive only when the image has no such padding (width and height fit whole MCUs);
-     otherwise it's baseline.
-     - The marker records that the source was progressive, and restoring writes a
-       progressive file again. That's exact, since the original couldn't hold AC data in
-       padding blocks either.
-     - The JPEG inside a JPEG-route JPEG XL is always baseline (see jxl-oxide above).
-   - The same limit applies to MCUs of more than 10 blocks, which only non-interleaved
-     scans can code. With partial edge MCUs, the scrambled file's frame is enlarged to
-     whole MCUs instead, so it shows up to 15 pixels wider and taller than the original
-     (other software reads it at that size). Marker flag bit 1 says so, an APP15
-     `pixmix-sz\0` segment (`u16 height | u16 width`) holds the original size, and
-     restoring gives the original size back, exactly. Rekeying keeps the enlarged form; a
-     visible watermark is placed on the original area. `inspect` reports the original
-     `width`/`height` and the stored `storedWidth`/`storedHeight`; the browser reveal shows
-     the original size throughout.
-   - The JPEG XL JPEG route cannot carry any file with more than 10 blocks per MCU
-     (jxl-oxide fails to rebuild its non-interleaved scans), so JPEG XL output of such a
-     JPEG takes the pixel route.
-
-Marker v1: `u8 version | u8 mode | u16 block | u8 saltLen | salt | u8[4] check`. Marker v2
-adds `u8 flags` (bit 0: a visible watermark's stash is in the file; bit 1: the JPEG frame is
-enlarged to whole MCUs, see above); it's only written when a flag is set, so versions that
-don't know a flag refuse the file, and the permutation is the same as v1's.
-- In `mcu` mode, `block` holds flags: bit 0 = transforms, bit 1 = restore as progressive.
-- APNG frames mix their index into the seed; it's 0 for still images.
-The permutation stream is pinned by a test. Any change to it must bump the version.
+   - **Truncated files** are restored with the coefficients they hold, as libjpeg reads
+     them, into a complete file. For a truncated progressive file this can look slightly
+     different from the original in libjpeg-turbo (and so in browsers): it smooths the
+     blocks whose AC bands never arrived, and the restored file has no missing bands to
+     smooth.
+   - **Partial edge MCUs.** Progressive AC scans, and the one-scan-per-component scans of
+     MCUs with more than 10 blocks, never hold the padding blocks of partial edge MCUs
+     (right and bottom), and scrambling may move real content into them.
+     - Progressive: a scrambled file is progressive only when the image has no such
+       padding (width and height fit whole MCUs); otherwise it's baseline. The marker
+       records that the source was progressive, and restoring writes a progressive file
+       again. That's exact, since the original couldn't hold AC data in padding blocks
+       either.
+     - More than 10 blocks per MCU (which only non-interleaved scans can code): the
+       scrambled file's frame is enlarged to whole MCUs instead, so it shows up to 15
+       pixels wider and taller than the original (other software reads it at that size).
+       Marker flag bit 1 says so, an APP15 `pixmix-sz\0` segment (`u16 height | u16
+       width`) holds the original size, and restoring gives the original size back,
+       exactly. Rekeying keeps the enlarged form; a visible watermark is placed on the
+       original area. `inspect` reports the original `width`/`height` and the stored
+       `storedWidth`/`storedHeight`; the browser reveal shows the original size
+       throughout. (Such a JPEG can't take the JPEG XL JPEG route, see "JPEG XL".)
+5. **Marker.** v1 is `u8 version | u8 mode | u16 block | u8 saltLen | salt | u8[4] check`.
+   - In `block` mode, `block` is the tile size, with the top bit set when tiles are
+     flipped/rotated. In `mcu` mode it holds flags: bit 0 = transforms, bit 1 = restore as
+     progressive.
+   - v2 adds `u8 flags`: bit 0, a visible watermark's stash is in the file; bit 1, the JPEG
+     frame is enlarged to whole MCUs (see above). It's only written when a flag is set, so
+     versions that don't know a flag refuse the file, and the permutation is the same as
+     v1's.
+   - PNG keeps it in a `pmIx` chunk, JPEG in APP15 `pixmix\0`, JPEG XL in a `pmIx` box.
+   - Animation frames mix their index into the seed; it's 0 for still images.
+   - The permutation stream is pinned by a test. Any change to it must bump the version.
 
 ### Size and speed
 
-Measured on 768×512 photos (Kodak test images):
+Sizes, measured on 768×512 photos (Kodak test images; KB = 1024 bytes):
 
 | | kodim23 | kodim05 |
 | --- | --- | --- |
@@ -900,48 +1092,90 @@ Measured on 768×512 photos (Kodak test images):
 | From the JPEG: JPEG / JXL JPEG route | 58 / 53 KB | 129 / 113 KB |
 | From the JPEG: PNG (lossless) | 418 KB | 724 KB |
 
-- **Block mode** (the default) keeps output within about 5–10% of an unscrambled lossless
+- **Block mode** (the default) keeps a photo within about 5–10% of an unscrambled lossless
   file. Tile flips cost nothing measurable.
+- It does not for images that PNG compresses much better than photos: flat graphics,
+  screenshots, smooth gradients. Shuffled tiles break the row-to-row prediction that makes
+  those files small, so they grow several times, and a smooth gradient tens of times.
+  Larger tiles help, and JPEG XL did best on flat graphics:
+
+  | Image | Source PNG | Block 16 | Block 64 | Pixel mode | JPEG XL, block 16 |
+  | --- | --- | --- | --- | --- | --- |
+  | Flat logo, 2000×1000, RGB | 35 KB | 57 KB | 45 KB | 878 KB | 32 KB |
+  | The same logo as a palette PNG | 17 KB | 74 KB | 45 KB | 599 KB | 31 KB |
+  | Smooth 16-bit gradient, 1024×1024 | 25 KB | 650 KB | 159 KB | 2310 KB | 1314 KB |
+
 - **Pixel mode** turns the image into noise that no lossless format can compress: about
-  twice a lossless original, or roughly the raw pixel size (a 12 MP photo is about 35 MB).
+  twice a lossless photo, or roughly the raw pixel size (a 12 MP photo is about 35 MB).
   Use it only when tiles give away too much.
 - **Lossy sources:** a JPEG (or lossy WebP/AVIF/JPEG XL) saved as PNG or pixel-route JPEG XL
   is 3–8× bigger even unscrambled, because lossless can't reuse the lossy compression.
   - Keep JPEGs as JPEG, or use JPEG XL's JPEG route, which is even smaller.
   - The conversion report adds a `notes` entry saying so.
   - Converting other lossy formats to `format: 'jpeg'` keeps them small too.
-- In Node, 12 MP takes about 3 s per encode or decode. Native zlib is used when available;
-  browsers use `CompressionStream`/`DecompressionStream`.
-- Converting a 12 MP JPEG to PNG takes about 2.4 s with the built-in decoder and 1.2 s with
-  sharp. In both cases building the PNG is most of the time.
-- JPEG → JPEG is fast and keeps the size: a 12 MP photo takes about 0.5 s to scramble and
-  0.4 s to restore, and grows about 3% (shuffled MCUs make the DC differences larger).
-  pixmix's progressive scans come out about the same size as libjpeg's.
-- Converting 12 MP PNG → scrambled JPEG takes about 1.7 s (colour conversion, DCT and
-  entropy coding in JS).
-- JPEG XL, JPEG route: see above. It's fast because nothing is DCT'd or entropy-optimised
-  twice.
-- JPEG XL, pixel route (single-threaded WASM):
-  - Pixel mode at effort 2: 2 MP encodes in 0.7 s and 12 MP in 4.3 s.
-  - Block mode at effort 7 is slower (a few seconds at 2 MP, half a minute at 12 MP on a
-    hard, noisy image), but the result is about 20% smaller than PNG block mode.
-  - Decoding 12 MP takes 5–9 s.
-  - Lower `effort` trades size for speed: at 2 MP, effort 5 takes about half the time of
-    effort 7 for a 50% larger file.
+- **JPEG → JPEG** keeps the size: a scrambled photo grows by about 2–3% (shuffled MCUs make
+  the DC differences larger). pixmix's progressive scans come out about the same size as
+  libjpeg's.
 
-Encode times with libjxl 0.12 against the encoders it replaced (`@jsquash/jxl` for pixels,
-`jxl-wasm`'s `cjxl` 0.7 for the JPEG route), measured in Node on the same synthetic,
-noisy photo-like images (so block mode is slower here than on real photos):
+Speed, on a 4-core x86-64 machine with Node 24, otherwise idle; everything runs on one
+core. 12 MP is Kodak's kodim05 scaled to 4000×3000 (a 24 MB PNG, a 1.4 MB JPEG at q88);
+best of 2–3 runs:
+
+| 12 MP, in Node | Time |
+| --- | --- |
+| PNG, block mode: scramble / restore | 5.0 s / 5.1 s |
+| PNG, pixel mode: scramble / restore | 3.1 s / 5.7 s |
+| JPEG → JPEG: scramble / restore | 0.5 s / 0.5 s |
+| JPEG → plain PNG (`convert`): built-in decoder / `sharpDecoder` | 4.5 s / 4.0 s |
+| JPEG → scrambled PNG, built-in decoder | 8.9 s |
+| PNG → scrambled JPEG (colour conversion, DCT and entropy coding in JS) | 2.0 s |
+| JPEG → JPEG XL, JPEG route: scramble / restore to JPEG XL | 1.1 s / 1.1 s |
+| PNG → JPEG XL, pixel mode (effort 2) | 3.9 s |
+| PNG → JPEG XL, block mode (effort 7) | 22 s |
+| JPEG XL pixel route, restore to JPEG XL (`decodeAsync`, effort 7) | 19–21 s |
+
+- Native zlib is used when available; browsers use
+  `CompressionStream`/`DecompressionStream`.
+- Converting a JPEG to PNG is mostly building the PNG, whichever decoder is used.
+- The JPEG route is fast because nothing is DCT'd or entropy-optimised twice.
+- The JPEG XL pixel route is single-threaded WASM. Block mode at effort 7 is slow but about
+  20% smaller than PNG block mode; lower `effort` trades size for speed (at 2 MP, effort 5
+  takes 40% of effort 7's time, for a 13% larger file). Restoring to JPEG XL encodes again
+  at effort 7 (`effort` changes it); restoring for display (`restoreForDisplay`, the
+  reveal) decodes only.
+
+Revealing a 12 MP image in the browser, with the worker, shown 400 px wide (so animated at
+a reduced size), from a local server; the time from `reveal()` to the restored `<img>` with
+`effect: 'none'` (an animation adds its `duration`, 1.2 s by default, plus about 0.2 s):
+
+| 12 MP reveal | Chromium | WebKit |
+| --- | --- | --- |
+| PNG, block mode | 6.1 s | 4.5 s |
+| JPEG | 0.65 s | 0.6 s |
+| JPEG XL, JPEG route | 1.25 s | 1.2 s |
+| JPEG XL, pixel route (block mode) | 8.3 s | 5.9 s |
+
+The page stays responsive while the worker decodes. The longest gap between animation
+frames on the page was 70 ms in Chromium during a `dissolve` (170 ms for PNG with `none`);
+in WebKit, about 100 ms for JPEG and up to 350 ms for PNG and pixel-route JPEG XL.
+
+JPEG XL encode times with libjxl 0.12 against the encoders it replaced (`@jsquash/jxl` for
+pixels, `jxl-wasm`'s `cjxl` 0.7 for the JPEG route), in Node on the same synthetic, noisy
+photo-like images (so block mode is slower here than on real photos). The "before" columns
+are from the original comparison and were not measured again; "now" is from the setup
+above:
 
 | Encode | 2 MP before | 2 MP now | 12 MP before | 12 MP now |
 | --- | --- | --- | --- | --- |
-| pixel mode (effort 2) | 0.58 s, 6.61 MB | 0.66 s, 6.41 MB | 5.3 s, 39.7 MB | 4.3 s, 38.5 MB |
-| block 16 (effort 7) | 20.5 s, 1.66 MB | 4.6 s, 1.75 MB | 66 s, 9.57 MB | 35 s, 10.25 MB |
-| JPEG route | 0.77 s | 0.16 s | 1.44 s | 1.24 s |
-| JPEG route, restore to JPEG XL | 0.85 s | 0.23 s | 1.83 s | 1.73 s |
+| pixel mode (effort 2) | 0.58 s, 6.61 MB | 0.49 s, 6.41 MB | 5.3 s, 39.7 MB | 3.8 s, 38.5 MB |
+| block 16 (effort 7) | 20.5 s, 1.66 MB | 4.3 s, 1.77 MB | 66 s, 9.57 MB | 26 s, 10.44 MB |
+| JPEG route | 0.77 s | 0.27 s | 1.44 s | 1.5 s |
+| JPEG route, restore to JPEG XL | 0.85 s | 0.26 s | 1.83 s | 1.4 s |
 
-The JPEG route's files are the same size as before. Block mode is 2–4 times faster at
-effort 7 and 5–7% larger (higher efforts close that gap only slowly).
+The JPEG route's files are the same size as before. Block mode is 2.5–5 times faster at
+effort 7 and 7–9% larger (higher efforts close that gap only slowly). Without SIMD (see
+"The codec"), block mode took 5.6 s at 2 MP and 33 s at 12 MP; the other rows stayed
+within 10%.
 
 ## Fuzzing
 

@@ -1,0 +1,10 @@
+{
+  "id": "vivi-privacy",
+  "name": "Privacy: keep camera details, credit Vivi",
+  "description": "Removes location, serial numbers, maker notes, owner names, timestamps, editing history, thumbnails and C2PA; keeps the rest, with Vivi as artist and copyright holder.",
+  "preset": "privacy",
+  "set": {
+    "artist": "Vivi",
+    "copyright": "Vivi"
+  }
+}

@@ -20,6 +20,7 @@ import { sanitizeJpeg } from '../formats/jpeg/index.js';
 import { buildPng } from './png-build.js';
 import { buildJpeg } from './jpeg-build.js';
 import { BUILTIN_DECODERS } from './decoders.js';
+import { applyMetadata, applyMetadataAsync, applyJxlParts, normalizePolicy } from '../meta/apply.js';
 
 const EXTRACTORS = { jpeg: readJpegMetadata, webp: readWebpMetadata, jxl: readJxlMetadata };
 export const OUTPUT_FORMATS = ['png', 'jpeg', 'jxl'];
@@ -33,6 +34,8 @@ export const OUTPUT_FORMATS = ['png', 'jpeg', 'jxl'];
  * @property {'4:2:0'|'4:2:2'|'4:4:4'} [subsampling='4:2:0']
  * @property {string} [background='#ffffff']  what transparency is flattened onto for JPEG
  * @property {Partial<import('../core/limits.js').Limits>} [limits]  resource limits for the input
+ * @property {object|string} [metadata]  a metadata policy for the output (see meta/policy.js);
+ *           without one, metadata is carried over as described above
  *
  * @typedef {object} ConvertResult
  * @property {Uint8Array} bytes
@@ -41,6 +44,8 @@ export const OUTPUT_FORMATS = ['png', 'jpeg', 'jxl'];
  * @property {string} decoder        which decoder produced the pixels ('none' = lossless path)
  * @property {string[]} transferred  metadata carried into the output
  * @property {string[]} dropped      what could not be (or was deliberately not) carried, and why
+ * @property {import('../meta/apply.js').MetadataReport} [metadata]  what the metadata policy
+ *           removed and set (only with a policy)
  */
 
 export function targetFormat(from, format) {
@@ -54,30 +59,44 @@ export function targetFormat(from, format) {
 /** Synchronous; built-in decoders or sync plugins only. @returns {ConvertResult} */
 export function convert(input, opts = {}) {
   const bytes = toBytes(input);
-  opts = withLimits(bytes, opts);
+  opts = withPolicy(withLimits(bytes, opts));
   const job = prepare(bytes, opts);
-  if (job.done) return job.done;
+  if (job.done) return applied(job.done, opts);
   if (job.target === 'jxl') throw new PixmixError('JPEG XL output needs encodeAsync/convertAsync', 'ASYNC_DECODER');
   const decoded = callDecoder(job, bytes, opts.limits);
   if (decoded && typeof decoded.then === 'function') {
     decoded.catch(() => {}); // nobody will await it
     throw new PixmixError(`Decoder "${job.decoder.name}" is async; use encodeAsync/convertAsync`, 'ASYNC_DECODER');
   }
-  return finish(bytes, job, checkDecoded(job, decoded, opts.limits), opts);
+  return applied(finish(bytes, job, checkDecoded(job, decoded, opts.limits), opts), opts);
 }
 
 /** Accepts async decoder plugins (sharp, browser-native) and JPEG XL. @returns {Promise<ConvertResult>} */
 export async function convertAsync(input, opts = {}) {
   const bytes = toBytes(input);
-  opts = withLimits(bytes, opts);
+  opts = withPolicy(withLimits(bytes, opts));
   const job = prepare(bytes, opts);
-  if (job.done) return job.done;
+  if (job.done) {
+    if (!opts.metadata) return job.done;
+    const { bytes: out, report } = await applyMetadataAsync(job.done.bytes, opts.metadata, { limits: opts.limits, stripThumbnails: !opts.keepThumbnails });
+    return { ...job.done, bytes: out, metadata: report };
+  }
   if (job.target === 'jxl') {
     const { image, boxes, report } = await decodeJob(bytes, job, opts);
     const codestream = await (await loadJxlCodec()).encode(image);
     return { bytes: wrapCodestream(boxes, codestream), ...report };
   }
-  return finish(bytes, job, await decodeAsync(job, bytes, opts.limits), opts);
+  return applied(finish(bytes, job, await decodeAsync(job, bytes, opts.limits), opts), opts);
+}
+
+/** Options with the metadata policy validated up front (before any decoding work). */
+const withPolicy = (opts) => (opts.metadata === undefined ? opts : { ...opts, metadata: normalizePolicy(opts.metadata) });
+
+/** A PNG or JPEG result with the metadata policy applied (and reported). */
+function applied(result, { metadata, limits, keepThumbnails }) {
+  if (!metadata) return result;
+  const { bytes, report } = applyMetadata(result.bytes, metadata, { limits, stripThumbnails: !keepThumbnails });
+  return { ...result, bytes, metadata: report };
 }
 
 // Decoders (plugins above all) throw whatever their library throws; callers get a
@@ -135,11 +154,19 @@ export async function decodeForJxl(input, opts = {}) {
   return decodeJob(bytes, job, opts);
 }
 
-async function decodeJob(bytes, job, { keepThumbnails = false, limits }) {
+async function decodeJob(bytes, job, { keepThumbnails = false, limits, metadata }) {
   const decoded = normalise(await decodeAsync(job, bytes, limits));
   const meta = mergedMeta(bytes, job.from, decoded, keepThumbnails, limits);
-  const { image, boxes, transferred, dropped } = jxlImage(decoded, meta);
-  return { image, boxes, report: { format: 'jxl', from: job.from, decoder: job.decoder.name, transferred, dropped, notes: sizeNotes(bytes, job.from, 'jxl') } };
+  let { image, boxes, transferred, dropped } = jxlImage(decoded, meta);
+  const report = { format: 'jxl', from: job.from, decoder: job.decoder.name, transferred, dropped, notes: sizeNotes(bytes, job.from, 'jxl') };
+  if (metadata) {
+    // The pixel route encodes the codestream, so the ICC profile can change here too.
+    const parts = applyJxlParts({ boxes, icc: image.icc ?? null }, normalizePolicy(metadata), { limits, stripThumbnails: !keepThumbnails });
+    ({ boxes } = parts);
+    image = { ...image, icc: parts.icc };
+    report.metadata = parts.report;
+  }
+  return { image, boxes, report };
 }
 
 /**

@@ -12,7 +12,8 @@
     "./browser": "./src/browser/index.js",
     "./plugins/sharp": "./src/plugins/sharp.js",
     "./plugins/browser": "./src/plugins/browser.js",
-    "./watermarks": "./src/watermark/index.js"
+    "./watermarks": "./src/watermark/index.js",
+    "./metadata": "./src/meta/index.js"
   },
   "files": [
     "src",
@@ -20,7 +21,8 @@
     "bin",
     "native/jxl/pkg",
     "native/libjxl/pkg",
-    "watermarks"
+    "watermarks",
+    "metadata-profiles"
   ],
   "scripts": {
     "build": "node scripts/build.js",

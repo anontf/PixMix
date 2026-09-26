@@ -6,7 +6,8 @@
 //
 // Watermarks live in the repository's watermarks/ directory ($PIXMIX_WATERMARKS_DIR
 // overrides it): the lab edits them through /api/watermarks, and decoders fetch the compiled
-// ones from /watermarks/<id>.json.
+// ones from /watermarks/<id>.json. Metadata profiles live in metadata-profiles/
+// ($PIXMIX_METADATA_PROFILES_DIR), edited through /api/metadata-profiles.
 
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -16,6 +17,8 @@ import { encodeAsync, rekeyAsync, inspect, detectFormat, sharpDecoder, PixmixErr
 import { decodeAsync } from '../src/decoder.js';
 import { watermarkStore } from '../src/watermark/store.js';
 import { ID_PATTERN, normalizeDefinition } from '../src/watermark/schema.js';
+import { metadataProfileStore } from '../src/meta/profiles.js';
+import { normalizePolicy, PROFILE_ID, PRESET_NAMES, KINDS, GROUPS } from '../src/meta/policy.js';
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8080; // 0 = any free port
 const HOST = process.env.HOST || '127.0.0.1';
@@ -40,7 +43,24 @@ const decoders = sharp ? [sharpDecoder(sharp, { formats: ['webp', 'avif', 'heic'
 const gallery = new Map();
 
 const watermarks = watermarkStore();
+const profiles = metadataProfileStore();
 const httpError = (status, message) => Object.assign(new Error(message), { status });
+
+/**
+ * The ?metadata= parameter: a preset name or a profile id, as the policy to pass on (the
+ * profile object itself: the encoder bundle validates it again), or undefined.
+ */
+async function storedPolicy(ref) {
+  if (!ref) return undefined;
+  if (PRESET_NAMES.includes(ref)) return ref;
+  if (!PROFILE_ID.test(ref)) throw httpError(400, `Invalid metadata profile id "${ref}"`);
+  const profile = await profiles.get(ref);
+  normalizePolicy(profile);
+  return profile;
+}
+
+// Reports go in response headers: JSON with anything outside ASCII escaped.
+const headerJson = (obj) => JSON.stringify(obj).replace(/[\u007f-\uffff]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
 
 /** The ?watermark= style parameter: an id in the store, or null. */
 async function storedWatermark(id) {
@@ -70,29 +90,43 @@ const routes = {
       // visibleWatermark: drawn on the scrambled image.
       watermark: q.get('watermarkEmbed') === 'id' && q.get('watermark') ? { id: q.get('watermark') } : await storedWatermark(q.get('watermark')),
       visibleWatermark: await storedWatermark(q.get('visibleWatermark')),
+      // ?metadata=<preset or profile id>: the scrambled file's metadata.
+      metadata: await storedPolicy(q.get('metadata')),
     });
     const { bytes: _, ...info } = report;
-    return { ...image(out), headers: { 'X-Pixmix-Convert': JSON.stringify(info) } };
+    return { ...image(out), headers: { 'X-Pixmix-Convert': headerJson(info) } };
   },
-  // ?watermark=<id> draws that watermark on the result, ?watermark=embedded the file's own.
+  // ?watermark=<id> draws that watermark on the result, ?watermark=embedded the file's own;
+  // ?metadata= sets the restored file's metadata (X-Pixmix-Metadata reports what changed).
   'POST /api/decode': async (req, q) => {
     const wm = q.get('watermark');
-    return image(await decodeAsync(await body(req), {
+    let meta = null;
+    const out = await decodeAsync(await body(req), {
       key: q.get('key'),
       limits: LIMITS,
       watermark: wm === 'embedded' ? 'embedded' : await storedWatermark(wm),
       resolveWatermark: (id) => storedWatermark(id),
-    }));
+      metadata: await storedPolicy(q.get('metadata')),
+      onMetadata: (r) => { meta = r; },
+    });
+    return { ...image(out), headers: meta ? { 'X-Pixmix-Metadata': headerJson(meta) } : {} };
   },
-  'POST /api/rekey': async (req, q) => image(await rekeyAsync(await body(req), {
-    from: q.get('from'),
-    to: q.get('to'),
-    mode: q.get('mode') || undefined,
-    block: q.has('block') ? Number(q.get('block')) : undefined,
-    transforms: q.has('transforms') ? q.get('transforms') !== '0' : undefined,
-    limits: LIMITS,
-  })),
-  'POST /api/inspect': async (req) => json(inspect(await body(req), { limits: LIMITS })),
+  'POST /api/rekey': async (req, q) => {
+    let meta = null;
+    const out = await rekeyAsync(await body(req), {
+      from: q.get('from'),
+      to: q.get('to'),
+      mode: q.get('mode') || undefined,
+      block: q.has('block') ? Number(q.get('block')) : undefined,
+      transforms: q.has('transforms') ? q.get('transforms') !== '0' : undefined,
+      limits: LIMITS,
+      metadata: await storedPolicy(q.get('metadata')),
+      onMetadata: (r) => { meta = r; },
+    });
+    return { ...image(out), headers: meta ? { 'X-Pixmix-Metadata': headerJson(meta) } : {} };
+  },
+  // ?metadata=1 adds the parsed metadata (EXIF tags, XMP properties, ICC, text, …).
+  'POST /api/inspect': async (req, q) => json(inspect(await body(req), { limits: LIMITS, metadata: q.get('metadata') === '1' })),
 
   // Stores an already-scrambled image for the demo site.
   'POST /api/gallery': async (req, q) => {
@@ -123,6 +157,26 @@ const routes = {
     const definition = normalizeDefinition(await jsonBody(req));
     return json({ definition, compiled: watermarks.compile(definition) });
   },
+
+  // Metadata profiles, saved to the metadata-profiles/ directory.
+  'GET /api/metadata-profiles': async () => json({ profiles: await profiles.list(), presets: PRESET_NAMES, kinds: KINDS, groups: GROUPS }),
+  'POST /api/metadata-profiles': async (req) => {
+    const profile = await jsonBody(req);
+    if (PROFILE_ID.test(profile?.id) && (await profiles.exists(profile.id))) throw httpError(409, `Metadata profile "${profile.id}" already exists`);
+    return json(await profiles.save(profile), 201);
+  },
+};
+
+/** /api/metadata-profiles/<id>: read, create or replace, delete. */
+const profileRoutes = {
+  GET: async (id) => json(await profiles.get(id)),
+  PUT: async (id, req) => {
+    const profile = await jsonBody(req);
+    if (profile?.id !== id) throw httpError(400, 'The profile\'s id must match the URL');
+    const created = !(await profiles.exists(id));
+    return json(await profiles.save(profile), created ? 201 : 200);
+  },
+  DELETE: async (id) => { await profiles.remove(id); return json({ ok: true }); },
 };
 
 /** /api/watermarks/<id>: read, create or replace, delete. */
@@ -147,11 +201,15 @@ const server = createServer(async (req, res) => {
   try {
     const route = routes[`${req.method} ${url.pathname}`];
     const wm = /^\/api\/watermarks\/([^/]+)$/.exec(url.pathname);
+    const mp = /^\/api\/metadata-profiles\/([^/]+)$/.exec(url.pathname);
     let out;
     if (route) out = await route(req, url.searchParams);
     else if (wm && watermarkRoutes[req.method]) {
       if (!ID_PATTERN.test(wm[1])) throw httpError(400, 'Invalid watermark id');
       out = await watermarkRoutes[req.method](wm[1], req);
+    } else if (mp && profileRoutes[req.method]) {
+      if (!PROFILE_ID.test(mp[1])) throw httpError(400, 'Invalid metadata profile id');
+      out = await profileRoutes[req.method](mp[1], req);
     } else if (req.method === 'GET') out = await staticFile(url.pathname);
     else out = json({ error: 'Not found' }, 404);
     send(res, out);

@@ -172,7 +172,14 @@ const out = await encodeAsync(webpBytes, {
 ```
 
 In browsers, `browserDecoder()` uses the browser's own decoders (WebP, AVIF, BMP, …).
-`convert` / `convertAsync` produce the plain, unscrambled file the encoder would scramble.
+A plugin only claims formats it can decode (`sharpDecoder` checks libvips' loaders), and
+leaves GIF and JPEG XL to pixmix's exact built-in decoders unless `formats` says otherwise.
+If a plugin fails on a format pixmix decodes itself, the built-in decoder takes over and
+the report's `notes` say so.
+`convert` / `convertAsync` produce the plain, unscrambled file the encoder would scramble
+(for JPEG XL output, along the same route: a JPEG is recompressed as the JPEG route holds
+it, unless `mode` asks for pixels). A JPEG XL made from a JPEG converts back to that JPEG,
+bit for bit, when jxl-oxide rebuilds it verifiably.
 
 Input that is already scrambled is refused with `ALREADY_SCRAMBLED` whatever the output
 format (decode it first, or use `rekey`): scrambling it again would lose the original.
@@ -298,10 +305,15 @@ Where each kind of metadata ends up:
 | Comments | `tEXt Comment` (`iTXt` beyond Latin-1) | COM (UTF-8) | dropped (no field) |
 
 The pixels stay exactly as stored. They aren't rotated (the EXIF orientation travels with
-the EXIF) and aren't converted to sRGB (the ICC profile travels with the image).
+the EXIF; a TIFF's orientation tag becomes EXIF; JPEG XL keeps it in its header, which
+viewers follow rather than the EXIF, so JPEG XL output gets the EXIF orientation there and
+JPEG XL input hands its header's orientation to the EXIF) and aren't converted to sRGB (the ICC
+profile travels with the image). AVIF and HEIC are the exception: libheif always applies
+their rotation, so the EXIF orientation is set to 1 and the report says so.
 
 Some things are dropped, and the report says so:
 - animation frames after the first;
+- pages after the first of a multi-page TIFF (or HEIF collection);
 - CMYK and other non-RGB/grey profiles, and grey profiles on colour images;
 - extended XMP;
 - precision above 8 bits when writing JPEG (PNG and JPEG XL keep 16 bits), and in
@@ -315,9 +327,9 @@ Every report has `notes` (a list, often empty): a lossless output of a lossy sou
 lossy WebP, AVIF unless coded as RGB, HEIC, lossy or recompressed-JPEG JPEG XL) gets a note
 that it will be several times larger, and what stays small.
 
-A PNG gets the smallest colour type that loses nothing: grey, palette (1–8 bit), RGB or
-RGBA. Palette output also compresses far better once the pixels are scrambled. A JPEG is
-written as a single component when the image is grey.
+A PNG gets the smallest colour type that loses nothing: grey (1–8 bit), palette (1–8
+bit), RGB or RGBA. Palette output also compresses far better once the pixels are
+scrambled. A JPEG is written as a single component when the image is grey.
 
 Sources deeper than 8 bits become 16-bit PNGs or JPEG XLs:
 - 16-bit PNG, 16-bit TIFF/PNG/AVIF/HEIF through sharp, and 10/12/16-bit or float JPEG XL.
@@ -406,10 +418,13 @@ a JPEG XL made by recompressing one (it has a `jbrd` box):
 
 **Pixel route** (`mode: 'pixel' | 'block'`), for everything else:
 - Decode JPEG XL with pixmix → the exact samples the input decodes to: 8- or 16-bit, in
-  its own colour space (never converted), every frame of an animation.
+  its own colour space (never converted), on the stored pixel grid (the header's
+  orientation isn't applied), every frame of an animation.
 - Scramble in `pixel` or `block` mode (each animation frame with its own permutation).
-- Encode losslessly with libjxl, with the same ICC profile (or sRGB), bit depth, frames,
-  delays and loop count. Grey and opaque images are stored with fewer channels.
+- Encode losslessly with libjxl, with the same colour encoding (the same enum values when
+  the input has them, else its ICC profile, else sRGB), orientation, bit depth, frames,
+  exact frame durations and loop count. Grey and opaque images are stored with fewer
+  channels.
 
 So the key always gives back exactly those samples. What the report lists under `dropped`
 when re-encoding a JPEG XL input on the pixel route:
@@ -427,8 +442,8 @@ when re-encoding a JPEG XL input on the pixel route:
 The codec has two parts, both pixmix's own WASM bindings:
 - **libjxl 0.12's encoder** (`native/libjxl`) for lossless encoding and JPEG
   recompression. A small C layer exposes:
-  - lossless 8- or 16-bit grey, grey+alpha, RGB or RGBA, tagged with an ICC profile or
-    as sRGB;
+  - lossless 8- or 16-bit grey, grey+alpha, RGB or RGBA, tagged with an enum colour
+    encoding, an ICC profile or as sRGB, with an orientation;
   - animations (full-canvas frames, per-frame durations, loop count);
   - lossless JPEG recompression with reconstruction data, in a container;
   - an effort setting.
@@ -438,16 +453,18 @@ The codec has two parts, both pixmix's own WASM bindings:
   lossless, so they give back the same pixels. Without SIMD, 2 MP block mode is about 15%
   slower and the JPEG route about 50% slower; pixel mode is about the same.
 - **pixmix's own jxl-oxide binding** (`native/jxl`) for decoding and JPEG reconstruction.
-  - It returns raw 8- or 16-bit pixels and the ICC profile, converting colour with `moxcms`,
-    a pure-Rust colour-management library.
-  - It can also return every keyframe of an animation.
+  - It returns raw 8- or 16-bit pixels, the ICC profile, the enum colour encoding and the
+    orientation, converting colour (only where asked, for display) with `moxcms`, a
+    pure-Rust colour-management library.
+  - It can also return every keyframe of an animation, with durations in ticks.
   - Neither published option would do. `@jsquash/jxl`'s libjxl decoder isn't bit-exact:
     it colour-converts even sRGB images and turns (4,255,0) into (3,255,0). The
     `jxl-oxide-wasm` package can't reconstruct JPEGs. A test guards the exactness.
 
 In the browser, most engines can't display JPEG XL. So the pixel route decodes it in WASM
 (as 8-bit sRGB), animates frame 0 like PNG, and gives the `<img>` a lossless PNG of the
-restored pixels, or an APNG of every frame for an animation. The JPEG route shows the
+restored pixels (turned the way the header's orientation says), or an APNG of every frame
+for an animation. The JPEG route shows the
 restored JPEG. Safari could show JPEG XL itself, but gets the PNG too, so every engine
 shows the same exact pixels.
 
@@ -585,7 +602,8 @@ the original exactly.
 - PNG: any colour type (palette images use their nearest palette colours); APNG frames that
   hold the whole watermark. JPEG: baseline, progressive, grey. JPEG XL: both routes, but on
   the pixel route only for 8-bit sRGB images (the browser reveals 8-bit sRGB pixels, and
-  the stored ones must be the same); others are refused.
+  the stored ones must be the same; a plain sRGB ICC profile is replaced by the sRGB
+  colour encoding); others are refused.
 - Tests check that pngjs, sharp (libpng, libjpeg) and jxl-oxide still read these files.
 
 Considered and left out:

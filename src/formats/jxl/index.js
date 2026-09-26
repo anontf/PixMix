@@ -24,6 +24,7 @@ import {
   makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError, FLAG_STASH, tileSize, tileTransforms,
 } from '../../core/params.js';
 import { stripExifPreviews, stripXmpPreviews } from '../../meta/thumbnails.js';
+import { isSrgbIcc } from '../../meta/icc.js';
 import { exifTiff, unwrapBrob } from '../../meta/jxl.js';
 import { scrambleJpeg, unscrambleJpegDetailed, rekeyJpeg, jpegMarkerBytes, jpegWatermark } from '../jpeg/index.js';
 import { readSegments } from '../jpeg/markers.js';
@@ -131,6 +132,9 @@ const frameList = (image) => (image.frames ? image.frames.map((f) => f.data) : [
  * @property {8|16} depth
  * @property {Uint8Array|Uint16Array} data   RGBA (frame 0 of an animation)
  * @property {Uint8Array|null} [icc]  colour profile of the samples (none = sRGB)
+ * @property {object|null} [colour]  the enum colour encoding they came with (see codec.js)
+ * @property {number} [orientation]  1-8: the samples are on the stored grid, and the header
+ *           says how to show them
  * @property {{data: Uint8Array, delay: [number, number]}[]} [frames]  animation: every
  *           frame, full canvas, 8-bit
  * @property {number} [plays]  0 = forever
@@ -138,8 +142,9 @@ const frameList = (image) => (image.frames ? image.frames.map((f) => f.data) : [
 
 /**
  * Decodes for re-encoding: frames of an animation, 16 bits when there are more than 8, and
- * the samples as stored, in the image's own colour space (with its ICC profile unless that
- * is sRGB). `display` asks for what a browser canvas wants instead: 8-bit sRGB.
+ * the samples as stored, on the stored grid (the orientation stays a header field) and in
+ * the image's own colour space (with its ICC profile unless that is sRGB). `display` asks
+ * for what a browser canvas wants instead: 8-bit sRGB (still on the stored grid).
  * @returns {Promise<JxlImage>}
  */
 export async function decodeJxlImage(bytes, { display = false, limits } = {}) {
@@ -148,14 +153,15 @@ export async function decodeJxlImage(bytes, { display = false, limits } = {}) {
   // Never convert an sRGB image: asking for sRGB would still turn grey into RGB.
   const srgb = display && header.srgb !== true;
   const icc = (profile) => (srgb || header.srgb === true ? null : profile);
+  const colour = (c) => (icc(c?.icc) ? c : null);
   if (header.animated) {
-    const a = await codec.decodeAnimation(bytes, { srgb, icc: header.srgb !== true, limits });
+    const a = await codec.decodeAnimation(bytes, { srgb, icc: header.srgb !== true, oriented: false, limits });
     if (a.frames.length > 1) {
-      return { width: a.width, height: a.height, depth: 8, data: a.frames[0].data, icc: icc(a.icc), frames: a.frames, plays: a.plays };
+      return { width: a.width, height: a.height, depth: 8, data: a.frames[0].data, icc: icc(a.icc), colour: colour(a.colour), orientation: a.orientation, frames: a.frames, plays: a.plays };
     }
   }
-  const image = await codec.decode(bytes, { srgb, high: !display && highPrecision(header), limits });
-  return { ...image, icc: icc(image.icc) };
+  const image = await codec.decode(bytes, { srgb, high: !display && highPrecision(header), oriented: false, limits });
+  return { ...image, icc: icc(image.icc), colour: colour(image.colour) };
 }
 
 // Frame i's permutation has index i in its seed; frame 0's key check goes in the marker.
@@ -203,17 +209,19 @@ export async function scrambleJxlPixels(image, boxes, { key, mode, block, transf
   if (watermark) extra.push({ type: WATERMARK_TAG, data: encodeWatermark(watermark) });
   if (visibleWatermark) {
     // Browsers get 8-bit sRGB pixels to reveal; only then are those the stored pixels too.
+    // A plain sRGB ICC profile says no more than the sRGB colour encoding, which replaces it.
+    if (image.icc && isSrgbIcc(image.icc)) image = { ...image, icc: null, colour: null };
     if (image.depth === 16 || image.icc) {
       throw new PixmixError('A visible watermark on JPEG XL needs an 8-bit sRGB image (or use PNG output)', 'UNSUPPORTED');
     }
-    const stash = stashRgba({ width: image.width, height: image.height, frames: frameList(scrambled.image) }, visibleWatermark, key, params.salt);
+    const stash = stashRgba({ width: image.width, height: image.height, orientation: image.orientation, frames: frameList(scrambled.image) }, visibleWatermark, key, params.salt);
     if (stash) {
       extra.push({ type: STASH_TAG, data: stash });
       params = { ...params, flags: FLAG_STASH };
     }
   }
   const codec = await loadJxlCodec();
-  const codestream = await codec.encode(scrambled.image, { effort: effortFor(params, effort) });
+  const codestream = await codec.encode({ ...scrambled.image, icc: image.icc, colour: image.colour }, { effort: effortFor(params, effort) });
   return wrapCodestream([...boxes, { type: MARKER_BOX, data: writeMarker(params, scrambled.layout.check) }, ...extra], codestream);
 }
 
@@ -298,20 +306,36 @@ function routeError(why) {
 }
 
 async function toJxlWithMarker(scrambledJpeg, limits) {
+  // The JPEG inside holds the watermark segments; a copy in a box lets inspect() see it.
+  const wm = jpegWatermark(readSegments(scrambledJpeg).segments, limits).data;
+  const mirror = wm ? [{ type: WATERMARK_TAG, data: wm }] : [];
+  return recompressChecked(scrambledJpeg, [{ type: MARKER_BOX, data: jpegMarkerBytes(scrambledJpeg) }, ...mirror], limits);
+}
+
+/**
+ * A (plain, unscrambled) JPEG recompressed into JPEG XL as the JPEG route carries it, which
+ * is what convertAsync gives for JPEG XL output from a JPEG: the same coefficients, written
+ * the way a JPEG-route file restores them (baseline, like the scrambled JPEG it holds).
+ * Throws like the route does (with `jpegRoute` set) when the JPEG cannot take it.
+ */
+export async function jpegToJxl(jpeg, limits) {
+  const key = 'pixmix';
+  const plain = unscrambleJpegDetailed(scrambleJpeg(jpeg, { key, progressive: false, limits }), { key, limits }).toJpeg();
+  return recompressChecked(plain, [], limits);
+}
+
+async function recompressChecked(jpeg, extra, limits) {
   const codec = await loadJxlCodec();
   let transcoded;
   try {
-    transcoded = await codec.transcodeJpeg(scrambledJpeg);
+    transcoded = await codec.transcodeJpeg(jpeg);
   } catch (err) {
     if (err?.code === 'LIMIT') throw err;
     throw routeError(`libjxl cannot recompress it: ${err?.message ?? err}`); // e.g. CMYK, 4:1:1
   }
   const { boxes, codestream } = readJxl(transcoded);
   const kept = boxes.filter((b) => !STRUCTURE.has(b.type)); // jbrd, Exif, xml from libjxl
-  // The JPEG inside holds the watermark segments; a copy in a box lets inspect() see it.
-  const wm = jpegWatermark(readSegments(scrambledJpeg).segments, limits).data;
-  const mirror = wm ? [{ type: WATERMARK_TAG, data: wm }] : [];
-  const out = writeJxl([...kept, { type: MARKER_BOX, data: jpegMarkerBytes(scrambledJpeg) }, ...mirror], codestream);
+  const out = writeJxl([...kept, ...extra], codestream);
   // libjxl writes the file and jxl-oxide rebuilds the JPEG from it, and jxl-oxide 0.12 gets
   // some JPEGs wrong (e.g. 4:4:4 stored with 1x2 sampling factors). A file that cannot be
   // rebuilt bit for bit could never be restored, so never write one.
@@ -322,7 +346,7 @@ async function toJxlWithMarker(scrambledJpeg, limits) {
     if (err?.code === 'LIMIT') throw err;
     throw routeError(`jxl-oxide cannot rebuild it: ${err?.message ?? err}`);
   }
-  if (!rebuilt || !sameBytes(rebuilt, scrambledJpeg)) throw routeError('jxl-oxide does not rebuild it exactly');
+  if (!rebuilt || !sameBytes(rebuilt, jpeg)) throw routeError('jxl-oxide does not rebuild it exactly');
   return out;
 }
 
@@ -384,7 +408,7 @@ export async function unscrambleJxlDetailed(bytes, { key, effort, display = fals
     if (!paint?.watermark) return image;
     const copy = image.frames ? { ...image, frames: image.frames.map((f) => ({ ...f, data: f.data.slice() })) } : { ...image, data: image.data.slice() };
     if (copy.frames) copy.data = copy.frames[0].data;
-    paint.painter.paintRgba({ width: image.width, height: image.height, frames: frameList(copy) }, paint.watermark, paint.limits);
+    paint.painter.paintRgba({ width: image.width, height: image.height, orientation: image.orientation, frames: frameList(copy) }, paint.watermark, paint.limits);
     return copy;
   };
   return {

@@ -181,7 +181,8 @@ test('animated GIF becomes an APNG with every frame, its delays and loop count',
   assert.deepEqual(r.dropped, []);
   assert.ok(r.transferred.includes('animation'));
   const info = inspect(r.bytes);
-  assert.deepEqual([info.animated, info.frames, info.plays, info.colorType], [true, 3, 2, 3]);
+  // NETSCAPE loop 2 = two repeats: browsers play it three times.
+  assert.deepEqual([info.animated, info.frames, info.plays, info.colorType], [true, 3, 3, 3]);
   const fctl = readChunks(r.bytes).filter((c) => c.type === 'fcTL').map((c) => [Buffer.from(c.data).readUInt16BE(20), Buffer.from(c.data).readUInt16BE(22)]);
   assert.deepEqual(fctl, [[20, 100], [10, 100], [5, 100]], 'delays, with 0 played as 10 like browsers do');
   const frames = readPng(r.bytes).frames;
@@ -398,4 +399,14 @@ test('PNG comments outside Latin-1 are written as iTXt', () => {
   assert.deepEqual(texts.map((c) => c.type), ['tEXt', 'iTXt']);
   assert.ok(Buffer.from(texts[1].data).includes(Buffer.from('naïve ✓')));
   assert.deepEqual(convert(convert(png, { format: 'jpeg' }).bytes, { format: 'png' }).transferred.includes('comments'), true);
+});
+
+test('grey PNG output uses 1, 2 or 4 bits when its levels allow, losslessly', () => {
+  for (const [levels, depth] of [[[0, 255], 1], [[0, 85, 170, 255], 2], [[0, 17, 136, 255], 4], [[0, 1, 255], 8]]) {
+    const data = new Uint8Array(W * H * 4);
+    for (let i = 0; i < W * H; i++) { const v = levels[i % levels.length]; data.set([v, v, v, 255], i * 4); }
+    const { png } = buildPng({ width: W, height: H, data });
+    assert.deepEqual([chunk(png, 'IHDR')[8], chunk(png, 'IHDR')[9]], [depth, 0], `levels ${levels}`);
+    assert.deepEqual(rgbaOf(png), data);
+  }
 });

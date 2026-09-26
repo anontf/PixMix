@@ -1,7 +1,10 @@
 //! Minimal JPEG XL bindings for pixmix, on top of jxl-oxide:
 //! - `decode`: first frame as interleaved 8- or 16-bit samples (orientation applied),
-//!   optionally converted to sRGB, plus the ICC profile of the returned pixels;
-//! - `decode_animation`: every keyframe, with durations in milliseconds and the loop count;
+//!   optionally converted to sRGB, plus the ICC profile of the returned pixels, the
+//!   orientation, and the enum colour encoding when the image has one instead of an ICC
+//!   profile (so an encoder can write it again as it was);
+//! - `decode_animation`: every keyframe, with durations in ticks, the tick rate and the
+//!   loop count;
 //! - `reconstruct_jpeg`: the original JPEG from a losslessly recompressed JPEG XL.
 //!
 //! Every call takes resource limits (see pixmix's core/limits.js): the image size and frame
@@ -12,6 +15,7 @@
 use std::cell::RefCell;
 use std::io::Cursor;
 
+use jxl_oxide::color::{ColourEncoding, ColourSpace, Primaries, TransferFunction, WhitePoint};
 use jxl_oxide::{AllocTracker, EnumColourEncoding, JpegReconstructionStatus, JxlImage, PixelFormat, RenderingIntent};
 use wasm_bindgen::prelude::*;
 
@@ -41,6 +45,8 @@ pub struct Decoded {
     pixels: Vec<u8>,
     pixels16: Vec<u16>,
     icc: Vec<u8>,
+    orientation: u32,
+    colour: Vec<f64>,
 }
 
 #[wasm_bindgen]
@@ -61,6 +67,64 @@ impl Decoded {
     /// ICC profile of the returned pixels; empty when they are sRGB.
     #[wasm_bindgen(getter)]
     pub fn icc(&self) -> Vec<u8> { self.icc.clone() }
+    /// The codestream's orientation (1-8, as in EXIF), which the pixels have applied.
+    #[wasm_bindgen(getter)]
+    pub fn orientation(&self) -> u32 { self.orientation }
+    /// The enum colour encoding of the returned pixels (see `colour_of`); empty when the
+    /// image has an ICC profile or the pixels were converted to sRGB.
+    #[wasm_bindgen(getter)]
+    pub fn colour(&self) -> Vec<f64> { self.colour.clone() }
+}
+
+/// The image's enum colour encoding as numbers, in libjxl's JxlColorEncoding terms (the
+/// same values as the JPEG XL spec): colour space, white point, primaries, transfer
+/// function, gamma, rendering intent, then the white point's and the red, green and blue
+/// primaries' xy (0 unless custom). Empty for an ICC profile, or XYB/unknown colour spaces.
+fn colour_of(image: &JxlImage) -> Vec<f64> {
+    let ColourEncoding::Enum(e) = &image.image_header().metadata.colour_encoding else {
+        return Vec::new();
+    };
+    let space = match e.colour_space {
+        ColourSpace::Rgb => 0.0,
+        ColourSpace::Grey => 1.0,
+        ColourSpace::Xyb | ColourSpace::Unknown => return Vec::new(),
+    };
+    let xy = |c: jxl_oxide::color::Customxy| [c.x as f64 / 1e6, c.y as f64 / 1e6];
+    let (white, wxy) = match e.white_point {
+        WhitePoint::D65 => (1.0, [0.0; 2]),
+        WhitePoint::Custom(c) => (2.0, xy(c)),
+        WhitePoint::E => (10.0, [0.0; 2]),
+        WhitePoint::Dci => (11.0, [0.0; 2]),
+    };
+    let (primaries, pxy) = match e.primaries {
+        Primaries::Srgb => (1.0, [0.0; 6]),
+        Primaries::Custom { red, green, blue } => {
+            let (r, g, b) = (xy(red), xy(green), xy(blue));
+            (2.0, [r[0], r[1], g[0], g[1], b[0], b[1]])
+        }
+        Primaries::Bt2100 => (9.0, [0.0; 6]),
+        Primaries::P3 => (11.0, [0.0; 6]),
+    };
+    let (tf, gamma) = match e.tf {
+        TransferFunction::Gamma { g, .. } => (65535.0, g as f64 / 1e7),
+        TransferFunction::Bt709 => (1.0, 0.0),
+        TransferFunction::Unknown => (2.0, 0.0),
+        TransferFunction::Linear => (8.0, 0.0),
+        TransferFunction::Srgb => (13.0, 0.0),
+        TransferFunction::Pq => (16.0, 0.0),
+        TransferFunction::Dci => (17.0, 0.0),
+        TransferFunction::Hlg => (18.0, 0.0),
+    };
+    let intent = match e.rendering_intent {
+        RenderingIntent::Perceptual => 0.0,
+        RenderingIntent::Relative => 1.0,
+        RenderingIntent::Saturation => 2.0,
+        RenderingIntent::Absolute => 3.0,
+    };
+    let mut out = vec![space, white, primaries, tf, gamma, intent];
+    out.extend_from_slice(&wxy);
+    out.extend_from_slice(&pxy);
+    out
 }
 
 /// Numbers from JS, so Infinity means no limit.
@@ -116,6 +180,8 @@ pub fn decode(bytes: &[u8], srgb: bool, high: bool, max_pixels: f64, alloc_bytes
     }
     let channels = channels_of(&image)?;
     let icc = if srgb { Vec::new() } else { image.rendered_icc() };
+    let colour = if srgb { Vec::new() } else { colour_of(&image) };
+    let orientation = image.image_header().metadata.orientation;
     let frame = image.render_frame(0).map_err(error)?;
     let mut stream = frame.stream();
     let (width, height) = (stream.width(), stream.height());
@@ -128,7 +194,7 @@ pub fn decode(bytes: &[u8], srgb: bool, high: bool, max_pixels: f64, alloc_bytes
         pixels = vec![0u8; n];
         stream.write_to_buffer(&mut pixels);
     }
-    Ok(Decoded { width, height, channels, pixels, pixels16, icc })
+    Ok(Decoded { width, height, channels, pixels, pixels16, icc, orientation, colour })
 }
 
 #[wasm_bindgen]
@@ -138,8 +204,11 @@ pub struct Animation {
     channels: u32,
     count: u32,
     pixels: Vec<u8>,
-    durations_ms: Vec<u32>,
+    ticks: Vec<u32>,
+    tps_numerator: u32,
+    tps_denominator: u32,
     loops: u32,
+    orientation: u32,
 }
 
 #[wasm_bindgen]
@@ -155,11 +224,19 @@ impl Animation {
     pub fn count(&self) -> u32 { self.count }
     #[wasm_bindgen(js_name = takePixels)]
     pub fn take_pixels(&mut self) -> Vec<u8> { std::mem::take(&mut self.pixels) }
-    #[wasm_bindgen(getter, js_name = durationsMs)]
-    pub fn durations_ms(&self) -> Vec<u32> { self.durations_ms.clone() }
+    /// Each frame's duration in ticks; a tick is `tpsDenominator / tpsNumerator` seconds.
+    #[wasm_bindgen(getter)]
+    pub fn ticks(&self) -> Vec<u32> { self.ticks.clone() }
+    #[wasm_bindgen(getter, js_name = tpsNumerator)]
+    pub fn tps_numerator(&self) -> u32 { self.tps_numerator }
+    #[wasm_bindgen(getter, js_name = tpsDenominator)]
+    pub fn tps_denominator(&self) -> u32 { self.tps_denominator }
     /// 0 = forever.
     #[wasm_bindgen(getter)]
     pub fn loops(&self) -> u32 { self.loops }
+    /// The codestream's orientation (1-8), which the frames have applied.
+    #[wasm_bindgen(getter)]
+    pub fn orientation(&self) -> u32 { self.orientation }
 }
 
 /// All keyframes (composited, orientation applied), like `decode` but for animations.
@@ -177,10 +254,11 @@ pub fn decode_animation(
         image.request_color_encoding(EnumColourEncoding::srgb(RenderingIntent::Relative));
     }
     let channels = channels_of(&image)?;
-    let (tps_num, tps_den, loops) = match &image.image_header().metadata.animation {
-        Some(a) => (a.tps_numerator.max(1) as u64, a.tps_denominator as u64, a.num_loops),
-        None => (1, 0, 0),
+    let (tps_numerator, tps_denominator, loops) = match &image.image_header().metadata.animation {
+        Some(a) => (a.tps_numerator.max(1), a.tps_denominator.max(1), a.num_loops),
+        None => (1, 1, 0),
     };
+    let orientation = image.image_header().metadata.orientation;
     let count = image.num_loaded_keyframes();
     if count as f64 > max_frames {
         return Err(format!("LIMIT: Animation has {count} frames, over the limit of {max_frames} (limits.maxFrames)"));
@@ -195,11 +273,10 @@ pub fn decode_animation(
     }
     let (mut width, mut height) = (0, 0);
     let mut pixels = Vec::new();
-    let mut durations_ms = Vec::with_capacity(count);
+    let mut ticks = Vec::with_capacity(count);
     for i in 0..count {
         let frame = image.render_frame(i).map_err(error)?;
-        let ticks = frame.duration() as u64;
-        durations_ms.push(((ticks * 1000 * tps_den + tps_num / 2) / tps_num).min(u32::MAX as u64) as u32);
+        ticks.push(frame.duration());
         let mut stream = frame.stream();
         width = stream.width();
         height = stream.height();
@@ -207,7 +284,7 @@ pub fn decode_animation(
         pixels.resize(start + (width * height * stream.channels()) as usize, 0);
         stream.write_to_buffer(&mut pixels[start..]);
     }
-    Ok(Animation { width, height, channels, count: count as u32, pixels, durations_ms, loops })
+    Ok(Animation { width, height, channels, count: count as u32, pixels, ticks, tps_numerator, tps_denominator, loops, orientation })
 }
 
 /// `None` when the file carries no JPEG reconstruction data.

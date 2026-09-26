@@ -223,7 +223,8 @@ async function prepare(bytes, key, orientation, animated, worker = true, limits,
   const restored = () => r.restored;
   const wm = { overlay: r.overlay ?? null, watermarkError: r.watermarkError };
   if (r.kind === 'pixels') {
-    const o = await effectiveOrientation(r.exif, orientation, browserHonoursPngOrientation);
+    // A JPEG XL's PNG has its orientation applied, in every browser.
+    const o = r.orientation ?? await effectiveOrientation(r.exif, orientation, browserHonoursPngOrientation);
     return { width, height, o, type: r.type, restored, ...wm, animate: (work, opts) => animate(work, r, r.scrambled, opts) };
   }
   let o = await effectiveOrientation(r.exif, orientation, async () => true);

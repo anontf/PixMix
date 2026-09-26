@@ -33,22 +33,6 @@ export class Animation {
         return ret >>> 0;
     }
     /**
-     * @returns {Uint32Array}
-     */
-    get durationsMs() {
-        try {
-            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-            wasm.animation_durationsMs(retptr, this.__wbg_ptr);
-            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
-            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
-            var v1 = getArrayU32FromWasm0(r0, r1).slice();
-            wasm.__wbindgen_export(r0, r1 * 4, 4);
-            return v1;
-        } finally {
-            wasm.__wbindgen_add_to_stack_pointer(16);
-        }
-    }
-    /**
      * @returns {number}
      */
     get height() {
@@ -61,6 +45,14 @@ export class Animation {
      */
     get loops() {
         const ret = wasm.animation_loops(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * The codestream's orientation (1-8), which the frames have applied.
+     * @returns {number}
+     */
+    get orientation() {
+        const ret = wasm.animation_orientation(this.__wbg_ptr);
         return ret >>> 0;
     }
     /**
@@ -78,6 +70,37 @@ export class Animation {
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
         }
+    }
+    /**
+     * Each frame's duration in ticks; a tick is `tpsDenominator / tpsNumerator` seconds.
+     * @returns {Uint32Array}
+     */
+    get ticks() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.animation_ticks(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var v1 = getArrayU32FromWasm0(r0, r1).slice();
+            wasm.__wbindgen_export(r0, r1 * 4, 4);
+            return v1;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * @returns {number}
+     */
+    get tpsDenominator() {
+        const ret = wasm.animation_tpsDenominator(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @returns {number}
+     */
+    get tpsNumerator() {
+        const ret = wasm.animation_tpsNumerator(this.__wbg_ptr);
+        return ret >>> 0;
     }
     /**
      * @returns {number}
@@ -115,6 +138,24 @@ export class Decoded {
         return ret >>> 0;
     }
     /**
+     * The enum colour encoding of the returned pixels (see `colour_of`); empty when the
+     * image has an ICC profile or the pixels were converted to sRGB.
+     * @returns {Float64Array}
+     */
+    get colour() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.decoded_colour(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var v1 = getArrayF64FromWasm0(r0, r1).slice();
+            wasm.__wbindgen_export(r0, r1 * 8, 8);
+            return v1;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
      * @returns {number}
      */
     get height() {
@@ -137,6 +178,14 @@ export class Decoded {
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
         }
+    }
+    /**
+     * The codestream's orientation (1-8, as in EXIF), which the pixels have applied.
+     * @returns {number}
+     */
+    get orientation() {
+        const ret = wasm.decoded_orientation(this.__wbg_ptr);
+        return ret >>> 0;
     }
     /**
      * Moves the 16-bit pixels out (call once; empty unless decoded with `high`).
@@ -335,6 +384,11 @@ function dropObject(idx) {
     heap_next = idx;
 }
 
+function getArrayF64FromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    return getFloat64ArrayMemory0().subarray(ptr / 8, ptr / 8 + len);
+}
+
 function getArrayU16FromWasm0(ptr, len) {
     ptr = ptr >>> 0;
     return getUint16ArrayMemory0().subarray(ptr / 2, ptr / 2 + len);
@@ -356,6 +410,14 @@ function getDataViewMemory0() {
         cachedDataViewMemory0 = new DataView(wasm.memory.buffer);
     }
     return cachedDataViewMemory0;
+}
+
+let cachedFloat64ArrayMemory0 = null;
+function getFloat64ArrayMemory0() {
+    if (cachedFloat64ArrayMemory0 === null || cachedFloat64ArrayMemory0.byteLength === 0) {
+        cachedFloat64ArrayMemory0 = new Float64Array(wasm.memory.buffer);
+    }
+    return cachedFloat64ArrayMemory0;
 }
 
 function getStringFromWasm0(ptr, len) {
@@ -428,6 +490,7 @@ function __wbg_finalize_init(instance, module) {
     wasm = instance.exports;
     wasmModule = module;
     cachedDataViewMemory0 = null;
+    cachedFloat64ArrayMemory0 = null;
     cachedUint16ArrayMemory0 = null;
     cachedUint32ArrayMemory0 = null;
     cachedUint8ArrayMemory0 = null;

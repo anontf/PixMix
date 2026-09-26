@@ -12,13 +12,17 @@ import { readOrientation } from '../meta/exif.js';
 import { loadPainter } from '../watermark/load.js';
 import { loadMetadataTools } from '../meta/load.js';
 import { checkInputSize } from '../core/limits.js';
+import { orientRgba } from '../core/orient.js';
+import { apngDelay } from '../core/delay.js';
 
 /**
  * @typedef {object} PixelsResult  PNG, and JPEG XL on the pixel route
  * @property {'pixels'} kind @property {string} type  MIME type of `restored`
  * @property {Uint8Array} restored  file for the <img>
  * @property {Uint8Array|null} exif PNG eXIf payload (for orientation)
- * @property {object} layout        width, height, map, tiles
+ * @property {number} [orientation] JPEG XL: the header's orientation, which `restored` (a PNG
+ *           of the pixels as displayed) has applied; the reveal draws through it too
+ * @property {object} layout        width, height, map, tiles (the stored pixel grid)
  * @property {Uint8ClampedArray} [scrambled]  frame 0 as RGBA (only when animating)
  *
  * @typedef {object} JpegResult  JPEG, and JPEG XL on the JPEG route
@@ -49,7 +53,7 @@ export async function compute(bytes, key, { animated = true, limits, watermark =
   if (format === 'png') {
     const d = await unscramblePngDetailedAsync(bytes, { key, limits });
     const exif = d.img.chunks.find((c) => c.type === 'eXIf')?.data.slice() ?? null;
-    const w = await painting(watermark, d.watermark, d.layout, exif, (paint) => d.toPng(paint), limits);
+    const w = await painting(watermark, d.watermark, d.layout, exif ? readOrientation(exif) : 1, (paint) => d.toPng(paint), limits);
     return {
       kind: 'pixels',
       type: 'image/png',
@@ -67,7 +71,7 @@ export async function compute(bytes, key, { animated = true, limits, watermark =
     return {
       kind: 'jpeg',
       type: 'image/jpeg',
-      ...(await painting(watermark, d.watermark, d.layout, exif, (paint) => d.toJpeg(paint), limits)),
+      ...(await painting(watermark, d.watermark, d.layout, exif ? readOrientation(exif) : 1, (paint) => d.toJpeg(paint), limits)),
       scrambled: bytes,
       exif,
       layout: { perm, transforms, cols, rows, tileW, tileH, width, height },
@@ -78,11 +82,16 @@ export async function compute(bytes, key, { animated = true, limits, watermark =
     if (inspect(bytes, { limits }).mode === 'mcu') return compute(await scrambledJpegOf(bytes, limits), key, { animated, limits, watermark, metadata });
     // Pixel route: the <img> gets a PNG (an APNG for an animation), since most browsers
     // cannot display JPEG XL. The reveal animates frame 0.
+    // The pixels (and the scramble) are on the stored grid; the PNG gets them as displayed,
+    // so every browser shows it the way the JPEG XL header says.
     const d = await unscrambleJxlDetailed(bytes, { key, display: true, limits });
+    const o = d.image.orientation ?? 1;
     const tools = metadata ? await loadMetadataTools() : null;
-    const w = await painting(watermark, d.watermark, d.layout, null, async (paint) => {
+    const w = await painting(watermark, d.watermark, d.layout, o, async (paint) => {
       const image = d.paint(paint);
-      const png = await rgbaPng(d.layout.width, d.layout.height, image.frames ?? [{ data: image.data }], image.plays);
+      const { width, height } = d.layout;
+      const frames = (image.frames ?? [{ data: image.data }]).map((f) => ({ ...f, data: orientRgba(f.data, width, height, o).data }));
+      const png = await rgbaPng(o >= 5 ? height : width, o >= 5 ? width : height, frames, image.plays);
       // The PNG holds display pixels and nothing else: only what the policy sets applies.
       return tools ? tools.applyMetadata(png, metadata, { limits }).bytes : png;
     }, limits);
@@ -91,6 +100,7 @@ export async function compute(bytes, key, { animated = true, limits, watermark =
       type: 'image/png',
       ...w,
       exif: null,
+      orientation: o,
       layout: plainLayout(d.layout),
       ...(animated ? { scrambled: new Uint8ClampedArray(d.scrambled.buffer, d.scrambled.byteOffset, d.scrambled.length) } : {}),
     };
@@ -102,13 +112,13 @@ export async function compute(bytes, key, { animated = true, limits, watermark =
  * The restored file, with the watermark drawn when one is wanted. A watermark that cannot
  * be drawn (it failed to validate, say) leaves the image as it is and says why.
  */
-async function painting(requested, embedded, { width, height }, exif, write, limits) {
+async function painting(requested, embedded, { width, height }, o, write, limits) {
   const watermark = requested === 'embedded' ? embedded?.compiled ?? null : requested;
   if (!watermark) return { restored: await write(null) };
   try {
     const painter = await loadPainter();
     const restored = await write({ painter, watermark, limits });
-    return { restored, overlay: painter.overlayFor(watermark, width, height, exif ? readOrientation(exif) : 1, limits) };
+    return { restored, overlay: painter.overlayFor(watermark, width, height, o, limits) };
   } catch (err) {
     // Only pixmix's own refusals (a bad or oversized watermark); anything else is a bug.
     if (err?.name !== 'PixmixError' && !err?.message?.startsWith('Watermark support could not be loaded')) throw err;
@@ -145,8 +155,9 @@ async function rgbaPng(width, height, frames, plays = 0) {
     if (frames.length > 1) {
       const fctl = new Uint8Array(26);
       fctl.set(u32(seq++, width, height, 0, 0));
-      new DataView(fctl.buffer).setUint16(20, Math.min(f.delay[0], 65535));
-      new DataView(fctl.buffer).setUint16(22, f.delay[1]);
+      const [num, den] = apngDelay(f.delay);
+      new DataView(fctl.buffer).setUint16(20, num);
+      new DataView(fctl.buffer).setUint16(22, den);
       chunks.push({ type: 'fcTL', data: fctl });
     }
     if (i === 0) chunks.push({ type: 'IDAT', data: idat });

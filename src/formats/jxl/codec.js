@@ -21,6 +21,7 @@ import initDecoder, {
   decode as decodeRaw, decodeAnimation as decodeAnimationRaw, reconstructJpeg as reconstructRaw, lastPanic, __pixmixReset,
 } from '../../../native/jxl/pkg/pixmix_jxl.js';
 import { iccSpace } from './icc.js';
+import { unorientRgba } from '../../core/orient.js';
 import { PixmixError } from '../../core/params.js';
 import { resolveLimits } from '../../core/limits.js';
 
@@ -85,21 +86,28 @@ function wasmLimits(limits) {
 }
 
 /**
- * First frame, orientation applied, as RGBA: 8-bit (`data` a Uint8Array), or with `high`
- * 16-bit (`data` a Uint16Array, `depth` 16). With `srgb` (default) the pixels are converted
- * to sRGB; without it they stay in the image's own colour space and `icc` describes it.
- * @returns {Promise<{width: number, height: number, depth: 8|16, data: Uint8Array|Uint16Array, icc: Uint8Array|null}>}
+ * First frame as RGBA: 8-bit (`data` a Uint8Array), or with `high` 16-bit (`data` a
+ * Uint16Array, `depth` 16). With `srgb` (default) the pixels are converted to sRGB; without
+ * it they stay in the image's own colour space and `icc` describes it, and `colour` holds
+ * the enum colour encoding when the image has one rather than an ICC profile ({encoding,
+ * icc}: see encode). By default the header's `orientation` is applied, as a viewer shows
+ * it; with `oriented: false` the pixels stay on the stored grid.
+ * @returns {Promise<{width: number, height: number, depth: 8|16, data: Uint8Array|Uint16Array,
+ *   icc: Uint8Array|null, colour: {encoding: number[], icc: Uint8Array}|null, orientation: number}>}
  */
-export async function decode(bytes, { srgb = true, high = false, limits } = {}) {
+export async function decode(bytes, { srgb = true, high = false, oriented = true, limits } = {}) {
   await ready();
   const l = wasmLimits(limits);
   return guard(() => {
     const d = decodeRaw(bytes, srgb, high, l.maxPixels, l.alloc);
     try {
-      const { width, height, channels } = d;
-      const icc = d.icc;
+      const { channels, orientation } = d;
+      const icc = d.icc.length ? d.icc : null;
+      const encoding = [...d.colour];
       const px = high ? d.takePixels16() : d.takePixels();
-      return { width, height, depth: high ? 16 : 8, data: toRgba(px, width * height, channels, high ? 65535 : 255), icc: icc.length ? icc : null };
+      const rgba = toRgba(px, d.width * d.height, channels, high ? 65535 : 255);
+      const { width, height, data } = oriented ? { width: d.width, height: d.height, data: rgba } : unorientRgba(rgba, d.width, d.height, orientation);
+      return { width, height, depth: high ? 16 : 8, data, icc, colour: encoding.length && icc ? { encoding, icc } : null, orientation };
     } finally {
       d.free();
     }
@@ -107,33 +115,45 @@ export async function decode(bytes, { srgb = true, high = false, limits } = {}) 
 }
 
 /**
- * Every frame of an animated JPEG XL as full-canvas 8-bit RGBA, with delays as [ms, 1000].
- * Without `srgb` the pixels keep the image's colour space, which `icc` then describes (unless
- * `icc: false`, which saves decoding the first frame once more).
- * @returns {Promise<{width: number, height: number, frames: {data: Uint8Array, delay: [number, number]}[], plays: number, icc: Uint8Array|null}>}
+ * Every frame of an animated JPEG XL as full-canvas 8-bit RGBA, with delays as exact
+ * [num, den] seconds (the file's ticks at its tick rate). Without `srgb` the pixels keep the
+ * image's colour space, which `icc` (and `colour`, see decode) then describes (unless
+ * `icc: false`, which saves decoding the first frame once more). `oriented` as in decode.
+ * @returns {Promise<{width: number, height: number, frames: {data: Uint8Array, delay: [number, number]}[], plays: number,
+ *   icc: Uint8Array|null, colour: object|null, orientation: number}>}
  */
-export async function decodeAnimation(bytes, { srgb = true, icc: wantIcc = !srgb, limits } = {}) {
+export async function decodeAnimation(bytes, { srgb = true, icc: wantIcc = !srgb, oriented = true, limits } = {}) {
   await ready();
   const l = wasmLimits(limits);
   const anim = guard(() => {
     const a = decodeAnimationRaw(bytes, srgb, l.maxPixels, l.maxFrames, l.maxTotal, l.alloc);
     try {
-      const { width, height, channels, count, loops } = a;
-      const durations = a.durationsMs;
+      const { channels, count, loops, orientation, tpsNumerator, tpsDenominator } = a;
+      const ticks = a.ticks;
       const all = a.takePixels();
-      const per = width * height * channels;
+      const per = a.width * a.height * channels;
+      let { width, height } = a;
       const frames = [];
       for (let i = 0; i < count; i++) {
-        frames.push({ data: toRgba(all.subarray(i * per, (i + 1) * per), width * height, channels), delay: [durations[i], 1000] });
+        let data = toRgba(all.subarray(i * per, (i + 1) * per), a.width * a.height, channels);
+        if (!oriented) ({ width, height, data } = unorientRgba(data, a.width, a.height, orientation));
+        frames.push({ data, delay: exactDelay(ticks[i] * tpsDenominator, tpsNumerator) });
       }
-      return { width, height, frames, plays: loops };
+      return { width, height, frames, plays: loops, orientation };
     } finally {
       a.free();
     }
   });
   // The ICC profile is the same for every frame; the still-image call reports it.
-  const icc = wantIcc && !srgb ? (await decode(bytes, { srgb: false, limits })).icc : null;
-  return { ...anim, icc };
+  const still = wantIcc && !srgb ? await decode(bytes, { srgb: false, limits }) : null;
+  return { ...anim, icc: still?.icc ?? null, colour: still?.colour ?? null };
+}
+
+/** [num, den] in lowest terms. */
+function exactDelay(num, den) {
+  const gcd = (a, b) => (b ? gcd(b, a % b) : a);
+  const g = gcd(num, den) || 1;
+  return [num / g, den / g];
 }
 
 /** The original JPEG of a losslessly recompressed JPEG XL, or null if it is not one. */
@@ -269,21 +289,26 @@ function ticksPerSecond(delays) {
  * Lossless by default: `{ width, height, data }` as RGBA (8-bit Uint8Array, or 16-bit
  * Uint16Array with `depth: 16`), tagged with `icc` (which must fit, see iccFits) or else
  * sRGB. With `frames` ([{data, delay: [num, den] seconds}], full-canvas 8-bit RGBA) and
- * `plays` (0 = forever) it writes an animation instead.
+ * `plays` (0 = forever) it writes an animation instead. `orientation` (1-8) goes in the
+ * header, the pixels being on the stored grid. `colour` (from decode) is the enum colour
+ * encoding the pixels came with; it is written instead of `icc` as long as `icc` is still
+ * the profile it came with, so an image made of enum values keeps them exactly.
  * @param {{effort?: number, distance?: number}} [options] distance > 0 is lossy (tests only)
  * @returns {Promise<Uint8Array>} a bare codestream, or a container when it needs level 10
  *          (16-bit lossless); see container.js wrapCodestream
  */
-export async function encode({ width, height, data, depth = 8, icc = null, frames = null, plays = 0 }, { effort = 7, distance = 0 } = {}) {
+export async function encode({ width, height, data, depth = 8, icc = null, frames = null, plays = 0, orientation = 1, colour = null }, { effort = 7, distance = 0 } = {}) {
   const animated = !!frames;
   const list = animated ? frames : [{ data, delay: [0, 1] }];
   const bits = !animated && depth === 16 ? 16 : 8;
   const max = bits === 16 ? 65535 : 255;
   const channels = channelsOf(list.map((f) => f.data), max, icc ? iccSpace(icc) : null);
   const tps = animated ? ticksPerSecond(list.map((f) => f.delay)) : 1;
+  const encoding = colour?.encoding?.length === 14 && icc && sameBytes(icc, colour.icc) ? colour.encoding : null;
   return runEncoder({ effort, distance }, (m, e, copyIn, check) => {
-    const iccPtr = icc ? copyIn(icc) : 0;
-    check(m._pmx_image(e, width, height, channels, bits, iccPtr, icc ? icc.length : 0, animated ? 1 : 0, tps, 1, plays >>> 0), 'image header');
+    const iccPtr = icc && !encoding ? copyIn(icc) : 0;
+    const colourPtr = encoding ? copyIn(new Uint8Array(Float64Array.from(encoding).buffer)) : 0;
+    check(m._pmx_image(e, width, height, channels, bits, iccPtr, iccPtr ? icc.length : 0, animated ? 1 : 0, tps, 1, plays >>> 0, orientation, colourPtr), 'image header');
     let p = 0; // one frame buffer, reused (libjxl copies each frame in)
     for (const f of list) {
       const px = pack(f.data, width * height, channels, bits);
@@ -296,6 +321,8 @@ export async function encode({ width, height, data, depth = 8, icc = null, frame
     }
   });
 }
+
+const sameBytes = (a, b) => a === b || (a.length === b.length && a.every((v, i) => v === b[i]));
 
 /** RGBA samples reduced to `channels` (1 grey, 2 grey+alpha, 3 RGB, 4 RGBA), as bytes. */
 function pack(rgba, n, channels, bits) {

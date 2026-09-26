@@ -11,12 +11,21 @@ export class Animation {
      * Number of frames; `takePixels` holds them one after another.
      */
     readonly count: number;
-    readonly durationsMs: Uint32Array;
     readonly height: number;
     /**
      * 0 = forever.
      */
     readonly loops: number;
+    /**
+     * The codestream's orientation (1-8), which the frames have applied.
+     */
+    readonly orientation: number;
+    /**
+     * Each frame's duration in ticks; a tick is `tpsDenominator / tpsNumerator` seconds.
+     */
+    readonly ticks: Uint32Array;
+    readonly tpsDenominator: number;
+    readonly tpsNumerator: number;
     readonly width: number;
 }
 
@@ -36,11 +45,20 @@ export class Decoded {
      * 1 grey, 2 grey + alpha, 3 RGB, 4 RGBA.
      */
     readonly channels: number;
+    /**
+     * The enum colour encoding of the returned pixels (see `colour_of`); empty when the
+     * image has an ICC profile or the pixels were converted to sRGB.
+     */
+    readonly colour: Float64Array;
     readonly height: number;
     /**
      * ICC profile of the returned pixels; empty when they are sRGB.
      */
     readonly icc: Uint8Array;
+    /**
+     * The codestream's orientation (1-8, as in EXIF), which the pixels have applied.
+     */
+    readonly orientation: number;
     readonly width: number;
 }
 
@@ -75,16 +93,21 @@ export interface InitOutput {
     readonly __wbg_decoded_free: (a: number, b: number) => void;
     readonly animation_channels: (a: number) => number;
     readonly animation_count: (a: number) => number;
-    readonly animation_durationsMs: (a: number, b: number) => void;
     readonly animation_height: (a: number) => number;
     readonly animation_loops: (a: number) => number;
+    readonly animation_orientation: (a: number) => number;
     readonly animation_takePixels: (a: number, b: number) => void;
+    readonly animation_ticks: (a: number, b: number) => void;
+    readonly animation_tpsDenominator: (a: number) => number;
+    readonly animation_tpsNumerator: (a: number) => number;
     readonly animation_width: (a: number) => number;
     readonly decode: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly decodeAnimation: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly decoded_channels: (a: number) => number;
+    readonly decoded_colour: (a: number, b: number) => void;
     readonly decoded_height: (a: number) => number;
     readonly decoded_icc: (a: number, b: number) => void;
+    readonly decoded_orientation: (a: number) => number;
     readonly decoded_takePixels: (a: number, b: number) => void;
     readonly decoded_takePixels16: (a: number, b: number) => void;
     readonly decoded_width: (a: number) => number;

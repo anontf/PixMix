@@ -15,19 +15,31 @@ const SIGNATURES = [
   ['tiff', [0x4d, 0x4d, 0x00, 0x2a]],
 ];
 
-// ISO-BMFF images: 'ftyp' box at offset 4, then the major brand.
-const FTYP_BRANDS = { avif: 'avif', avis: 'avif', heic: 'heic', heix: 'heic', mif1: 'heic', msf1: 'heic' };
+// ISO-BMFF images: 'ftyp' box at offset 4, then the major brand. The generic HEIF brands
+// (mif1, msf1) say nothing about the codec, so the compatible brands decide: AVIF when they
+// name it, else HEIC.
+const FTYP_BRANDS = { avif: 'avif', avis: 'avif', heic: 'heic', heix: 'heic', mif1: 'heif', msf1: 'heif' };
 
 /** @param {Uint8Array|ArrayBuffer|ArrayBufferView} bytes @returns {string|null} */
 export function detectFormat(bytes) {
   if (!(bytes instanceof Uint8Array)) bytes = toBytes(bytes);
   if (bytes.length >= 12 && String.fromCharCode(...bytes.subarray(4, 8)) === 'ftyp') {
-    return FTYP_BRANDS[String.fromCharCode(...bytes.subarray(8, 12))] ?? null;
+    const brand = FTYP_BRANDS[String.fromCharCode(...bytes.subarray(8, 12))] ?? null;
+    return brand === 'heif' ? (compatibleBrands(bytes).some((b) => FTYP_BRANDS[b] === 'avif') ? 'avif' : 'heic') : brand;
   }
   for (const [name, sig] of SIGNATURES) {
     if (bytes.length >= sig.length && sig.every((b, i) => b < 0 || bytes[i] === b)) return name;
   }
   return null;
+}
+
+/** The compatible brands of an 'ftyp' box (after its major brand and minor version). */
+function compatibleBrands(bytes) {
+  const size = ((bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3]) >>> 0;
+  const end = Math.min(size, bytes.length, 4096);
+  const out = [];
+  for (let o = 16; o + 4 <= end; o += 4) out.push(String.fromCharCode(...bytes.subarray(o, o + 4)));
+  return out;
 }
 
 /**

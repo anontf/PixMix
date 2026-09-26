@@ -123,6 +123,6 @@ for (const defaultInAnimation of [true, false]) {
     const anim = await (await loadJxlCodec()).decodeAnimation(await decodeAsync(s, { key: 'k' }));
     const want = composited(30, 20, defaultInAnimation ? FRAMES : FRAMES.slice(1));
     assert.deepEqual(anim.frames.map((f) => Buffer.from(f.data)), want);
-    assert.deepEqual(anim.frames.map((f) => f.delay), want.map(() => [100, 1000]));
+    assert.deepEqual(anim.frames.map((f) => f.delay), want.map(() => [1, 10]), 'exact: 100 ms');
   });
 }

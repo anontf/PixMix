@@ -56,12 +56,16 @@ EMSCRIPTEN_KEEPALIVE Enc *pmx_new(int effort, int container, float distance) {
 }
 
 // channels: 1 grey, 2 grey+alpha, 3 RGB, 4 RGBA; bits 8 or 16 (samples in native order).
-// icc may be NULL (the image is then tagged sRGB). An animation (animated = 1) counts
-// tps_num/tps_den ticks per second and plays `loops` times (0 = forever).
+// The colour encoding is `colour` when given (14 numbers: colour space, white point,
+// primaries, transfer function, gamma, rendering intent, then white xy and red, green,
+// blue xy, as in JxlColorEncoding), else the ICC profile `icc`, else sRGB. An animation
+// (animated = 1) counts tps_num/tps_den ticks per second and plays `loops` times
+// (0 = forever). orientation (1-8, as in EXIF) goes in the header: pixels are as stored.
 EMSCRIPTEN_KEEPALIVE int pmx_image(Enc *e, uint32_t width, uint32_t height, int channels, int bits,
                                    const uint8_t *icc, size_t icc_len, int animated,
-                                   uint32_t tps_num, uint32_t tps_den, uint32_t loops) {
-  if (channels < 1 || channels > 4 || (bits != 8 && bits != 16)) return -1;
+                                   uint32_t tps_num, uint32_t tps_den, uint32_t loops,
+                                   uint32_t orientation, const double *colour) {
+  if (channels < 1 || channels > 4 || (bits != 8 && bits != 16) || orientation < 1 || orientation > 8) return -1;
   int alpha = channels == 2 || channels == 4;
   JxlBasicInfo info;
   JxlEncoderInitBasicInfo(&info);
@@ -72,6 +76,7 @@ EMSCRIPTEN_KEEPALIVE int pmx_image(Enc *e, uint32_t width, uint32_t height, int 
   info.num_extra_channels = alpha;
   info.alpha_bits = alpha ? bits : 0;
   info.uses_original_profile = e->distance > 0 ? JXL_FALSE : JXL_TRUE; // lossless needs it
+  info.orientation = (JxlOrientation)orientation;
   if (animated) {
     info.have_animation = JXL_TRUE;
     info.animation.tps_numerator = tps_num;
@@ -79,7 +84,24 @@ EMSCRIPTEN_KEEPALIVE int pmx_image(Enc *e, uint32_t width, uint32_t height, int 
     info.animation.num_loops = loops;
   }
   CHECK(JxlEncoderSetBasicInfo(e->enc, &info));
-  if (icc && icc_len) {
+  if (colour) {
+    JxlColorEncoding c;
+    memset(&c, 0, sizeof c);
+    c.color_space = (JxlColorSpace)colour[0];
+    c.white_point = (JxlWhitePoint)colour[1];
+    c.primaries = (JxlPrimaries)colour[2];
+    c.transfer_function = (JxlTransferFunction)colour[3];
+    c.gamma = colour[4];
+    c.rendering_intent = (JxlRenderingIntent)colour[5];
+    c.white_point_xy[0] = colour[6];
+    c.white_point_xy[1] = colour[7];
+    for (int i = 0; i < 2; i++) {
+      c.primaries_red_xy[i] = colour[8 + i];
+      c.primaries_green_xy[i] = colour[10 + i];
+      c.primaries_blue_xy[i] = colour[12 + i];
+    }
+    CHECK(JxlEncoderSetColorEncoding(e->enc, &c));
+  } else if (icc && icc_len) {
     CHECK(JxlEncoderSetICCProfile(e->enc, icc, icc_len));
   } else {
     JxlColorEncoding colour;

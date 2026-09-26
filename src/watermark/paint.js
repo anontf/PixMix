@@ -347,10 +347,11 @@ export function paintJpegImage(frame, segments, c, o = 1, limits) {
 
 /**
  * Paints full-canvas RGBA frames (JPEG XL pixels: 8-bit, or 16-bit in a Uint16Array) in place.
- * @param {{width: number, height: number, frames: (Uint8Array|Uint16Array)[]}} image
+ * @param {{width: number, height: number, frames: (Uint8Array|Uint16Array)[], orientation?: number}} image
+ *        orientation: how the stored grid is shown (the JPEG XL header's)
  */
-export function paintRgba({ width, height, frames }, c, limits) {
-  const patch = renderFor(validateCompiled(c), width, height, 1, limits);
+export function paintRgba({ width, height, frames, orientation = 1 }, c, limits) {
+  const patch = renderFor(validateCompiled(c), width, height, orientation, limits);
   for (const data of frames) paintSamples(patch, { width, height, channels: 4, depth: data instanceof Uint16Array ? 16 : 8, data });
   return !!patch;
 }
@@ -413,9 +414,9 @@ export function stashJpeg(frame, segments, c, o, key, salt) {
 }
 
 /** JPEG XL: full-canvas 8-bit RGBA frames (the only depth whose display pixels match). */
-export function stashRgba({ width, height, frames }, c, key, salt) {
+export function stashRgba({ width, height, frames, orientation = 1 }, c, key, salt) {
   c = validateCompiled(c);
-  const patch = renderFor(c, width, height, 1);
+  const patch = renderFor(c, width, height, orientation);
   if (!patch) return null;
   const r0 = { x: patch.x, y: patch.y, width: Math.min(width, patch.x + patch.width) - patch.x, height: Math.min(height, patch.y + patch.height) - patch.y };
   const regions = frames.map((_, i) => ({ frame: i, ...r0 }));

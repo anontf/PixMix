@@ -9,7 +9,9 @@
 // @property {Uint8Array|Uint16Array} data  RGBA, not premultiplied, EXIF orientation NOT
 //           applied: 8-bit, or 16-bit with `depth: 16`
 // @property {import('../meta/jpeg.js').Metadata} [metadata]  used when pixmix has no
-//           extractor of its own for the container
+//           extractor of its own for the container. `metadata.orientation` (1-8) says how
+//           the stored pixels are shown when the container keeps that outside EXIF (the
+//           JPEG XL header); it then wins over the EXIF's
 
 import decodeJpeg from 'jpeg-js/lib/decoder.js';
 import { GifReader } from 'omggif';
@@ -181,9 +183,10 @@ export const gifDecoder = {
 };
 
 // jxl-oxide WASM, loaded on first use (so it is async: encodeAsync/convertAsync only).
-// Samples come as stored, never colour-converted; non-sRGB images hand over their ICC
-// profile, like the other formats. Precision above 8 bits is kept (as 16-bit), except in
-// animations.
+// Samples come as stored, never colour-converted and on the stored grid (the header's
+// orientation is handed over, to become the EXIF orientation); non-sRGB images hand over
+// their ICC profile, like the other formats. Precision above 8 bits is kept (as 16-bit),
+// except in animations.
 export const jxlDecoder = {
   name: 'jxl-oxide',
   formats: ['jxl'],
@@ -191,15 +194,15 @@ export const jxlDecoder = {
     const header = readJxlHeader(readJxl(bytes, limits).codestream, limits);
     const codec = await loadJxlCodec();
     const deep = header.bits > 8 || header.float;
-    const image = await codec.decode(bytes, { srgb: false, high: !header.animated && deep, limits });
+    const image = await codec.decode(bytes, { srgb: false, high: !header.animated && deep, oriented: false, limits });
     const dropped = [];
     if (header.animated) dropped.push('animation (first frame kept)');
     if (header.animated && deep) dropped.push(`${header.float ? 'floating-point' : `${header.bits}-bit`} precision (reduced to 8-bit)`);
     const icc = header.srgb === true ? null : image.icc;
-    const metadata = { dropped, ...(icc ? { icc } : {}) };
+    const metadata = { dropped, orientation: image.orientation, ...(icc ? { icc } : {}) };
     if (!header.animated) return { ...image, metadata };
     // Animations: every frame, for APNG or animated JPEG XL output (other targets keep the first).
-    const anim = await codec.decodeAnimation(bytes, { srgb: false, icc: false, limits });
+    const anim = await codec.decodeAnimation(bytes, { srgb: false, icc: false, oriented: false, limits });
     return { ...image, animation: { frames: anim.frames, plays: anim.plays }, metadata };
   },
 };

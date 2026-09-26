@@ -10,6 +10,7 @@ import { PixmixError } from '../core/params.js';
 // Metadata is compressed with fflate everywhere (not native zlib) so the same input gives
 // byte-identical chunks on servers and in browsers.
 import { zlibSync } from 'fflate';
+import { apngDelay } from '../core/delay.js';
 
 const utf8 = new TextEncoder();
 const latin1Bytes = (s) => Uint8Array.from(s, (c) => { const n = c.charCodeAt(0); return n < 256 ? n : 63; });
@@ -95,8 +96,9 @@ export function buildPng(image, meta = {}) {
     frames.forEach((f, i) => {
       const fctl = new Uint8Array(26);
       fctl.set(u32(seq++, width, height, 0, 0));
-      new DataView(fctl.buffer).setUint16(20, f.delay[0]);
-      new DataView(fctl.buffer).setUint16(22, f.delay[1]);
+      const [num, den] = apngDelay(f.delay);
+      new DataView(fctl.buffer).setUint16(20, num);
+      new DataView(fctl.buffer).setUint16(22, den);
       chunks.push({ type: 'fcTL', data: fctl });
       const z = encodeRaster(header, raster.pixels.subarray(i * per, (i + 1) * per));
       chunks.push(i === 0 ? { type: 'IDAT', data: z } : { type: 'fdAT', data: concat(u32(seq++), z) });
@@ -124,6 +126,13 @@ function pickRaster(width, height, rgba, iccSpace) {
     for (let i = 0; i < n; i++) {
       pixels[i * pb] = rgba[i * 4];
       if (!opaque) pixels[i * pb + 1] = rgba[i * 4 + 3];
+    }
+    if (opaque) {
+      // 1, 2 or 4 bits when every level is one of theirs (0/255, multiples of 85 or 17).
+      for (const depth of [1, 2, 4]) {
+        const step = 255 / ((1 << depth) - 1);
+        if (pixels.every((v) => v % step === 0)) return { colorType: 0, depth, pixels: pixels.map((v) => v / step) };
+      }
     }
     return { colorType: opaque ? 0 : 4, depth: 8, pixels };
   }

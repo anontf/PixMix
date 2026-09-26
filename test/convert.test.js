@@ -243,3 +243,13 @@ test('lossless output of a lossy source carries a size note; JPEG output does no
   encode(src, { key: 'k', onConvert: (r) => { report = r; } });
   assert.deepEqual(report.notes ?? [], []);
 });
+
+test('grey PNG output uses 1, 2 or 4 bits when its levels allow, losslessly', () => {
+  for (const [levels, depth] of [[[0, 255], 1], [[0, 85, 170, 255], 2], [[0, 17, 136, 255], 4], [[0, 1, 255], 8]]) {
+    const data = new Uint8Array(W * H * 4);
+    for (let i = 0; i < W * H; i++) { const v = levels[i % levels.length]; data.set([v, v, v, 255], i * 4); }
+    const { png } = buildPng({ width: W, height: H, data });
+    assert.deepEqual([chunk(png, 'IHDR')[8], chunk(png, 'IHDR')[9]], [depth, 0], `levels ${levels}`);
+    assert.deepEqual(rgbaOf(png), data);
+  }
+});

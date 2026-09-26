@@ -11,10 +11,13 @@ import { readJpegMetadata } from '../meta/jpeg.js';
 import { readWebpMetadata } from '../meta/webp.js';
 import { readJxlMetadata } from '../meta/jxl.js';
 import { readJxl, writeJxl, wrapCodestream, readJxlHeader } from '../formats/jxl/container.js';
-import { sanitizeBoxes } from '../formats/jxl/index.js';
+import { sanitizeBoxes, jpegToJxl } from '../formats/jxl/index.js';
+import { jpegForJxl, fallbackNotes } from './jpeg-route.js';
 import { iccSpace, iccFits } from '../formats/jxl/icc.js';
 import { loadJxlCodec } from '../formats/jxl/load.js';
 import { stripExifThumbnail } from '../meta/thumbnails.js';
+import { readOrientation } from '../meta/exif.js';
+import { withOrientation } from './orientation.js';
 import { readChunks, writeChunks } from '../formats/png/chunks.js';
 import { sanitizeJpeg } from '../formats/jpeg/index.js';
 import { buildPng } from './png-build.js';
@@ -82,9 +85,27 @@ export async function convertAsync(input, opts = {}) {
     return { ...job.done, bytes: out, metadata: report };
   }
   if (job.target === 'jxl') {
+    // The route the encoder would take (see jpeg-route.js): a JPEG is recompressed as it is.
+    let fallback = null;
+    const viaJpeg = await jpegForJxl(bytes, job.from, opts);
+    if (viaJpeg?.jpeg) {
+      const converted = convert(viaJpeg.jpeg, { ...opts, format: 'jpeg' });
+      try {
+        return { ...converted, bytes: await jpegToJxl(converted.bytes, opts.limits), format: 'jxl', from: job.from, decoder: viaJpeg.decoder, dropped: [...viaJpeg.notes, ...converted.dropped] };
+      } catch (err) {
+        if (!err?.jpegRoute || opts.mode === 'mcu') throw err;
+        fallback = err.message;
+      }
+    }
     const { image, boxes, report } = await decodeJob(bytes, job, opts);
+    if (fallback) report.notes = fallbackNotes(fallback);
     const codestream = await (await loadJxlCodec()).encode(image);
     return { bytes: wrapCodestream(boxes, codestream), ...report };
+  }
+  if (job.target === 'jpeg' && job.from === 'jxl') {
+    // A recompressed JPEG gives back that JPEG, exactly, when it rebuilds verifiably.
+    const viaJpeg = await jpegForJxl(bytes, 'jxl', { limits: opts.limits });
+    if (viaJpeg?.jpeg) return { ...convert(viaJpeg.jpeg, { ...opts, format: 'jpeg' }), from: 'jxl', decoder: viaJpeg.decoder };
   }
   return applied(finish(bytes, job, await decodeAsync(job, bytes, opts.limits), opts), opts);
 }
@@ -217,7 +238,9 @@ function isLossyJxl(bytes) {
 function jxlImage(decoded, meta) {
   const boxes = [], transferred = [];
   let dropped = [...meta.dropped];
-  let image = { width: decoded.width, height: decoded.height, depth: decoded.depth === 16 ? 16 : 8, data: decoded.data };
+  // The pixels stay on the stored grid; JPEG XL viewers orient by the header, not the EXIF.
+  const orientation = meta.exif?.length ? readOrientation(meta.exif) : 1;
+  let image = { width: decoded.width, height: decoded.height, depth: decoded.depth === 16 ? 16 : 8, data: decoded.data, orientation };
   const frames = decoded.animation?.frames.length > 1 ? decoded.animation.frames : null;
   if (frames) {
     // Animations are 8-bit (so are the frames decoders hand over).
@@ -291,6 +314,14 @@ function mergedMeta(bytes, from, decoded, keepThumbnails, limits) {
   if (meta.exif && !keepThumbnails) {
     const stripped = stripExifThumbnail(meta.exif);
     if (stripped) { meta.exif = stripped; meta.dropped.push('EXIF thumbnail'); }
+  }
+  const o = fromDecoder.orientation;
+  delete meta.orientation;
+  if (o >= 1 && o <= 8) {
+    // The container's own orientation (JPEG XL's header) is the one viewers follow.
+    const said = meta.exif?.length ? readOrientation(meta.exif) : 1;
+    meta.exif = withOrientation(meta.exif, o);
+    if (said !== o && extracted.exif?.length) meta.dropped.push(`EXIF orientation ${said} (the ${from.toUpperCase()} header's ${o} wins)`);
   }
   return meta;
 }

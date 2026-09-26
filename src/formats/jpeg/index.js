@@ -16,12 +16,15 @@
 //
 // The same goes for frames whose MCU has more than 10 blocks (e.g. every component sampled
 // 2x2): they can only be coded one scan per component, and such scans never hold padding
-// blocks either. With partial edge MCUs there is nowhere to put the content scrambling
-// moves into the padding, so those files are refused (UNSUPPORTED).
+// blocks either. With partial edge MCUs, the scrambled file is written with its frame
+// enlarged to whole MCUs instead (so the padding is real image, up to 15 pixels more each
+// way); marker flag FLAG_ENLARGED says so and APP15 "pixmix-sz\0" holds the original size
+// (u16 height, u16 width, as in SOF), which restoring puts back. Rekeying keeps the form.
 //
 // Watermarks (see watermark/embed.js) travel in more APP15 segments: "pixmix-wm\0" names the
 // watermark for the restored image, "pixmix-ws\0" (split over as many segments as it needs)
-// holds the coefficients under a watermark drawn on the scrambled image.
+// holds the coefficients under a watermark drawn on the scrambled image (within the
+// original area of an enlarged one).
 
 import { readSegments, writeSegments, isJpeg, isSof, isApp, startsWith, M } from './markers.js';
 import { decodeFrame, normalizeQuantTables } from './decode.js';
@@ -35,7 +38,7 @@ import { checkPixels } from '../../core/limits.js';
 import { readJpegMetadata } from '../../meta/jpeg.js';
 import { readOrientation } from '../../meta/exif.js';
 import { stripExifThumbnail, stripIrbThumbnails, stripJfifThumbnail } from '../../meta/thumbnails.js';
-import { FLAG_STASH } from '../../core/params.js';
+import { FLAG_STASH, FLAG_ENLARGED } from '../../core/params.js';
 import { encodeWatermark, decodeWatermark, restoreJpegStash } from '../../watermark/embed.js';
 import { stashJpeg } from '../../watermark/paint.js';
 import { watermarkInfo, carried } from '../png/index.js';
@@ -45,6 +48,7 @@ export { isJpeg };
 const SIG = 'pixmix\0';
 const WM_SIG = 'pixmix-wm\0';
 const WS_SIG = 'pixmix-ws\0';
+const SZ_SIG = 'pixmix-sz\0';
 const WS_CHUNK = 65533 - WS_SIG.length - 2;
 const ascii = (str) => Uint8Array.from(str, (c) => c.charCodeAt(0));
 const NAMES = { 0xc0: 'SOF0', 0xc1: 'SOF1', 0xc2: 'SOF2', 0xc4: 'DHT', 0xda: 'SOS', 0xdb: 'DQT', 0xdd: 'DRI', 0xfe: 'COM' };
@@ -66,7 +70,7 @@ function readMarkerFrom(segments) {
   return seg ? readMarker(seg.data.subarray(SIG.length)) : null;
 }
 
-const isOurs = (s) => s.marker === M.APP15 && (startsWith(s.data, SIG) || startsWith(s.data, WM_SIG) || startsWith(s.data, WS_SIG));
+const isOurs = (s) => s.marker === M.APP15 && [SIG, WM_SIG, WS_SIG, SZ_SIG].some((sig) => startsWith(s.data, sig));
 
 /** Everything that is kept verbatim, in order (drops coding segments and our segments). */
 function headerSegments(segments) {
@@ -111,35 +115,75 @@ function concat(...parts) {
   return out;
 }
 
+/** The frame with another size in its SOF: same MCU grid and coefficients, other real blocks. */
+function resized(frame, width, height) {
+  const sof = frame.sof.slice();
+  sof[1] = height >> 8; sof[2] = height & 255; sof[3] = width >> 8; sof[4] = width & 255;
+  const components = frame.components.map((c) => ({
+    ...c,
+    realW: Math.ceil(Math.ceil((width * c.h) / frame.hmax) / 8),
+    realH: Math.ceil(Math.ceil((height * c.v) / frame.vmax) / 8),
+  }));
+  return { ...frame, sof, width, height, components };
+}
+
 /**
  * Scrambled frame -> file: the marker, the watermark segments and, with a visible
- * watermark, the frame painted and its covered coefficients stashed.
+ * watermark, the frame painted and its covered coefficients stashed. A frame whose MCUs
+ * cannot be interleaved and that has partial edge MCUs is written enlarged to whole MCUs
+ * (see the top of this file). `progressive`: wanted, if the frame allows it.
  */
 function finishScramble(segments, frame, params, check, { key, watermark, visibleWatermark, progressive }) {
-  if (!interleavable(frame) && hasPadding(frame)) {
-    throw new PixmixError(
-      'JPEG with more than 10 blocks per MCU and partial edge MCUs cannot be scrambled losslessly (its scans cannot hold the padding blocks scrambling fills)',
-      'UNSUPPORTED',
-    );
-  }
-  let stash = null;
+  let stash = null, flags = 0;
   if (visibleWatermark) {
+    // Painted on the original area, the part of the image that is restored.
     stash = stashJpeg(frame, segments, visibleWatermark, jpegOrientation(segments), key, params.salt);
-    if (stash) params = { ...params, flags: FLAG_STASH };
+    if (stash) flags |= FLAG_STASH;
   }
-  return assembleJpeg(headerSegments(segments), frame, {
+  let out = frame;
+  const extra = watermarkSegments(watermark, stash);
+  if (!interleavable(frame) && hasPadding(frame)) {
+    const width = frame.mcusX * 8 * frame.hmax, height = frame.mcusY * 8 * frame.vmax;
+    if (width > 0xffff || height > 0xffff) {
+      throw new PixmixError('JPEG too large to scramble: its enlarged frame would pass 65535 pixels', 'UNSUPPORTED');
+    }
+    out = resized(frame, width, height);
+    flags |= FLAG_ENLARGED;
+    const { width: w, height: h } = frame;
+    extra.push(concat(ascii(SZ_SIG), Uint8Array.of(h >> 8, h & 255, w >> 8, w & 255)));
+  }
+  if (flags) params = { ...params, flags };
+  return assembleJpeg(headerSegments(segments), out, {
     marker: markerPayload(params, check),
-    extra: watermarkSegments(watermark, stash),
-    progressive,
+    extra,
+    progressive: progressive && !hasPadding(out),
   });
+}
+
+/** An enlarged scrambled frame (FLAG_ENLARGED) at its original size; other frames as they are. */
+function originalSize(segments, frame, marker) {
+  if (!(marker.params.flags & FLAG_ENLARGED)) return frame;
+  const seg = segments.find((s) => s.marker === M.APP15 && startsWith(s.data, SZ_SIG));
+  const d = seg?.data.subarray(SZ_SIG.length);
+  if (!d || d.length !== 4) throw new PixmixError('Image lost its original size (APP15 pixmix-sz)', 'BAD_JPEG');
+  const height = (d[0] << 8) | d[1], width = (d[2] << 8) | d[3];
+  // Only the partial edge MCUs are cut: the MCU grid (and so the permutation) stays.
+  if (!width || !height || Math.ceil(width / (8 * frame.hmax)) !== frame.mcusX || Math.ceil(height / (8 * frame.vmax)) !== frame.mcusY) {
+    throw new PixmixError('Corrupt original size (APP15 pixmix-sz)', 'BAD_JPEG');
+  }
+  return resized(frame, width, height);
 }
 
 /** Checks the key, puts a visible watermark's stash back into the scrambled frame, unscrambles. */
 function restoreFrame(segments, frame, marker, key, limits) {
-  const layout = layoutFor(key, marker.params, frame, marker.check);
+  const stored = frame;
+  frame = originalSize(segments, frame, marker);
+  let layout = layoutFor(key, marker.params, frame, marker.check);
+  // An enlarged scrambled file shows at its stored size; the original is its top left.
+  if (stored !== frame) layout = { ...layout, storedWidth: stored.width, storedHeight: stored.height };
   let visible = null;
   if (marker.params.flags & FLAG_STASH) visible = restoreJpegStash(frame, stashOf(segments), key, marker.params.salt, limits);
-  return { layout, visible, restored: applyMcuLayout(frame, layout, 'unscramble') };
+  return { layout, visible, frame, restored: applyMcuLayout(frame, layout, 'unscramble') };
 }
 
 function parse(bytes, limits) {
@@ -227,7 +271,7 @@ export function scrambleJpeg(bytes, { key, transforms = true, salt, mode, progre
   const layout = layoutFor(key, params, frame);
   const scrambled = applyMcuLayout(frame, layout, 'scramble');
   return finishScramble(segments, scrambled, params, layout.check, {
-    key, watermark, visibleWatermark, progressive: restoreProgressive && !hasPadding(frame),
+    key, watermark, visibleWatermark, progressive: restoreProgressive,
   });
 }
 
@@ -266,17 +310,17 @@ export function rekeyJpeg(bytes, { from, to, transforms, salt, mode, progressive
   const { segments, frame } = parse(bytes, limits);
   const marker = readMarkerFrom(segments);
   if (!marker) throw new PixmixError('Image carries no pixmix marker', 'NOT_SCRAMBLED');
-  const { restored: plain, visible } = restoreFrame(segments, frame, marker, from, limits);
+  const { restored: plain, visible, frame: original } = restoreFrame(segments, frame, marker, from, limits);
   const restoreProgressive = progressive === undefined || progressive === 'auto' ? !!(marker.params.block & MCU_PROGRESSIVE) : !!progressive;
   const params = makeParams({
     mode: 'mcu', transforms: transforms ?? !!(marker.params.block & MCU_TRANSFORMS), progressive: restoreProgressive, salt,
   });
-  const layout = layoutFor(to, params, frame);
+  const layout = layoutFor(to, params, original);
   return finishScramble(segments, applyMcuLayout(plain, layout, 'scramble'), params, layout.check, {
     key: to,
     watermark: watermark === undefined ? carried(jpegWatermark(segments, limits)) : watermark,
     visibleWatermark: visibleWatermark === undefined ? visible : visibleWatermark,
-    progressive: restoreProgressive && !hasPadding(frame),
+    progressive: restoreProgressive,
   });
 }
 
@@ -302,10 +346,15 @@ export function inspectJpeg(bytes, limits) {
   for (let i = 0; i < n; i++) comps.push(sof.data[7 + i * 3]);
   const hmax = n > 1 ? Math.max(...comps.map((b) => b >> 4)) : 1;
   const vmax = n > 1 ? Math.max(...comps.map((b) => b & 15)) : 1;
+  // An enlarged scrambled file: the size it restores to, and the size it is stored (and shows) at.
+  const sz = marker && marker.params.flags & FLAG_ENLARGED
+    ? segments.find((s) => s.marker === M.APP15 && startsWith(s.data, SZ_SIG))?.data.subarray(SZ_SIG.length) : null;
+  const size = sz?.length === 4
+    ? { width: (sz[2] << 8) | sz[3], height: (sz[0] << 8) | sz[1], storedWidth: meta.width, storedHeight: meta.height }
+    : { width: meta.width, height: meta.height };
   return {
     format: 'jpeg',
-    width: meta.width,
-    height: meta.height,
+    ...size,
     components: n,
     progressive: sof?.marker === M.SOF2,
     mcu: `${8 * hmax}x${8 * vmax}`,

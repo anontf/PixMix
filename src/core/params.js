@@ -12,9 +12,11 @@
 //   u8[4] key check    (lets the decoder reject a wrong key instead of producing noise)
 //
 // Marker v2 is v1 followed by one byte of flags (bit 0: a visible watermark covers part of
-// the scrambled image and the pixels under it are stored in the file). It is only written
-// when a flag is set, so that pixmix versions which cannot put those pixels back refuse the
-// file instead of restoring it wrongly. The permutation is the same as v1's.
+// the scrambled image and the pixels under it are stored in the file; bit 1, JPEG only: the
+// scrambled frame is enlarged to whole MCUs, and APP15 "pixmix-sz\0" holds the original
+// size). It is only written when a flag is set, so that pixmix versions which cannot undo
+// what a flag says refuse the file instead of restoring it wrongly. The permutation is the
+// same as v1's.
 
 import { hkdf } from './sha256.js';
 
@@ -29,6 +31,7 @@ export const tileSize = (params) => params.block & 0x7fff;
 export const tileTransforms = (params) => params.mode === 'block' && !!(params.block & BLOCK_TRANSFORMS);
 export const MCU_PROGRESSIVE = 2;
 export const FLAG_STASH = 1;
+export const FLAG_ENLARGED = 2;
 const SALT_BYTES = 16;
 const CHECK_BYTES = 4;
 
@@ -40,7 +43,7 @@ const utf8 = new TextEncoder();
  * @property {'pixel'|'block'|'mcu'} mode   mcu: JPEG DCT-domain shuffle of whole MCUs
  * @property {number} block   block mode: tile edge in pixels; mcu mode: flags
  * @property {Uint8Array} salt
- * @property {number} [flags]  marker v2 flags (FLAG_STASH)
+ * @property {number} [flags]  marker v2 flags (FLAG_STASH, FLAG_ENLARGED)
  */
 
 /** @returns {ScrambleParams} */
@@ -124,7 +127,7 @@ export function readMarker(data) {
   // tile transforms existed the flag bit made this check fail, so old readers refuse such files.)
   if (mode === 'block' && !((block & 0x7fff) >= 2 && (block & 0x7fff) <= 4096)) throw new PixmixError('Corrupt pixmix marker (block size)');
   const flags = extra ? data[data.length - 1] : 0;
-  if (flags & ~FLAG_STASH) throw new PixmixError(`Unsupported pixmix marker flags ${flags}`);
+  if (flags & ~(FLAG_STASH | FLAG_ENLARGED)) throw new PixmixError(`Unsupported pixmix marker flags ${flags}`);
   return {
     params: { version: VERSION, mode, block, salt: data.slice(5, 5 + saltLen), flags },
     check: data.slice(5 + saltLen, 5 + saltLen + CHECK_BYTES),

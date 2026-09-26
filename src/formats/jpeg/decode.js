@@ -1,11 +1,12 @@
 // Huffman-coded JPEG -> quantized DCT coefficients (no IDCT). Handles baseline, extended
-// and progressive scans, restart intervals and truncated data (zero-filled, like libjpeg).
+// and progressive scans, restart intervals and truncated data (like libjpeg: the MCU the
+// data runs out in is decoded from zero bits, later MCUs of the scan are left as they are).
 //
 // Coefficients are stored per component in natural (row-major) order, 64 per block, on a
 // grid padded to whole MCUs so that every interleaved MCU exists.
 
 import { M, isSof } from './markers.js';
-import { parseDht, buildDecodeTable } from './huffman.js';
+import { parseDht, buildDecodeTable, standardTable } from './huffman.js';
 import { PixmixError } from '../../core/params.js';
 import { resolveLimits, checkPixels, limitError } from '../../core/limits.js';
 
@@ -18,9 +19,13 @@ export const ZIGZAG = Uint8Array.from([
 /**
  * @typedef {object} Component
  * @property {number} id @property {number} h @property {number} v @property {number} tq
+ * @property {QuantTable|null} [qt]  the table tq named when the component's first scan
+ *           started (tables may be redefined between scans; decoders latch them then)
  * @property {number} blocksW @property {number} blocksH   padded to whole MCUs
  * @property {number} realW @property {number} realH       blocks a non-interleaved scan covers
  * @property {Int16Array} coefs
+ *
+ * @typedef {{pq: number, values: Uint16Array}} QuantTable  values in zigzag order, as in DQT
  *
  * @typedef {object} Frame
  * @property {number} marker  SOF marker of the source
@@ -40,13 +45,15 @@ export function decodeFrame(segments, limits) {
   // Every scan is a pass over the whole image, even with no data left (it is zero-filled).
   const scans = segments.reduce((n, s) => n + (s.marker === M.SOS), 0);
   if (scans > maxScans) throw limitError(`JPEG has ${scans} scans, over the limit of ${maxScans} (limits.maxScans)`);
-  const dc = [], ac = [];
+  const dc = [], ac = [], qt = [];
   let frame = null;
   let restartInterval = 0;
   for (const seg of segments) {
     const { marker, data } = seg;
     if (marker === M.DHT) {
       for (const t of parseDht(data)) (t.tableClass ? ac : dc)[t.id] = buildDecodeTable(t.spec);
+    } else if (marker === M.DQT) {
+      for (const t of parseDqt(data)) qt[t.id] = t.table;
     } else if (marker === M.DRI) {
       restartInterval = (data[0] << 8) | data[1];
     } else if (isSof(marker)) {
@@ -54,6 +61,10 @@ export function decodeFrame(segments, limits) {
       frame = parseSof(marker, data, limits);
     } else if (marker === M.SOS) {
       if (!frame) throw new PixmixError('JPEG scan before frame header', 'BAD_JPEG');
+      for (let i = 0; i < data[0]; i++) {
+        const c = frame.components.find((x) => x.id === data[1 + i * 2]);
+        if (c && c.qt === undefined) c.qt = qt[c.tq] ?? null;
+      }
       decodeScan(frame, data, seg.ecs, dc, ac, restartInterval);
     } else if (marker === M.DNL) {
       throw new PixmixError('JPEG with DNL marker is not supported', 'UNSUPPORTED');
@@ -63,7 +74,73 @@ export function decodeFrame(segments, limits) {
   return frame;
 }
 
-function parseSof(marker, data, limits) {
+/** DQT payload -> [{id, table}]; a truncated table ends the list (the segment is kept as is). */
+export function parseDqt(data) {
+  const out = [];
+  for (let pos = 0; pos < data.length;) {
+    const pq = data[pos] >> 4, id = data[pos] & 15;
+    const size = pq ? 2 : 1;
+    if (pq > 1 || id > 3 || pos + 1 + 64 * size > data.length) break;
+    const values = new Uint16Array(64);
+    for (let k = 0; k < 64; k++) values[k] = pq ? (data[pos + 1 + 2 * k] << 8) | data[pos + 2 + 2 * k] : data[pos + 1 + k];
+    out.push({ id, table: { pq, values } });
+    pos += 1 + 64 * size;
+  }
+  return out;
+}
+
+const sameTable = (a, b) => !!a && !!b && a.values.every((v, k) => v === b.values[k]);
+
+/**
+ * pixmix writes every DQT in front of the frame, where the last definition of a table id
+ * wins. A file that redefines a table between scans (legal: each component uses the table
+ * as it was when its first scan started) would then decode differently. Such files get
+ * one DQT with the tables the components really used, redefined ones moved to free ids,
+ * and a frame header pointing at them: the same image.
+ * @param {import('./markers.js').Segment[]} segments @param {Frame} frame
+ * @returns {{segments: import('./markers.js').Segment[], frame: Frame}}
+ */
+export function normalizeQuantTables(segments, frame) {
+  const final = [];
+  for (const seg of segments) if (seg.marker === M.DQT) for (const t of parseDqt(seg.data)) final[t.id] = t.table;
+  const moved = frame.components.filter((c) => c.qt && !sameTable(c.qt, final[c.tq]));
+  if (!moved.length) return { segments, frame };
+  const slots = [];
+  for (const c of frame.components) if (!moved.includes(c) && final[c.tq]) slots[c.tq] = final[c.tq];
+  const tq = new Map();
+  for (const c of moved) {
+    let id = slots.findIndex((t) => sameTable(t, c.qt));
+    if (id < 0) {
+      id = [0, 1, 2, 3].find((i) => !slots[i]); // each component holds at most one id: one is free
+      slots[id] = c.qt;
+    }
+    tq.set(c, id);
+  }
+  const dqt = [];
+  slots.forEach((t, id) => {
+    if (!t) return;
+    const pq = t.pq || t.values.some((v) => v > 255) ? 1 : 0;
+    dqt.push((pq << 4) | id);
+    for (const v of t.values) pq ? dqt.push(v >> 8, v & 255) : dqt.push(v);
+  });
+  const sof = frame.sof.slice();
+  const components = frame.components.map((c, i) => {
+    if (!tq.has(c)) return c;
+    sof[8 + i * 3] = tq.get(c);
+    return { ...c, tq: tq.get(c) };
+  });
+  const first = segments.findIndex((s) => s.marker === M.DQT);
+  const out = segments.filter((s, i) => s.marker !== M.DQT || i === first);
+  out[out.indexOf(segments[first])] = { marker: M.DQT, data: Uint8Array.from(dqt) };
+  return { segments: out, frame: { ...frame, sof, components } };
+}
+
+/**
+ * Checks a frame header (SOFn payload) against what pixmix decodes: 8-bit Huffman-coded
+ * sequential or progressive DCT, 1-4 components, height in the header, within the limits.
+ * @returns {{width: number, height: number, raw: {id: number, h: number, v: number, tq: number}[]}}
+ */
+export function checkFrameHeader(marker, data, limits) {
   if (marker !== M.SOF0 && marker !== M.SOF1 && marker !== M.SOF2) {
     const kind = marker === 0xc3 || marker === 0xc7 || marker === 0xcb || marker === 0xcf ? 'lossless'
       : marker >= 0xc9 ? 'arithmetic-coded' : 'hierarchical';
@@ -85,6 +162,12 @@ function parseSof(marker, data, limits) {
   }
   // Sampling factors are 1-4 (B.2.2); a 0 made the MCU grid infinite.
   if (raw.some((c) => c.h < 1 || c.h > 4 || c.v < 1 || c.v > 4)) throw new PixmixError('Invalid JPEG sampling factors', 'BAD_JPEG');
+  return { width, height, raw };
+}
+
+function parseSof(marker, data, limits) {
+  const { width, height, raw } = checkFrameHeader(marker, data, limits);
+  const n = raw.length;
   // A single-component frame is never interleaved: its MCU is one block, whatever the
   // sampling factors say.
   if (n === 1) { raw[0].h = 1; raw[0].v = 1; }
@@ -103,7 +186,7 @@ function parseSof(marker, data, limits) {
       coefs: new Int16Array(blocksW * blocksH * 64),
     };
   });
-  return { marker, sof: data, width, height, precision, hmax, vmax, mcusX, mcusY, components };
+  return { marker, sof: data, width, height, precision: 8, hmax, vmax, mcusX, mcusY, components };
 }
 
 class BitReader {
@@ -113,6 +196,14 @@ class BitReader {
     this.buf = 0;
     this.cnt = 0;
     this.eof = false; // hit a marker or the end: feeding zeros from here
+    this.zeros = 0; // how many of the buffered bits are such zeros
+    this.short = false; // the data ran out: some of those zeros were used
+  }
+
+  use(n) {
+    this.cnt -= n;
+    this.buf &= (1 << this.cnt) - 1;
+    if (this.cnt < this.zeros) { this.zeros = this.cnt; this.short = true; }
   }
 
   fill() {
@@ -126,6 +217,7 @@ class BitReader {
           else { b = 0; this.eof = true; } // marker: do not consume
         } else this.pos++;
       } else this.eof = true;
+      if (this.eof) this.zeros += 8;
       this.buf = ((this.buf << 8) | b) >>> 0;
       this.cnt += 8;
     }
@@ -134,9 +226,8 @@ class BitReader {
   bits(n) {
     if (!n) return 0;
     if (this.cnt < n) this.fill();
-    this.cnt -= n;
-    const v = (this.buf >>> this.cnt) & ((1 << n) - 1);
-    this.buf &= (1 << this.cnt) - 1;
+    const v = (this.buf >>> (this.cnt - n)) & ((1 << n) - 1);
+    this.use(n);
     return v;
   }
 
@@ -155,30 +246,30 @@ class BitReader {
     const peek = (this.buf >>> (this.cnt - 9)) & 511;
     const e = t.lookup[peek];
     if (e) {
-      this.cnt -= e >> 8;
-      this.buf &= (1 << this.cnt) - 1;
+      this.use(e >> 8);
       return e & 255;
     }
     const code16 = (this.buf >>> (this.cnt - 16)) & 0xffff;
     for (let l = 10; l <= 16; l++) {
       const code = code16 >>> (16 - l);
       if (code <= t.maxcode[l]) {
-        this.cnt -= l;
-        this.buf &= (1 << this.cnt) - 1;
+        this.use(l);
         return t.symbols[t.valptr[l] + code - t.mincode[l]];
       }
     }
-    if (this.eof) return 0; // zero-filled tail
+    if (this.eof) { this.short = true; return 0; } // zero-filled tail
     throw new PixmixError('Corrupt JPEG data (bad Huffman code)', 'BAD_JPEG');
   }
 
-  /** Discards buffered bits and skips past the next RSTn marker. */
+  /** Discards buffered bits and skips past the next RSTn marker (if there is one, the data goes on). */
   restart() {
     this.buf = 0;
     this.cnt = 0;
     this.eof = false;
+    this.zeros = 0;
     const d = this.data;
     while (this.pos + 1 < d.length && !(d[this.pos] === 0xff && d[this.pos + 1] >= 0xd0 && d[this.pos + 1] <= 0xd7)) this.pos++;
+    if (this.pos + 1 < d.length) this.short = false;
     this.pos += 2;
   }
 }
@@ -190,7 +281,10 @@ function decodeScan(frame, header, ecs, dcTables, acTables, restartInterval) {
     const id = header[1 + i * 2], tables = header[2 + i * 2];
     const c = frame.components.find((x) => x.id === id);
     if (!c) throw new PixmixError('JPEG scan references an unknown component', 'BAD_JPEG');
-    comps.push({ c, dc: dcTables[tables >> 4], ac: acTables[tables & 15], pred: 0 });
+    // Like libjpeg, an undefined table 0 or 1 is the Annex K one (Motion-JPEG has no DHT).
+    const dc = dcTables[tables >> 4] ?? standardTable(0, tables >> 4);
+    const ac = acTables[tables & 15] ?? standardTable(1, tables & 15);
+    comps.push({ c, dc, ac, pred: 0 });
   }
   const o = 1 + ns * 2;
   const ss = header[o], se = header[o + 1], ah = header[o + 2] >> 4, al = header[o + 2] & 15;
@@ -307,17 +401,18 @@ function decodeScan(frame, header, ecs, dcTables, acTables, restartInterval) {
     const { realW, realH, blocksW } = sc.c;
     for (let by = 0; by < realH; by++) {
       for (let bx = 0; bx < realW; bx++) {
-        decodeBlock(sc, (by * blocksW + bx) * 64);
+        if (!r.short) decodeBlock(sc, (by * blocksW + bx) * 64);
         maybeRestart();
       }
     }
   } else {
     for (let my = 0; my < frame.mcusY; my++) {
       for (let mx = 0; mx < frame.mcusX; mx++) {
+        const skip = r.short;
         for (const sc of comps) {
           const { h, v, blocksW } = sc.c;
           for (let y = 0; y < v; y++) {
-            for (let x = 0; x < h; x++) decodeBlock(sc, ((my * v + y) * blocksW + mx * h + x) * 64);
+            for (let x = 0; x < h; x++) if (!skip) decodeBlock(sc, ((my * v + y) * blocksW + mx * h + x) * 64);
           }
         }
         maybeRestart();

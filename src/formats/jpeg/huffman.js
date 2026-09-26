@@ -166,3 +166,29 @@ export class BitWriter {
     return this.buf.subarray(0, this.pos);
   }
 }
+
+// The example tables of Annex K.3 (luminance = table 0, chrominance = table 1), as DHT
+// payloads without the class/id byte. libjpeg decodes a scan with an undefined table 0 or 1
+// with these, which Motion-JPEG frames rely on: they carry no DHT at all.
+const STANDARD = [
+  [
+    '00010501010101010100000000000000000102030405060708090a0b',
+    '00030101010101010101010000000000000102030405060708090a0b',
+  ],
+  [
+    '0002010303020403050504040000017d01020300041105122131410613516107227114328191a1082342b1c11552d1f02433627282090a161718191a25262728292a3435363738393a434445464748494a535455565758595a636465666768696a737475767778797a838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7f8f9fa',
+    '00020102040403040705040400010277000102031104052131061241510761711322328108144291a1b1c109233352f0156272d10a162434e125f11718191a262728292a35363738393a434445464748494a535455565758595a636465666768696a737475767778797a82838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae2e3e4e5e6e7e8e9eaf2f3f4f5f6f7f8f9fa',
+  ],
+];
+const standardCache = [[], []];
+
+/** The Annex K decoding table for class 0 (DC) / 1 (AC) and id 0 or 1, else undefined. */
+export function standardTable(tableClass, id) {
+  if (id > 1) return undefined;
+  if (!standardCache[tableClass][id]) {
+    const hex = STANDARD[tableClass][id];
+    const data = Uint8Array.from({ length: hex.length / 2 + 1 }, (_, i) => (i ? parseInt(hex.substr(i * 2 - 2, 2), 16) : 0));
+    standardCache[tableClass][id] = buildDecodeTable(parseDht(data)[0].spec);
+  }
+  return standardCache[tableClass][id];
+}

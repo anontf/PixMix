@@ -2,9 +2,11 @@
 // re-entropy-coded; nothing is requantized. APPn/COM/DQT segments and the SOF payload are
 // copied through unchanged. The scramble parameters go in an APP15 "pixmix\0" segment.
 //
-// What does change: Huffman tables are re-optimised, restart markers are dropped, and the
-// scans are rewritten: baseline files as one baseline scan, progressive files as progressive
-// scans with pixmix's own scan script (option `progressive` overrides either way).
+// What does change: Huffman tables are re-optimised, restart markers are dropped, DQT
+// segments that redefine a table between scans are merged into one (normalizeQuantTables:
+// same image, other table ids), and the scans are rewritten: baseline files as one
+// baseline scan, progressive files as progressive scans with pixmix's own scan script
+// (option `progressive` overrides either way).
 //
 // One catch: progressive AC scans only cover an image's real blocks, not the padding blocks
 // of partial edge MCUs. Scrambling can move real content into those, so a scrambled file is
@@ -12,13 +14,18 @@
 // progressive, and restoring writes progressive again (exactly: the original could not hold
 // AC data in padding blocks either).
 //
+// The same goes for frames whose MCU has more than 10 blocks (e.g. every component sampled
+// 2x2): they can only be coded one scan per component, and such scans never hold padding
+// blocks either. With partial edge MCUs there is nowhere to put the content scrambling
+// moves into the padding, so those files are refused (UNSUPPORTED).
+//
 // Watermarks (see watermark/embed.js) travel in more APP15 segments: "pixmix-wm\0" names the
 // watermark for the restored image, "pixmix-ws\0" (split over as many segments as it needs)
 // holds the coefficients under a watermark drawn on the scrambled image.
 
 import { readSegments, writeSegments, isJpeg, isSof, isApp, startsWith, M } from './markers.js';
-import { decodeFrame } from './decode.js';
-import { assembleJpeg } from './encode.js';
+import { decodeFrame, normalizeQuantTables } from './decode.js';
+import { assembleJpeg, interleavable } from './encode.js';
 import { applyMcuLayout, transformCount } from './transform.js';
 import { computeGridLayout } from '../../core/layout.js';
 import {
@@ -109,6 +116,12 @@ function concat(...parts) {
  * watermark, the frame painted and its covered coefficients stashed.
  */
 function finishScramble(segments, frame, params, check, { key, watermark, visibleWatermark, progressive }) {
+  if (!interleavable(frame) && hasPadding(frame)) {
+    throw new PixmixError(
+      'JPEG with more than 10 blocks per MCU and partial edge MCUs cannot be scrambled losslessly (its scans cannot hold the padding blocks scrambling fills)',
+      'UNSUPPORTED',
+    );
+  }
   let stash = null;
   if (visibleWatermark) {
     stash = stashJpeg(frame, segments, visibleWatermark, jpegOrientation(segments), key, params.salt);
@@ -131,8 +144,7 @@ function restoreFrame(segments, frame, marker, key, limits) {
 
 function parse(bytes, limits) {
   const { segments, trailing } = readSegments(bytes, limits);
-  const frame = decodeFrame(segments, limits);
-  return { segments, trailing, frame };
+  return { ...normalizeQuantTables(segments, decodeFrame(segments, limits)), trailing };
 }
 
 function layoutFor(key, params, frame, expectedCheck) {
@@ -266,6 +278,16 @@ export function rekeyJpeg(bytes, { from, to, transforms, salt, mode, progressive
     visibleWatermark: visibleWatermark === undefined ? visible : visibleWatermark,
     progressive: restoreProgressive && !hasPadding(frame),
   });
+}
+
+/**
+ * The same image as a clean JPEG (like jpegtran): explicit Huffman tables, no stray bytes,
+ * truncated data zero-filled, redefined quantisation tables merged, baseline scans. For
+ * pixel decoders that cannot read the original.
+ */
+export function rebuildJpeg(bytes, limits) {
+  const { segments, frame } = parse(bytes, limits);
+  return assembleJpeg(headerSegments(segments), frame);
 }
 
 /** Cheap: parses segments only, no entropy decoding. */

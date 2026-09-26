@@ -6,7 +6,7 @@ import { resolveLimits, checkChunks } from '../../core/limits.js';
 
 export const M = {
   SOI: 0xd8, EOI: 0xd9, SOS: 0xda, DQT: 0xdb, DHT: 0xc4, DRI: 0xdd, DNL: 0xdc, COM: 0xfe,
-  SOF0: 0xc0, SOF1: 0xc1, SOF2: 0xc2, APP0: 0xe0, APP1: 0xe1, APP2: 0xe2, APP13: 0xed, APP15: 0xef,
+  SOF0: 0xc0, SOF1: 0xc1, SOF2: 0xc2, APP0: 0xe0, APP1: 0xe1, APP2: 0xe2, APP13: 0xed, APP14: 0xee, APP15: 0xef,
 };
 
 export const isSof = (m) => m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc;
@@ -21,18 +21,25 @@ export function isJpeg(bytes) {
  *   data is the payload after the length field; SOS segments carry `ecs`, the
  *   entropy-coded bytes (including any RST markers) that follow the header.
  * @param {Uint8Array} bytes @param {Partial<import('../../core/limits.js').Limits>} [limits]
- * @returns {{segments: Segment[], trailing: Uint8Array}}
+ * @returns {{segments: Segment[], trailing: Uint8Array, damaged: boolean}}  damaged: bytes
+ *   before a marker were skipped, or the file ends inside a scan (no EOI)
  */
 export function readSegments(bytes, limits) {
   if (!isJpeg(bytes)) throw new PixmixError('Not a JPEG file', 'BAD_JPEG');
   const { maxChunks } = resolveLimits(limits);
   const segments = [];
-  let pos = 2;
+  let pos = 2, damaged = false;
   for (;;) {
     if (segments.length >= maxChunks) checkChunks(segments.length + 1, limits, 'segments');
-    while (pos < bytes.length && bytes[pos] === 0xff && bytes[pos + 1] === 0xff) pos++; // fill bytes
+    // Like libjpeg's next_marker: garbage before a marker is skipped (libjpeg warns about
+    // "extraneous bytes"), and so are fill bytes (FF FF) and stuffed FF00 pairs.
+    for (;;) {
+      while (pos < bytes.length && bytes[pos] !== 0xff) { pos++; damaged = true; }
+      while (pos + 1 < bytes.length && bytes[pos + 1] === 0xff) pos++;
+      if (pos + 1 < bytes.length && bytes[pos + 1] === 0) { pos += 2; damaged = true; continue; }
+      break;
+    }
     if (pos + 2 > bytes.length) throw new PixmixError('JPEG ends before EOI', 'BAD_JPEG');
-    if (bytes[pos] !== 0xff) throw new PixmixError('Corrupt JPEG marker stream', 'BAD_JPEG');
     const marker = bytes[pos + 1];
     pos += 2;
     if (marker === M.EOI) break;
@@ -56,12 +63,12 @@ export function readSegments(bytes, limits) {
       }
       seg.ecs = bytes.subarray(start, Math.min(pos, bytes.length));
       segments.push(seg);
-      if (pos >= bytes.length) break; // truncated file: tolerate a missing EOI
+      if (pos >= bytes.length) { damaged = true; break; } // truncated file: tolerate a missing EOI
       continue;
     }
     segments.push(seg);
   }
-  return { segments, trailing: bytes.subarray(Math.min(pos, bytes.length)) };
+  return { segments, trailing: bytes.subarray(Math.min(pos, bytes.length)), damaged };
 }
 
 /** @param {Segment[]} segments @param {Uint8Array} [trailing] */

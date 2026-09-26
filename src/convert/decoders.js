@@ -19,7 +19,10 @@ import { resolveLimits, checkPixels, checkFrames } from '../core/limits.js';
 import { readPng } from '../formats/png/index.js';
 import { toRGBA8 } from '../formats/png/rgba.js';
 import { readPngMetadata } from '../meta/png.js';
-import { readJpegMetadata } from '../meta/jpeg.js';
+import { readSegments, isSof, startsWith, M } from '../formats/jpeg/markers.js';
+import { checkFrameHeader } from '../formats/jpeg/decode.js';
+import { parseDht } from '../formats/jpeg/huffman.js';
+import { rebuildJpeg } from '../formats/jpeg/index.js';
 import { loadJxlCodec } from '../formats/jxl/load.js';
 import { readJxlHeader, readJxl } from '../formats/jxl/container.js';
 
@@ -100,30 +103,110 @@ function apngFrames(img) {
   return frames.length ? { frames, plays } : null;
 }
 
+// jpeg-js does the pixels. pixmix's own reader checks the file first (what it cannot
+// decode is UNSUPPORTED, as on the JPEG -> JPEG path) and picks the colour transform the
+// way libjpeg does; files jpeg-js misreads or refuses (truncated, stray bytes, no DHT,
+// quantisation tables redefined between scans) go through rebuildJpeg first, which keeps
+// the image and writes it the way jpeg-js expects.
 export const jpegDecoder = {
   name: 'jpeg-js',
   formats: ['jpeg'],
   decode(bytes, _format, { limits } = {}) {
     const l = resolveLimits(limits);
+    const { segments, damaged } = readSegments(bytes, l);
+    const sofs = segments.filter((s) => isSof(s.marker));
+    if (!sofs.length) throw new PixmixError('JPEG has no frame header', 'BAD_JPEG');
+    if (sofs.length > 1) throw new PixmixError('JPEG has more than one frame', 'UNSUPPORTED');
     // The frame header first, so jpeg-js never starts on an image over the limit.
-    const { width, height, components = 3 } = readJpegMetadata(bytes);
-    if (width && height) checkPixels(width, height, l);
-    try {
-      const img = decodeJpeg(bytes, {
+    const { raw } = checkFrameHeader(sofs[0].marker, sofs[0].data, l);
+    if (raw.length === 2) throw new PixmixError('JPEG with 2 components is not supported', 'UNSUPPORTED');
+    const { colorTransform, adobe } = colourModel(segments, raw);
+    const dropped = raw.length === 4
+      ? [`${colorTransform ? 'YCCK' : 'CMYK'} colours (converted to RGB by formula, without a colour profile: approximate)`] : [];
+    const run = (input) => {
+      // jpeg-js only reads 4 components with an Adobe segment (and then takes its transform).
+      if (raw.length === 4 && !adobe) input = withAdobe(input, colorTransform ? 2 : 0);
+      const img = decodeJpeg(input, {
         useTArray: true,
         formatAsRGBA: true,
         tolerantDecoding: true,
+        colorTransform,
         maxResolutionInMP: l.maxPixels / 1e6,
         // Coefficients (2 bytes per sample, padded) plus the RGBA output, with headroom.
-        maxMemoryUsageInMB: Math.ceil((l.maxPixels * (4 + 4 * Math.max(components, 1))) / 2 ** 20) + 64,
+        maxMemoryUsageInMB: Math.ceil((l.maxPixels * (4 + 4 * raw.length)) / 2 ** 20) + 64,
       });
-      return { width: img.width, height: img.height, data: img.data };
-    } catch (err) {
-      if (err instanceof PixmixError) throw err;
-      throw new PixmixError(`JPEG decode failed: ${err.message}`, 'BAD_JPEG');
+      return { width: img.width, height: img.height, data: img.data, metadata: { dropped } };
+    };
+    let rebuilt = needsRebuild(segments, damaged);
+    for (;;) {
+      try {
+        return run(rebuilt ? rebuildJpeg(bytes, l) : bytes);
+      } catch (err) {
+        if (err instanceof PixmixError) throw err;
+        if (!rebuilt) { rebuilt = true; continue; } // whatever jpeg-js trips over: once more, rebuilt
+        const why = err instanceof TypeError || err instanceof RangeError ? 'corrupt data' : err.message;
+        throw new PixmixError(`JPEG decode failed: ${why}`, 'BAD_JPEG');
+      }
     }
   },
 };
+
+/**
+ * libjpeg's choice of colour space (jdapimin.c): 3 components are YCbCr with a JFIF
+ * segment, else as an Adobe segment says (transform 0 = RGB), else RGB only for component
+ * ids 'R', 'G', 'B'; 4 components are YCCK when an Adobe segment has a non-zero transform,
+ * else CMYK. `adobe`: whether jpeg-js sees an Adobe segment (it wants "Adobe\0").
+ */
+function colourModel(segments, raw) {
+  const app = (marker, sig, min) => segments.filter((s) => s.marker === marker && s.data.length >= min && startsWith(s.data, sig));
+  const jfif = app(M.APP0, 'JFIF\0', 14).length > 0;
+  const app14 = app(M.APP14, 'Adobe', 12).pop();
+  const adobe = app(M.APP14, 'Adobe\0', 0).length > 0;
+  if (raw.length === 3) {
+    const rgbIds = raw[0].id === 0x52 && raw[1].id === 0x47 && raw[2].id === 0x42;
+    return { colorTransform: jfif || (app14 ? app14.data[11] !== 0 : !rgbIds), adobe };
+  }
+  return { colorTransform: raw.length === 4 && !!app14 && app14.data[11] !== 0, adobe };
+}
+
+/** Files jpeg-js misreads (see jpegDecoder), found from the segments alone. */
+function needsRebuild(segments, damaged) {
+  if (damaged) return true;
+  const dc = new Set(), ac = new Set();
+  let scanned = false, progressive = false;
+  for (const { marker, data } of segments) {
+    if (isSof(marker)) {
+      progressive = marker === M.SOF2;
+    } else if (marker === M.DHT) {
+      try {
+        for (const t of parseDht(data)) (t.tableClass ? ac : dc).add(t.id);
+      } catch {
+        return true;
+      }
+    } else if (marker === M.DQT && scanned) {
+      return true;
+    } else if (marker === M.SOS) {
+      scanned = true;
+      const o = 1 + data[0] * 2, ss = data[o], ah = data[o + 2] >> 4;
+      const needDc = !progressive || (ss === 0 && ah === 0), needAc = !progressive || ss > 0;
+      for (let i = 0; i < data[0]; i++) {
+        const t = data[2 + i * 2];
+        if ((needDc && !dc.has(t >> 4)) || (needAc && !ac.has(t & 15))) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** The JPEG with an Adobe APP14 segment (the given transform) right after SOI. */
+function withAdobe(bytes, transform) {
+  const app14 = [0xff, M.APP14, 0, 14, 0x41, 0x64, 0x6f, 0x62, 0x65, 0, 100, 0, 0, 0, 0, transform];
+  const out = new Uint8Array(bytes.length + app14.length);
+  out.set(bytes.subarray(0, 2));
+  out.set(app14, 2);
+  out.set(bytes.subarray(2), 2 + app14.length);
+  return out;
+}
 
 export const gifDecoder = {
   name: 'omggif',

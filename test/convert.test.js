@@ -12,6 +12,9 @@ import { readChunks } from '../src/formats/png/chunks.js';
 import { readOrientation } from '../src/meta/exif.js';
 import { readPng } from '../src/formats/png/index.js';
 import { toRGBA8 } from '../src/formats/png/rgba.js';
+import { readSegments, writeSegments, isSof } from '../src/formats/jpeg/markers.js';
+import { assembleJpeg, encodeScan } from '../src/formats/jpeg/encode.js';
+import { encodePixels } from '../src/formats/jpeg/fdct.js';
 
 const W = 48, H = 32;
 const ascii = (s) => Buffer.from(s, 'latin1');
@@ -241,4 +244,101 @@ test('lossless output of a lossy source carries a size note; JPEG output does no
   assert.match(report.notes[0], /jpeg is lossy/);
   encode(src, { key: 'k', onConvert: (r) => { report = r; } });
   assert.deepEqual(report.notes ?? [], []);
+});
+
+// --- the built-in JPEG decoder against libjpeg -------------------------------------
+
+/** A 4:4:4 JPEG built by pixmix's writer, with `edit(segments)` applied. */
+function builtJpeg(edit = (s) => s, { w = W, h = H, subsampling = '4:4:4' } = {}) {
+  const { frame, dqt } = encodePixels({ width: w, height: h, data: gradient(w, h).map((v, i) => (i % 4 === 2 ? (i * 7) & 255 : v)) }, { subsampling });
+  return writeSegments(edit(readSegments(assembleJpeg([dqt], frame, { progressive: false })).segments, frame));
+}
+const meanDiff = async (jpegBytes, png) => {
+  const ref = await sharp(jpegBytes, { failOn: 'none' }).ensureAlpha().raw().toBuffer();
+  const mine = rgbaOf(png);
+  let s = 0;
+  for (let i = 0; i < ref.length; i++) s += Math.abs(ref[i] - mine[i]);
+  return s / ref.length;
+};
+const withSof = (segments, change) => segments.map((s) => (isSof(s.marker) ? change(s) : s));
+const app14 = (transform) => ({ marker: 0xee, data: Uint8Array.from([0x41, 0x64, 0x6f, 0x62, 0x65, 0, 100, 0, 0, 0, 0, transform]) });
+
+test('built-in JPEG decoder picks the colour transform like libjpeg (RGB-coded files)', async () => {
+  const cases = {
+    'YCbCr, no markers': (s) => s,
+    'Adobe transform 0': (s) => [app14(0), ...s],
+    'component ids R G B': (s) => withSof(s, (sof) => {
+      const data = sof.data.slice();
+      data[6] = 0x52; data[9] = 0x47; data[12] = 0x42;
+      return { ...sof, data };
+    }).map((x) => (x.marker === 0xda ? { ...x, data: Uint8Array.from(x.data, (b, i) => (i === 1 ? 0x52 : i === 3 ? 0x47 : i === 5 ? 0x42 : b)) } : x)),
+    'JFIF wins over Adobe transform 0': (s) => [{ marker: 0xe0, data: ascii('JFIF\0\x01\x01\x00\x00\x01\x00\x01\x00\x00') }, app14(0), ...s],
+  };
+  for (const [name, edit] of Object.entries(cases)) {
+    const src = builtJpeg(edit);
+    const d = await meanDiff(src, convert(src, { format: 'png' }).bytes);
+    assert.ok(d < 1.5, `${name}: mean difference to libjpeg ${d.toFixed(2)}`);
+  }
+});
+
+test('built-in JPEG decoder refuses what pixmix cannot decode, like the JPEG path', () => {
+  const src = builtJpeg();
+  const code = (bytes) => { try { convert(bytes, { format: 'png' }); return 'ok'; } catch (err) { return err.code; } };
+  assert.equal(code(builtJpeg((s) => withSof(s, (sof) => ({ ...sof, data: Uint8Array.from(sof.data, (b, i) => (i ? b : 12)), marker: 0xc1 })))), 'UNSUPPORTED', '12-bit');
+  for (const marker of [0xc3, 0xc9, 0xc5]) assert.equal(code(builtJpeg((s) => withSof(s, (sof) => ({ ...sof, marker })))), 'UNSUPPORTED', marker.toString(16));
+  assert.equal(code(src.subarray(0, 40)), 'BAD_JPEG');
+});
+
+test('built-in JPEG decoder reads what libjpeg tolerates: truncation, stray bytes, no DHT, DQT between scans', async () => {
+  const full = builtJpeg();
+  const noDht = (() => {
+    // A frame coded with the Annex K tables, then without its DHT (Motion-JPEG style).
+    const std = new Uint8Array(jpeg.encode({ width: W, height: H, data: gradient() }, 90).data);
+    return [std, writeSegments(readSegments(std).segments.filter((s) => s.marker !== 0xc4))];
+  })();
+  const at = 2 + 4 + readSegments(full).segments[0].data.length;
+  const cases = {
+    truncated: [full, full.subarray(0, Math.floor(full.length * 0.6))],
+    'stray bytes': [full, Uint8Array.from([...full.subarray(0, at), 0, 0, 7, ...full.subarray(at)])],
+    'no DHT': noDht,
+  };
+  for (const [name, [ref, bytes]] of Object.entries(cases)) {
+    const png = convert(bytes, { format: 'png' }).bytes;
+    const d = await meanDiff(bytes, png);
+    assert.ok(d < 1.5, `${name}: mean difference to libjpeg ${d.toFixed(2)}`);
+    if (name !== 'truncated') assert.ok((await meanDiff(ref, png)) < 1.5, `${name}: the intact image`);
+  }
+  // Table 0 redefined before the second of three single-component scans.
+  const { frame, dqt } = encodePixels({ width: W, height: H, data: gradient() }, { subsampling: '4:4:4' });
+  const segs = [dqt, { marker: 0xc0, data: frame.sof }];
+  frame.components.forEach((_, only) => {
+    if (only === 1) segs.push({ marker: 0xdb, data: Uint8Array.from([0, ...Array(64).fill(40), 1, ...Array(64).fill(3)]) });
+    const s = encodeScan(frame, { only });
+    segs.push({ marker: 0xc4, data: s.dht }, { marker: 0xda, data: s.sos, ecs: s.ecs });
+  });
+  const redefined = writeSegments(segs);
+  assert.ok((await meanDiff(redefined, convert(redefined, { format: 'png' }).bytes)) < 1.5, 'DQT between scans');
+});
+
+test('built-in JPEG decoder: CMYK is converted by formula, and the report says so', () => {
+  const cmyk = builtJpeg((s, frame) => {
+    const out = withSof(s, (sof) => {
+      const data = new Uint8Array(sof.data.length + 3);
+      data.set(sof.data);
+      data[5] = 4;
+      data.set([4, 0x11, 0], sof.data.length);
+      return { ...sof, data };
+    });
+    // The 4th component (K) repeats the first's coefficients in a scan of its own.
+    const k = encodeScan({ ...frame, components: [{ ...frame.components[0], id: 4 }] });
+    const i = out.findIndex((x) => x.marker === 0xda);
+    out.splice(i + 1, 0, { marker: 0xc4, data: k.dht }, { marker: 0xda, data: k.sos, ecs: k.ecs });
+    return out;
+  });
+  for (const [name, bytes] of [['Adobe CMYK', writeSegments([app14(0), ...readSegments(cmyk).segments])], ['no Adobe segment', cmyk]]) {
+    const r = convert(bytes, { format: 'png' });
+    assert.ok(r.dropped.some((d) => /^CMYK colours \(converted to RGB by formula/.test(d)), name);
+  }
+  const ycck = writeSegments([app14(2), ...readSegments(cmyk).segments]);
+  assert.ok(convert(ycck, { format: 'png' }).dropped.some((d) => d.startsWith('YCCK colours')));
 });

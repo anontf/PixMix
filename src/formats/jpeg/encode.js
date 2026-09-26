@@ -1,4 +1,5 @@
-// Quantized DCT coefficients -> Huffman JPEG, baseline (one interleaved scan) or progressive
+// Quantized DCT coefficients -> Huffman JPEG, baseline (one interleaved scan, or one per
+// component when the MCU is too large to interleave) or progressive
 // (spectral selection), with Huffman tables optimised for the data (two passes, like
 // jpegtran -optimize). Everything that is not entropy coding (APPn, COM, DQT, the SOF
 // payload) is supplied by the caller and written back unchanged.
@@ -18,15 +19,37 @@ const acCategory = (v) => {
   return c;
 };
 
+// Decoders keep the DC predictor as an int and store it as a 16-bit coefficient, so only
+// a difference mod 2^16 matters. Corrupt data whose predictor overflowed decodes to
+// coefficients whose differences can need 16 bits, which no DC table codes: write the
+// difference wrapped into 15 bits instead, which decodes to the same coefficients. Only
+// a difference of exactly 2^15 has no such form.
+const dcDiff = (dc, pred) => {
+  const d = ((dc - pred + 0x8000) & 0xffff) - 0x8000;
+  if (d === -0x8000) throw new PixmixError('JPEG DC coefficient out of range (corrupt data)', 'BAD_JPEG');
+  return d;
+};
+
 /**
+ * Whether the frame can be coded in one interleaved scan: T.81 B.2.3 (and libjpeg) limit
+ * an interleaved MCU to 10 blocks. Larger layouts (e.g. every component sampled 2x2) are
+ * only legal as one scan per component.
+ */
+export const interleavable = (frame) => frame.components.length === 1
+  || frame.components.reduce((n, c) => n + c.h * c.v, 0) <= 10;
+
+/**
+ * One baseline scan: every component interleaved, or with `only` just that component
+ * (non-interleaved: its real blocks, in raster order).
  * @param {import('./decode.js').Frame} frame
- * @param {{restartInterval?: number}} [opts]  restart markers are only for tests
+ * @param {{restartInterval?: number, only?: number}} [opts]  restart markers are only for tests
  * @returns {{dht: Uint8Array, sos: Uint8Array, ecs: Uint8Array, dri: Uint8Array|null}}
  */
-export function encodeScan(frame, { restartInterval = 0 } = {}) {
-  const comps = frame.components;
-  const tableOf = (i) => (i === 0 ? 0 : 1); // luma table 0, chroma table 1 (baseline allows 2)
-  const nTables = comps.length > 1 ? 2 : 1;
+export function encodeScan(frame, { restartInterval = 0, only } = {}) {
+  const comps = only === undefined ? frame.components : [frame.components[only]];
+  // Luma table 0, chroma table 1 (baseline allows 2).
+  const tableOf = (i) => ((only ?? i) === 0 ? 0 : 1);
+  const tables = [...new Set(comps.map((_, i) => tableOf(i)))];
 
   const walk = (visit) => {
     const pred = new Int32Array(comps.length);
@@ -36,9 +59,11 @@ export function encodeScan(frame, { restartInterval = 0 } = {}) {
     };
     let totalMcus;
     if (comps.length === 1) {
-      const c = comps[0];
-      totalMcus = c.blocksW * c.blocksH;
-      for (let b = 0; b < totalMcus; b++) { visit(0, b * 64, 0, pred); tick(); }
+      const { realW, realH, blocksW } = comps[0];
+      totalMcus = realW * realH;
+      for (let by = 0; by < realH; by++) {
+        for (let bx = 0; bx < realW; bx++) { visit(0, (by * blocksW + bx) * 64, 0, pred); tick(); }
+      }
     } else {
       totalMcus = frame.mcusX * frame.mcusY;
       for (let my = 0; my < frame.mcusY; my++) {
@@ -62,7 +87,7 @@ export function encodeScan(frame, { restartInterval = 0 } = {}) {
     if (ci < 0) return;
     const coefs = comps[ci].coefs, t = tableOf(ci);
     const dc = coefs[blk];
-    dcFreq[t][category(dc - pred[ci])]++;
+    dcFreq[t][category(dcDiff(dc, pred[ci]))]++;
     pred[ci] = dc;
     let run = 0;
     for (let k = 1; k < 64; k++) {
@@ -77,7 +102,7 @@ export function encodeScan(frame, { restartInterval = 0 } = {}) {
 
   const specs = [];
   const dcEnc = [], acEnc = [];
-  for (let t = 0; t < nTables; t++) {
+  for (const t of tables) {
     const dcSpec = buildOptimalSpec(dcFreq[t]);
     const acSpec = buildOptimalSpec(acFreq[t]);
     specs.push({ tableClass: 0, id: t, spec: dcSpec }, { tableClass: 1, id: t, spec: acSpec });
@@ -92,7 +117,7 @@ export function encodeScan(frame, { restartInterval = 0 } = {}) {
     const coefs = comps[ci].coefs, t = tableOf(ci);
     const dcT = dcEnc[t], acT = acEnc[t];
     const dc = coefs[blk];
-    const diff = dc - pred[ci];
+    const diff = dcDiff(dc, pred[ci]);
     pred[ci] = dc;
     const s = category(diff);
     w.put(dcT.code[s], dcT.size[s]);
@@ -140,13 +165,16 @@ export function sofMarkerFor(dqtSegments) {
 // --- progressive -------------------------------------------------------------------
 
 /**
- * Scan script: DC of all components first (one interleaved scan), then AC bands per
- * component, luma's low frequencies early. Spectral selection only (Ah = Al = 0), which
- * every progressive decoder handles and keeps coefficients exact.
+ * Scan script: DC of all components first (one interleaved scan, or one per component when
+ * the MCU is too large to interleave), then AC bands per component, luma's low frequencies
+ * early. Spectral selection only (Ah = Al = 0), which every progressive decoder handles
+ * and keeps coefficients exact.
  */
-function progressiveScript(n) {
+function progressiveScript(n, interleaved) {
   if (n === 1) return [{ comps: [0], ss: 0, se: 0 }, { comps: [0], ss: 1, se: 5 }, { comps: [0], ss: 6, se: 63 }];
-  const script = [{ comps: [...Array(n).keys()], ss: 0, se: 0 }, { comps: [0], ss: 1, se: 5 }];
+  const all = [...Array(n).keys()];
+  const dc = interleaved ? [{ comps: all, ss: 0, se: 0 }] : all.map((c) => ({ comps: [c], ss: 0, se: 0 }));
+  const script = [...dc, { comps: [0], ss: 1, se: 5 }];
   for (let c = 1; c < n; c++) script.push({ comps: [c], ss: 1, se: 63 });
   script.push({ comps: [0], ss: 6, se: 63 });
   return script;
@@ -179,7 +207,7 @@ function codeScan(frame, { comps, ss, se }, put) {
     const pred = new Int32Array(cs.length);
     walkScan(frame, comps, (ci, blk) => {
       const dc = cs[ci].coefs[blk];
-      const diff = dc - pred[ci];
+      const diff = dcDiff(dc, pred[ci]);
       pred[ci] = dc;
       const s = category(diff);
       put(ci, s, diff < 0 ? diff - 1 : diff, s);
@@ -213,7 +241,7 @@ function codeScan(frame, { comps, ss, se }, put) {
 /** Progressive scans: [{dht, sos, ecs}] with tables optimised per scan. */
 export function encodeProgressive(frame) {
   const out = [];
-  for (const scan of progressiveScript(frame.components.length)) {
+  for (const scan of progressiveScript(frame.components.length, interleavable(frame))) {
     const dc = scan.ss === 0;
     // DC scans: luma table 0, chroma table 1; an AC scan has one component, table 0.
     const tableOf = (slot) => (dc && scan.comps[slot] !== 0 ? 1 : 0);
@@ -259,10 +287,10 @@ export function assembleJpeg(header, frame, { marker, extra = [], restartInterva
     }
     return writeSegments(out);
   }
-  const { dht, sos, ecs, dri } = encodeScan(frame, { restartInterval });
   out.push({ marker: sofMarkerFor(header.filter((s) => s.marker === M.DQT)), data: frame.sof });
-  out.push({ marker: M.DHT, data: dht });
-  if (dri) out.push({ marker: M.DRI, data: dri });
-  out.push({ marker: M.SOS, data: sos, ecs });
+  const scans = interleavable(frame) ? [encodeScan(frame, { restartInterval })]
+    : frame.components.map((_, only) => encodeScan(frame, { restartInterval, only }));
+  if (scans[0].dri) out.push({ marker: M.DRI, data: scans[0].dri });
+  for (const { dht, sos, ecs } of scans) out.push({ marker: M.DHT, data: dht }, { marker: M.SOS, data: sos, ecs });
   return writeSegments(out);
 }

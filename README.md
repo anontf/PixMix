@@ -259,6 +259,12 @@ input is decoded to pixels and re-encoded:
 | WebP | `sharpDecoder` / `browserDecoder` | pixmix's WebP reader |
 | AVIF, HEIC, TIFF | `sharpDecoder` / `browserDecoder` | sharp |
 
+The built-in JPEG decoder refuses what pixmix's JPEG reader refuses (12-bit, lossless,
+arithmetic-coded, hierarchical: `UNSUPPORTED`) and picks the colour transform as libjpeg
+does (JFIF, else the Adobe APP14 transform, else component ids `R`,`G`,`B` mean RGB).
+CMYK and YCCK are converted by the usual profile-less formula (as libjpeg and browsers do
+without a profile), which `dropped` reports; `sharpDecoder` converts with the ICC profile.
+
 Where each kind of metadata ends up:
 
 | Metadata | PNG | JPEG | JPEG XL |
@@ -759,8 +765,11 @@ clean. Two defaults: `vivi-web` (the `web` preset with Vivi as artist and copyri
    deflated. Only `IDAT` changes. A `pmIx` chunk (ancillary, private, safe-to-copy) holding
    the version, mode, block size, salt and key check goes right before it.
 4. **JPEG.** The entropy-coded data is decoded to quantised DCT coefficients, with no IDCT.
-   Baseline, extended and progressive files are supported, along with restart markers and
-   truncated data.
+   Baseline, extended and progressive files are supported, along with restart markers,
+   truncated data (read as libjpeg does), stray bytes between segments and scans without
+   Huffman tables (Motion-JPEG frames: the Annex K tables are used, as in libjpeg).
+   12-bit, lossless, arithmetic-coded and hierarchical JPEGs are refused (`UNSUPPORTED`),
+   on every path.
    - Whole MCUs (8×8 or 16×16, depending on chroma subsampling) are moved with all their
      components, so colour stays attached to its brightness.
    - The transforms are applied exactly on the coefficients: flipping negates the odd
@@ -768,11 +777,17 @@ clean. Two defaults: `vivi-web` (the `web` preset with Vivi as artist and copyri
      gets the 4 flips.
    - The coefficients are written back with Huffman tables optimised for the data, as
      `jpegtran -optimize` does.
-     - Baseline sources are written as one baseline scan.
+     - Baseline sources are written as one baseline scan (one per component when the
+       MCU has more than 10 blocks, e.g. every component sampled 2×2, as the standard
+       requires).
      - Progressive sources are written as progressive scans: DC first, then AC bands,
        spectral selection with per-scan tables. `progressive: true | false` overrides that.
    - Nothing is requantised. APPn, COM and DQT segments and the SOF payload are copied
-     unchanged, and an APP15 `pixmix\0` segment holds the marker.
+     unchanged, and an APP15 `pixmix\0` segment holds the marker. The exception: a file
+     that redefines a quantisation table between scans gets one DQT with the tables its
+     components really used (on free table ids) and a SOF pointing at them, the same image.
+   - DC differences are written mod 2^16 (as decoders read them), so corrupt files whose
+     DC predictor overflowed stay readable.
    - Restart markers are not kept.
    - **Progressive caveat.** Progressive AC scans can't store the padding blocks of partial
      edge MCUs, and scrambling may move real content into them. So a scrambled file is
@@ -782,6 +797,8 @@ clean. Two defaults: `vivi-web` (the `web` preset with Vivi as artist and copyri
        progressive file again. That's exact, since the original couldn't hold AC data in
        padding blocks either.
      - The JPEG inside a JPEG-route JPEG XL is always baseline (see jxl-oxide above).
+   - The same limit applies to MCUs of more than 10 blocks, which only non-interleaved
+     scans can code: with partial edge MCUs such files are refused (`UNSUPPORTED`).
 
 Marker v1: `u8 version | u8 mode | u16 block | u8 saltLen | salt | u8[4] check`. Marker v2
 adds `u8 flags` (bit 0: a visible watermark's stash is in the file); it's only written when a

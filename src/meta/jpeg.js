@@ -27,9 +27,10 @@ export function readJpegMetadata(bytes) {
   const iccParts = [];
   let pos = 2;
   while (pos + 4 <= bytes.length) {
-    if (bytes[pos] !== 0xff) throw new PixmixError('Corrupt JPEG marker stream', 'BAD_JPEG');
+    if (bytes[pos] !== 0xff) { pos++; continue; } // garbage before a marker: skipped, like libjpeg
     const marker = bytes[pos + 1];
     if (marker === 0xff) { pos++; continue; } // fill byte
+    if (marker === 0) { pos += 2; continue; }
     if (marker === 0xd8 || (marker >= 0xd0 && marker <= 0xd7) || marker === 0x01) { pos += 2; continue; }
     if (marker === 0xd9 || marker === 0xda) break; // EOI / start of scan: no more metadata
     const len = (bytes[pos + 2] << 8) | bytes[pos + 3];

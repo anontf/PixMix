@@ -5,7 +5,7 @@
 // grid padded to whole MCUs so that every interleaved MCU exists.
 
 import { M, isSof } from './markers.js';
-import { parseDht, buildDecodeTable } from './huffman.js';
+import { parseDht, buildDecodeTable, standardTable } from './huffman.js';
 import { PixmixError } from '../../core/params.js';
 import { resolveLimits, checkPixels, limitError } from '../../core/limits.js';
 
@@ -190,7 +190,10 @@ function decodeScan(frame, header, ecs, dcTables, acTables, restartInterval) {
     const id = header[1 + i * 2], tables = header[2 + i * 2];
     const c = frame.components.find((x) => x.id === id);
     if (!c) throw new PixmixError('JPEG scan references an unknown component', 'BAD_JPEG');
-    comps.push({ c, dc: dcTables[tables >> 4], ac: acTables[tables & 15], pred: 0 });
+    // Like libjpeg, an undefined table 0 or 1 is the Annex K one (Motion-JPEG has no DHT).
+    const dc = dcTables[tables >> 4] ?? standardTable(0, tables >> 4);
+    const ac = acTables[tables & 15] ?? standardTable(1, tables & 15);
+    comps.push({ c, dc, ac, pred: 0 });
   }
   const o = 1 + ns * 2;
   const ss = header[o], se = header[o + 1], ah = header[o + 2] >> 4, al = header[o + 2] & 15;

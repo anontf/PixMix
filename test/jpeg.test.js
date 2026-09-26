@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import sharp from 'sharp';
 import { encode, decode, rekey, inspect, convert, WrongKeyError } from '../src/index.js';
-import { readSegments, M } from '../src/formats/jpeg/markers.js';
+import { readSegments, writeSegments, M } from '../src/formats/jpeg/markers.js';
 import { decodeFrame } from '../src/formats/jpeg/decode.js';
 import { assembleJpeg } from '../src/formats/jpeg/encode.js';
 import { encodePixels } from '../src/formats/jpeg/fdct.js';
@@ -219,4 +219,23 @@ test('progressive JPEGs stay progressive through scramble and restore; option ov
   // Pixel sources can be written progressive too.
   const png = convert(new Uint8Array(await fromRaw(40, 30).png().toBuffer()), { format: 'jpeg', progressive: true }).bytes;
   assert.equal(inspect(png).progressive, true);
+});
+
+test('stray bytes before a marker and Motion-JPEG frames without DHT decode like libjpeg', async () => {
+  // Coded with the Annex K tables, so it still decodes once its DHT is removed.
+  const src = new Uint8Array(await fromRaw(56, 40).jpeg({ quality: 85, optimiseCoding: false }).toBuffer());
+  const { segments } = readSegments(src);
+  const at = 2 + 4 + segments[0].data.length; // after APP0
+  const stray = new Uint8Array(Buffer.concat([src.subarray(0, at), Buffer.from([0, 0, 0x12, 0xff, 0]), src.subarray(at)]));
+  assert.equal(readSegments(stray).damaged, true);
+  assert.equal(readSegments(src).damaged, false);
+  const noDht = writeSegments(segments.filter((s) => s.marker !== M.DHT));
+  for (const [name, bytes] of [['stray bytes', stray], ['no DHT', noDht]]) {
+    const ref = await sharp(bytes, { failOn: 'none' }).raw().toBuffer();
+    const scrambled = encode(bytes, { key: 'k' });
+    assert.ok(readSegments(scrambled).segments.some((s) => s.marker === M.DHT), `${name}: tables written`);
+    const restored = decode(scrambled, { key: 'k' });
+    assert.ok(sameCoefs(restored, src), `${name}: coefficients`);
+    assert.ok(ref.equals(await pixels(restored)), `${name}: libjpeg pixels`);
+  }
 });

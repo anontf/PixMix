@@ -38,7 +38,7 @@ test('bad option values are BAD_OPTION errors, before any work', async () => {
     { level: 10 }, { level: -1 }, { level: '5' }, { level: 1.5 }, { effort: 0 }, { effort: 10 }, { effort: 3.5 }, { effort: 'x' },
     { block: 1 }, { block: 4097 }, { block: '16' }, { mode: 'tiles' }, { transforms: 'no' }, { progressive: 1 },
     { keepThumbnails: 'yes' }, { decoders: {} }, { decoders: [{}] }, { salt: new Uint8Array(256) }, { salt: 'abc' },
-    { key: '' }, { key: 5 }, { key: 'a\ud800b' },
+    { key: '' }, { key: 5 }, { key: 'a\ud800b' }, { onConvert: 'log' },
   ]) {
     rejects(() => encode(src, { key: 'k', ...opts }));
     await rejectsAsync(() => encodeAsync(src, { key: 'k', ...opts }));

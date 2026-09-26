@@ -53,6 +53,9 @@ export function checkOptions(opts) {
   boolean(opts, 'transforms');
   boolean(opts, 'progressive', 'auto');
   boolean(opts, 'keepThumbnails');
+  for (const name of ['onConvert', 'onMetadata']) {
+    if (opts[name] !== undefined && typeof opts[name] !== 'function') throw bad(`${name} must be a function`);
+  }
   const { salt, decoders } = opts;
   if (salt !== undefined && !(salt instanceof Uint8Array && salt.length <= MAX_SALT)) {
     throw bad(`salt must be a Uint8Array of at most ${MAX_SALT} bytes`);

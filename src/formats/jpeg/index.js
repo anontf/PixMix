@@ -12,13 +12,18 @@
 // progressive, and restoring writes progressive again (exactly: the original could not hold
 // AC data in padding blocks either).
 //
+// The same goes for frames whose MCU has more than 10 blocks (e.g. every component sampled
+// 2x2): they can only be coded one scan per component, and such scans never hold padding
+// blocks either. With partial edge MCUs there is nowhere to put the content scrambling
+// moves into the padding, so those files are refused (UNSUPPORTED).
+//
 // Watermarks (see watermark/embed.js) travel in more APP15 segments: "pixmix-wm\0" names the
 // watermark for the restored image, "pixmix-ws\0" (split over as many segments as it needs)
 // holds the coefficients under a watermark drawn on the scrambled image.
 
 import { readSegments, writeSegments, isJpeg, isSof, isApp, startsWith, M } from './markers.js';
 import { decodeFrame } from './decode.js';
-import { assembleJpeg } from './encode.js';
+import { assembleJpeg, interleavable } from './encode.js';
 import { applyMcuLayout, transformCount } from './transform.js';
 import { computeGridLayout } from '../../core/layout.js';
 import {
@@ -109,6 +114,12 @@ function concat(...parts) {
  * watermark, the frame painted and its covered coefficients stashed.
  */
 function finishScramble(segments, frame, params, check, { key, watermark, visibleWatermark, progressive }) {
+  if (!interleavable(frame) && hasPadding(frame)) {
+    throw new PixmixError(
+      'JPEG with more than 10 blocks per MCU and partial edge MCUs cannot be scrambled losslessly (its scans cannot hold the padding blocks scrambling fills)',
+      'UNSUPPORTED',
+    );
+  }
   let stash = null;
   if (visibleWatermark) {
     stash = stashJpeg(frame, segments, visibleWatermark, jpegOrientation(segments), key, params.salt);

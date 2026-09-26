@@ -265,3 +265,40 @@ test('an overflowed DC predictor is written as wrapped differences libjpeg reads
     assert.ok(ref.equals(await pixels(restored)));
   }
 });
+
+/** A 4:4:4 frame relabelled with every component sampled 2x2 (12 blocks per MCU). */
+function sampled2x2(w, h) {
+  const { frame, dqt } = encodePixels({ width: w, height: h, data: gradient(w, h) }, { subsampling: '4:4:4' });
+  const mcusX = Math.ceil(w / 16), mcusY = Math.ceil(h / 16);
+  const sof = frame.sof.slice();
+  for (let i = 0; i < 3; i++) sof[7 + i * 3] = 0x22;
+  const components = frame.components.map((c) => {
+    const blocksW = mcusX * 2, blocksH = mcusY * 2;
+    const coefs = new Int16Array(blocksW * blocksH * 64);
+    for (let by = 0; by < c.realH; by++) coefs.set(c.coefs.subarray(by * c.blocksW * 64, (by * c.blocksW + c.realW) * 64), by * blocksW * 64);
+    return { ...c, h: 2, v: 2, blocksW, blocksH, coefs };
+  });
+  return { dqt, frame: { ...frame, sof, hmax: 2, vmax: 2, mcusX, mcusY, components } };
+}
+
+test('more than 10 blocks per MCU: one scan per component, which libjpeg reads', async () => {
+  const { frame, dqt } = sampled2x2(64, 48);
+  for (const progressive of [false, true]) {
+    const src = assembleJpeg([dqt], frame, { progressive });
+    assert.equal(readSegments(src).segments.filter((s) => s.marker === M.SOS).length, progressive ? 3 + 4 : 3);
+    const ref = await pixels(src);
+    for (const opts of [{}, { progressive: !progressive }]) {
+      const scrambled = encode(src, { key: 'k', ...opts });
+      assert.ok(!ref.equals(await pixels(scrambled)), 'libjpeg reads the scrambled file');
+      const restored = decode(scrambled, { key: 'k' });
+      assert.ok(sameCoefs(restored, src));
+      assert.ok(ref.equals(await pixels(restored)));
+      assert.ok(ref.equals(await pixels(decode(rekey(scrambled, { from: 'k', to: 'j' }), { key: 'j' }))));
+    }
+  }
+  // With partial edge MCUs such scans cannot hold what scrambling moves into the padding.
+  const odd = sampled2x2(40, 24);
+  const src = assembleJpeg([odd.dqt], odd.frame);
+  await pixels(src);
+  assert.throws(() => encode(src, { key: 'k' }), (err) => err.code === 'UNSUPPORTED');
+});

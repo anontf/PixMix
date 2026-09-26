@@ -296,7 +296,7 @@ for (const { name: engine, skip } of await engines()) describe(engine, { skip },
     const plain = convert(F.jpeg, { format: 'jpeg' }).bytes;
     assert.ok(sameCoefs((await unscrambleJxlDetailed(new Uint8Array(out.jxl), { key: 'k' })).jpeg.toJpeg(), plain), 'Node restores what the browser wrote');
     assert.ok(sameCoefs(await reconstructJpeg(new Uint8Array(out.restored)), plain), 'the browser restored it to a JPEG XL of the original JPEG');
-    assert.deepEqual([out.anim.animated, out.anim.mode], [true, 'pixel']);
+    assert.deepEqual([out.anim.animated, out.anim.mode], [true, 'block']);
     assert.deepEqual([out.deep, out.deepExact], [16, true]);
     assert.deepEqual(errors, []);
     await p.close();

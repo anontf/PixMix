@@ -301,6 +301,7 @@ function describe(report) {
     bits.push(`kept: ${report.transferred.length ? report.transferred.join(', ') : 'no metadata'}`);
   }
   if (report.dropped.length) bits.push(`<span class="bad">dropped: ${esc(report.dropped.join(', '))}</span>`);
+  if (report.notes?.length) bits.push(`<span class="bad">note: ${esc(report.notes.join('; '))}</span>`);
   return bits.length ? `<br>${bits.join(' · ')}` : '';
 }
 

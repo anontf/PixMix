@@ -232,3 +232,13 @@ test('sharp plugin: AVIF uses sharp-provided metadata', async () => {
   assert.equal(p.width, W);
   assert.equal(p.height, H);
 });
+
+test('lossless output of a lossy source carries a size note; JPEG output does not', () => {
+  const src = jpegWithMetadata();
+  let report;
+  encode(src, { key: 'k', format: 'png', onConvert: (r) => { report = r; } });
+  assert.equal(report.notes.length, 1);
+  assert.match(report.notes[0], /jpeg is lossy/);
+  encode(src, { key: 'k', onConvert: (r) => { report = r; } });
+  assert.deepEqual(report.notes ?? [], []);
+});

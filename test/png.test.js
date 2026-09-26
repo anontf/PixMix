@@ -96,3 +96,18 @@ test('EXIF thumbnails are removed by default (they would show the unscrambled im
   assert.ok(Buffer.from(after.subarray(0, end)).equals(Buffer.from(before.subarray(0, end))));
   assert.equal(Buffer.from(after).readUInt32BE(end), 0, 'IFD1 unlinked');
 });
+
+test('default is block mode with transformed tiles, and it stays compact', () => {
+  const orig = readFileSync(new URL('basn2c08.png', DIR));
+  const s = encode(orig, { key: 'k' });
+  const info = inspect(s);
+  assert.deepEqual([info.mode, info.block, info.transforms], ['block', 16, true]);
+  const plain = encode(orig, { key: 'k', transforms: false, mode: 'block', block: 16 });
+  assert.equal(inspect(plain).transforms, false);
+  assert.ok(!pixels(s).equals(pixels(plain)), 'transforms change the tiles');
+  assert.ok(pixels(decode(s, { key: 'k' })).equals(pixels(orig)));
+  const px = encode(orig, { key: 'k', mode: 'pixel' });
+  assert.ok(s.length < px.length, `block ${s.length} B vs pixel ${px.length} B`);
+  // Rekey keeps the tile settings unless told otherwise.
+  assert.equal(inspect(rekey(s, { from: 'k', to: 'j' })).transforms, true);
+});

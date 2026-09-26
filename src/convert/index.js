@@ -10,7 +10,7 @@ import { withLimits, checkPixels, checkFrames } from '../core/limits.js';
 import { readJpegMetadata } from '../meta/jpeg.js';
 import { readWebpMetadata } from '../meta/webp.js';
 import { readJxlMetadata } from '../meta/jxl.js';
-import { readJxl, writeJxl, wrapCodestream } from '../formats/jxl/container.js';
+import { readJxl, writeJxl, wrapCodestream, readJxlHeader } from '../formats/jxl/container.js';
 import { sanitizeBoxes } from '../formats/jxl/index.js';
 import { iccSpace, iccFits } from '../formats/jxl/icc.js';
 import { loadJxlCodec } from '../formats/jxl/load.js';
@@ -139,7 +139,34 @@ async function decodeJob(bytes, job, { keepThumbnails = false, limits }) {
   const decoded = normalise(await decodeAsync(job, bytes, limits));
   const meta = mergedMeta(bytes, job.from, decoded, keepThumbnails, limits);
   const { image, boxes, transferred, dropped } = jxlImage(decoded, meta);
-  return { image, boxes, report: { format: 'jxl', from: job.from, decoder: job.decoder.name, transferred, dropped } };
+  return { image, boxes, report: { format: 'jxl', from: job.from, decoder: job.decoder.name, transferred, dropped, notes: sizeNotes(bytes, job.from, 'jxl') } };
+}
+
+/**
+ * Lossless output (PNG, or JPEG XL on the pixel route) of a lossy source is several times
+ * larger than the source even before scrambling; say so, and what stays small.
+ */
+function sizeNotes(bytes, from, target) {
+  const lossy = from === 'jpeg' || from === 'avif' || from === 'heic'
+    || (from === 'webp' && hasChunk(bytes, 'VP8 '))
+    || (from === 'jxl' && isLossyJxl(bytes));
+  if (!lossy || target === 'jpeg') return [];
+  const smaller = from === 'jpeg' ? 'format "jpeg" (or "jxl" without a pixel/block mode, the JPEG route)' : 'format "jpeg" with a quality setting';
+  return [`${from} is lossy: lossless ${target} output is typically 3-8 times its size even unscrambled; ${smaller} stays small`];
+}
+
+function hasChunk(bytes, fourcc) {
+  const tag = [...fourcc].map((c) => c.charCodeAt(0));
+  for (let i = 12; i + 4 <= Math.min(bytes.length, 64); i++) if (tag.every((c, k) => bytes[i + k] === c)) return true;
+  return false;
+}
+
+function isLossyJxl(bytes) {
+  try {
+    return !!readJxlHeader(readJxl(bytes).codestream).lossy;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -233,7 +260,7 @@ function finish(bytes, { from, target, decoder }, decoded, { keepThumbnails = fa
   const built = target === 'jpeg'
     ? (({ jpeg, ...r }) => ({ bytes: jpeg, ...r }))(buildJpeg(decoded, meta, { quality, subsampling, background, progressive }))
     : (({ png, ...r }) => ({ bytes: png, ...r }))(buildPng(decoded, meta));
-  return { bytes: built.bytes, format: target, from, decoder: decoder.name, transferred: built.transferred, dropped: [...new Set(built.dropped)] };
+  return { bytes: built.bytes, format: target, from, decoder: decoder.name, transferred: built.transferred, dropped: [...new Set(built.dropped)], notes: sizeNotes(bytes, from, target) };
 }
 
 function sanitize(format, bytes, limits) {

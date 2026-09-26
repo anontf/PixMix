@@ -367,17 +367,22 @@ function animate(canvas, d, scrambledRGBA, { effect, duration, onProgress, prese
 
 function animateBlocks(ctx, layout, scrambledRGBA, duration, onProgress, present) {
   const { width, height, map, tiles } = layout;
-  const { size, cols, rows, perm } = tiles;
+  const { size, cols, rows, perm, transforms } = tiles;
   const count = perm.length;
 
+  // Tiles are drawn from the restored image, each starting at its scrambled slot in its
+  // scrambled orientation and turning back as it flies home (like JPEG MCUs).
+  const src32 = new Uint32Array(scrambledRGBA.buffer);
+  const restored = new Uint8ClampedArray(scrambledRGBA.length);
+  const restored32 = new Uint32Array(restored.buffer);
+  for (let i = 0; i < src32.length; i++) restored32[map[i]] = src32[i];
   const sheet = document.createElement('canvas');
   sheet.width = width;
   sheet.height = height;
-  sheet.getContext('2d').putImageData(new ImageData(scrambledRGBA, width, height), 0, 0);
+  sheet.getContext('2d').putImageData(new ImageData(restored, width, height), 0, 0);
 
   // Leftover strips (not covered by whole tiles) dissolve underneath the moving tiles.
   const tiledW = cols * size, tiledH = rows * size;
-  const src32 = new Uint32Array(scrambledRGBA.buffer);
   const back = new ImageData(width, height);
   const back32 = new Uint32Array(back.data.buffer);
   const rest = [];
@@ -391,37 +396,47 @@ function animateBlocks(ctx, layout, scrambledRGBA, duration, onProgress, present
 
   // Tiles arrive in reading order of their destination, overlapping heavily.
   const travel = 0.45;
-  const moves = new Float32Array(count * 5);
-  for (let slot = 0; slot < count; slot++) {
+  const half = size / 2;
+  const moves = Array.from({ length: count }, (_, slot) => {
     const t = perm[slot];
-    const o = slot * 5;
-    moves[o] = (slot % cols) * size;
-    moves[o + 1] = Math.floor(slot / cols) * size;
-    moves[o + 2] = (t % cols) * size;
-    moves[o + 3] = Math.floor(t / cols) * size;
-    moves[o + 4] = (t / count) * (1 - travel);
-  }
+    return {
+      sx: (slot % cols) * size + half, sy: Math.floor(slot / cols) * size + half,
+      hx: (t % cols) * size, hy: Math.floor(t / cols) * size,
+      start: (t / count) * (1 - travel),
+      ...decompose(transforms ? transforms[slot] : 0),
+    };
+  });
 
   let restDone = 0;
   return frames(duration, (t) => {
     const target = t >= 1 ? rest.length : Math.floor(easeInOut(t) * rest.length);
     for (let k = restDone; k < target; k++) back32[map[rest[k]]] = src32[rest[k]];
     restDone = target;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.putImageData(back, 0, 0);
 
     // Layering: waiting tiles, then settled ones on top, then the ones in flight.
     for (let pass = 0; pass < 3; pass++) {
-      for (let slot = 0; slot < count; slot++) {
-        const o = slot * 5;
-        const local = t >= 1 ? 1 : Math.min(1, Math.max(0, (t - moves[o + 4]) / travel));
+      for (const k of moves) {
+        const local = t >= 1 ? 1 : Math.min(1, Math.max(0, (t - k.start) / travel));
         const layer = local <= 0 ? 0 : local >= 1 ? 1 : 2;
         if (layer !== pass) continue;
+        if (layer === 1) {
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          ctx.drawImage(sheet, k.hx, k.hy, size, size, k.hx, k.hy, size, size);
+          continue;
+        }
         const e = easeInOut(local);
-        const x = moves[o] + (moves[o + 2] - moves[o]) * e;
-        const y = moves[o + 1] + (moves[o + 3] - moves[o + 1]) * e;
-        ctx.drawImage(sheet, moves[o], moves[o + 1], size, size, x, y, size, size);
+        const cx = k.sx + (k.hx + half - k.sx) * e;
+        const cy = k.sy + (k.hy + half - k.sy) * e;
+        const angle = k.angle * (1 - e);
+        const flip = k.flip + (1 - k.flip) * e;
+        const cos = Math.cos(angle), sin = Math.sin(angle);
+        ctx.setTransform(cos * flip, sin * flip, -sin, cos, cx, cy);
+        ctx.drawImage(sheet, k.hx, k.hy, size, size, -half, -half, size, size);
       }
     }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
     present?.();
     onProgress?.(t);
   });

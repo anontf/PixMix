@@ -35,7 +35,7 @@ export function computeLayout(key, params, width, height, index = 0) {
   }
 
   // Pixel grids only know pixel and block mode: an mcu marker here (a JPEG's) is corrupt.
-  const size = params.block;
+  const size = params.block & 0x7fff;
   if (params.mode !== 'block' || !(size >= 2 && size <= 4096)) {
     throw new PixmixError(`Corrupt pixmix marker (mode ${params.mode}, block ${size}) for this image`);
   }
@@ -44,15 +44,34 @@ export function computeLayout(key, params, width, height, index = 0) {
   const perm = new Uint32Array(cols * rows);
   for (let i = 0; i < perm.length; i++) perm[i] = i;
   shuffle(perm, rng);
+  // With the transform flag, each slot also gets one of the 8 flips/rotations (same codes as
+  // JPEG MCUs), drawn right after the permutation.
+  let transforms = null;
+  if (params.block & 0x8000) {
+    transforms = new Uint8Array(perm.length);
+    for (let i = 0; i < perm.length; i++) transforms[i] = rng.below(8);
+  }
 
   for (let slot = 0; slot < perm.length; slot++) {
     const src = perm[slot];
     const sx = (slot % cols) * size, sy = Math.floor(slot / cols) * size;
     const ox = (src % cols) * size, oy = Math.floor(src / cols) * size;
+    const t = transforms ? invertTransform(transforms[slot]) : 0;
     for (let dy = 0; dy < size; dy++) {
       const s = (sy + dy) * width + sx;
-      const o = (oy + dy) * width + ox;
-      for (let dx = 0; dx < size; dx++) map[s + dx] = o + dx;
+      if (!t) {
+        const o = (oy + dy) * width + ox;
+        for (let dx = 0; dx < size; dx++) map[s + dx] = o + dx;
+        continue;
+      }
+      // The slot shows T(original tile): pixel p of the slot comes from T^-1(p) of the tile.
+      for (let dx = 0; dx < size; dx++) {
+        let x = dx, y = dy;
+        if (t & 4) { x = dy; y = dx; }
+        if (t & 1) x = size - 1 - x;
+        if (t & 2) y = size - 1 - y;
+        map[s + dx] = (oy + y) * width + ox + x;
+      }
     }
   }
 
@@ -68,7 +87,7 @@ export function computeLayout(key, params, width, height, index = 0) {
   shuffle(shuffled, rng);
   for (let i = 0; i < n; i++) map[rest[i]] = shuffled[i];
 
-  return { width, height, map, tiles: { size, cols, rows, perm }, check };
+  return { width, height, map, tiles: { size, cols, rows, perm, transforms }, check };
 }
 
 function shuffle(arr, rng) {

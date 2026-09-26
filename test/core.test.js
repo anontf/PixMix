@@ -45,7 +45,7 @@ test('layouts are permutations and reversible', () => {
 });
 
 test('layout is deterministic and key-dependent', () => {
-  const params = makeParams({ salt: new Uint8Array(16) });
+  const params = makeParams({ mode: 'pixel', salt: new Uint8Array(16) });
   const a = computeLayout('alpha', params, 32, 32).map;
   assert.deepEqual(computeLayout('alpha', params, 32, 32).map, a);
   assert.notDeepEqual(computeLayout('beta', params, 32, 32).map, a);

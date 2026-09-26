@@ -110,7 +110,7 @@ JPEG XL support is optional:
 ```js
 import { encode, rekey, inspect } from './dist/pixmix-encoder.mjs';
 
-const scrambled = encode(pngBytes, { key: 'site-key' });                      // PNG, pixel mode
+const scrambled = encode(pngBytes, { key: 'site-key' });                      // PNG, 16 px tiles, flipped
 const tiles     = encode(pngBytes, { key: 'site-key', mode: 'block', block: 16 });
 const photo     = encode(jpegBytes, { key: 'site-key' });                      // JPEG, lossless
 const asJpeg    = encode(gifBytes, { key: 'site-key', format: 'jpeg', quality: 85 });
@@ -577,6 +577,9 @@ In Node, `pixmix/watermarks` exports `compileWatermark`, `normalizeDefinition`,
 2. **Permutation.** A Fisher–Yates shuffle driven by ChaCha20 with unbiased
    rejection sampling, integer-only so every engine agrees.
    - `pixel` mode shuffles all pixels.
+   - `block` mode (the default for PNG and JPEG XL, 16 px) shuffles tiles, and with
+     `transforms` (on by default) also gives each tile one of the 8 flips/rotations. The
+     transform flag is the top bit of the marker's tile-size field.
    - `block` mode shuffles whole B×B tiles. The right/bottom leftover strips are shuffled
      pixel by pixel among themselves.
    - `mcu` mode (JPEG) shuffles the grid of MCUs, then draws a transform per slot.
@@ -619,9 +622,28 @@ The permutation stream is pinned by a test. Any change to it must bump the versi
 
 ### Size and speed
 
-- Pixel mode turns the image into noise that deflate can't compress, so expect roughly the
-  raw pixel size (a 12 MP RGB photo comes out at about 35 MB).
-- Block mode (8–32 px) stays close to the original size.
+Measured on 768×512 photos (Kodak test images):
+
+| | kodim23 | kodim05 |
+| --- | --- | --- |
+| Original PNG / JPEG q85 | 545 / 56 KB | 767 / 128 KB |
+| Unscrambled lossless PNG / JPEG XL | 545 / 366 KB | 767 / 481 KB |
+| PNG, default (block 16 + flips) | 584 KB | 800 KB |
+| PNG, pixel mode | 1094 KB | 1075 KB |
+| JPEG XL, default / pixel mode | 399 / 1151 KB | 524 / 1047 KB |
+| From the JPEG: JPEG / JXL JPEG route | 58 / 53 KB | 129 / 113 KB |
+| From the JPEG: PNG (lossless) | 418 KB | 724 KB |
+
+- **Block mode** (the default) keeps output within about 5–10% of an unscrambled lossless
+  file. Tile flips cost nothing measurable.
+- **Pixel mode** turns the image into noise that no lossless format can compress: about
+  twice a lossless original, or roughly the raw pixel size (a 12 MP photo is about 35 MB).
+  Use it only when tiles give away too much.
+- **Lossy sources:** a JPEG (or lossy WebP/AVIF/JPEG XL) saved as PNG or pixel-route JPEG XL
+  is 3–8× bigger even unscrambled, because lossless can't reuse the lossy compression.
+  - Keep JPEGs as JPEG, or use JPEG XL's JPEG route, which is even smaller.
+  - The conversion report adds a `notes` entry saying so.
+  - Converting other lossy formats to `format: 'jpeg'` keeps them small too.
 - In Node, 12 MP takes about 3 s per encode or decode. Native zlib is used when available;
   browsers use `CompressionStream`/`DecompressionStream`.
 - Converting a 12 MP JPEG to PNG takes about 2.4 s with the built-in decoder and 1.2 s with

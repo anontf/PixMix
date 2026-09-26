@@ -37,7 +37,7 @@ const needsAsync = (what) => new PixmixError(`JPEG XL ${what} is async; use ${wh
  * @property {string|Uint8Array} key
  * @property {'png'|'jpeg'|'jxl'} [format]  output format; default: the input's own format
  *           when pixmix can write it (PNG, JPEG, JPEG XL), otherwise PNG
- * @property {'pixel'|'block'|'mcu'} [mode]  PNG: pixel (default) or block. JPEG: always mcu.
+ * @property {'pixel'|'block'|'mcu'} [mode]  PNG: block (default: 16 px tiles, flipped/rotated) or pixel. JPEG: always mcu.
  *           JPEG XL: pixel/block (lossless pixels), or mcu, the JPEG route, which is the
  *           default when the source is a JPEG (or a JPEG XL holding one)
  * @property {number} [block=8]        block mode tile size
@@ -116,7 +116,7 @@ export async function encodeAsync(input, opts) {
     // Decode once, scramble the pixels, encode once (no intermediate unscrambled JXL).
     const { image, boxes, report } = await decodeForJxl(bytes, withFormat);
     opts.onConvert?.(report);
-    return scrambleJxlPixels(image, boxes, { ...opts, mode: opts.mode ?? 'pixel' });
+    return scrambleJxlPixels(image, boxes, opts);
   }
   const converted = await convertAsync(bytes, withFormat);
   if (converted.format === 'jxl') {
@@ -124,7 +124,7 @@ export async function encodeAsync(input, opts) {
   }
   opts.onConvert?.(converted);
   const s = SCRAMBLERS[converted.format];
-  return s.scramble ? s.scramble(converted.bytes, opts) : s.scrambleAsync(converted.bytes, { ...opts, mode: opts.mode ?? 'pixel' });
+  return s.scramble ? s.scramble(converted.bytes, opts) : s.scrambleAsync(converted.bytes, opts);
 }
 
 /**

@@ -23,12 +23,12 @@ Keys (prefer the file or environment forms; -k ends up in shell history):
 Options:
   -o, --out <path>         output file, directory, or "-" for stdout (single input)
   --format <png|jpeg|jxl>  output format (default: same as the input when possible, else png)
-  --mode <pixel|block|mcu> PNG: pixel (default) or block. JPEG: always mcu. JPEG XL: pixel/block
+  --mode <pixel|block|mcu> PNG: block (default; small files) or pixel (~2x larger). JPEG: always mcu. JPEG XL: pixel/block
                            (lossless pixels) or mcu (JPEG route: a DCT-scrambled JPEG inside
                            the JXL; the default for JPEG sources)
-  --block <n>              tile size in block mode (default 8)
+  --block <n>              tile size in block mode (default 16)
   --effort <1-9>           JPEG XL encoder effort (default 2 in pixel mode, 7 in block mode)
-  --no-transforms          JPEG: shuffle MCUs only, without flipping/rotating them
+  --no-transforms          shuffle tiles/MCUs only, without flipping/rotating them
   --progressive | --baseline  JPEG scan structure (default: same as a JPEG source, else baseline)
   --quality <1-100>        JPEG quality when converting to JPEG (default 90)
   --subsampling <s>        JPEG chroma subsampling when converting: 4:2:0 (default), 4:2:2, 4:4:4
@@ -206,6 +206,7 @@ async function run(command, input, opts) {
     if (report.transferred.length) bits.push(`kept ${report.transferred.join(', ')}`);
   }
   if (report.dropped.length) bits.push(`dropped ${report.dropped.join(', ')}`);
+  if (report.notes?.length) bits.push(`note: ${report.notes.join('; ')}`);
   return { bytes, note: bits.join('; ') };
 }
 

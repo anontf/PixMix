@@ -19,7 +19,7 @@ import {
 } from './raster.js';
 import { computeLayout, applyMap } from '../../core/layout.js';
 import {
-  makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError, FLAG_STASH,
+  makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError, FLAG_STASH, tileSize, tileTransforms,
 } from '../../core/params.js';
 import { readOrientation } from '../../meta/exif.js';
 import { WATERMARK_TAG, STASH_TAG, encodeWatermark, decodeWatermark, restorePixelStash } from '../../watermark/embed.js';
@@ -195,15 +195,16 @@ const mapFrames = (img, layouts, direction) => img.frames.map((px, i) => applyMa
 
 /**
  * @param {Uint8Array} bytes PNG or APNG
- * @param {{key: string|Uint8Array, mode?: 'pixel'|'block', block?: number, level?: number, salt?: Uint8Array}} opts
+ * @param {{key: string|Uint8Array, mode?: 'pixel'|'block', block?: number, transforms?: boolean, level?: number, salt?: Uint8Array}} opts
+ *   default: block mode, 16 px tiles, flipped/rotated (transforms)
  */
-export function scramblePng(bytes, { key, mode, block, level, salt, limits, watermark, visibleWatermark } = {}) {
+export function scramblePng(bytes, { key, mode, block, transforms, level, salt, limits, watermark, visibleWatermark } = {}) {
   const img = readPng(bytes, limits);
   if (readPngMarker(img.chunks)) {
     throw new PixmixError('Image is already scrambled (decode it first, or use rekey)', 'ALREADY_SCRAMBLED');
   }
   if (mode === 'mcu') throw new PixmixError('Mode "mcu" only applies to JPEG and JPEG XL output', 'BAD_OPTION');
-  const params = makeParams({ mode, block, salt });
+  const params = makeParams({ mode, block, transforms, salt });
   const layouts = layoutsFor(key, params, img);
   return finishScramble(img, mapFrames(img, layouts, 'scramble'), params, layouts[0].check, { key, level, watermark, visibleWatermark });
 }
@@ -311,12 +312,13 @@ export function unscramblePng(bytes, opts) {
  * Re-scrambles with a new key (and optionally new mode/block) in one pass. Watermarks stay
  * as they are unless `watermark` / `visibleWatermark` are given (null removes them).
  */
-export function rekeyPng(bytes, { from, to, mode, block, level, salt, limits, watermark, visibleWatermark } = {}) {
+export function rekeyPng(bytes, { from, to, mode, block, transforms, level, salt, limits, watermark, visibleWatermark } = {}) {
   const img = readPng(bytes, limits);
   const { marker, frames, visible } = unscrambled(img, from, limits);
   const params = makeParams({
     mode: mode ?? marker.params.mode,
-    block: block ?? (marker.params.block || undefined),
+    block: block ?? (marker.params.mode === 'block' ? tileSize(marker.params) : undefined),
+    transforms: transforms ?? (marker.params.mode === 'block' ? tileTransforms(marker.params) : undefined),
     salt,
   });
   const layouts = layoutsFor(to, params, img);
@@ -352,7 +354,8 @@ export function inspectPng(bytes, limits) {
     ...(dv ? { frames: dv.getUint32(0), plays: dv.getUint32(4) } : {}),
     scrambled: !!marker,
     mode: marker?.params.mode ?? null,
-    block: marker?.params.block || null,
+    block: marker?.params.mode === 'block' ? tileSize(marker.params) : null,
+    transforms: marker?.params.mode === 'block' ? tileTransforms(marker.params) : null,
     ...watermarkInfo(pngWatermark(chunks, limits), marker),
     chunks: chunks.map((c) => ({ type: c.type, length: c.data.length })),
   };

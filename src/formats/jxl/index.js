@@ -20,7 +20,9 @@
 import { readJxl, writeJxl, wrapCodestream, readJxlHeader, isJxl } from './container.js';
 import { loadJxlCodec } from './load.js';
 import { computeLayout, applyMap } from '../../core/layout.js';
-import { makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError, FLAG_STASH } from '../../core/params.js';
+import {
+  makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError, FLAG_STASH, tileSize, tileTransforms,
+} from '../../core/params.js';
 import { stripExifThumbnail } from '../../meta/thumbnails.js';
 import { exifTiff, unwrapBrob } from '../../meta/jxl.js';
 import { scrambleJpeg, unscrambleJpegDetailed, rekeyJpeg, jpegMarkerBytes, jpegWatermark } from '../jpeg/index.js';
@@ -176,9 +178,9 @@ const effortFor = (params, effort) => effort ?? (params.mode === 'pixel' ? 2 : 7
  * @param {JxlImage} image
  * @param {import('./container.js').Box[]} boxes metadata boxes to include
  */
-export async function scrambleJxlPixels(image, boxes, { key, mode, block, salt, effort, watermark, visibleWatermark } = {}) {
+export async function scrambleJxlPixels(image, boxes, { key, mode, block, transforms, salt, effort, watermark, visibleWatermark } = {}) {
   if (mode === 'mcu') throw new PixmixError('Mode "mcu" needs a JPEG source', 'BAD_OPTION');
-  let params = makeParams({ mode, block, salt });
+  let params = makeParams({ mode, block, transforms, salt });
   const scrambled = mapFrames(key, params, image, 'scramble');
   const extra = [];
   if (watermark) extra.push({ type: WATERMARK_TAG, data: encodeWatermark(watermark) });
@@ -324,7 +326,8 @@ export async function rekeyJxl(bytes, { from, to, mode, block, salt, effort, tra
   return scrambleJxlPixels(image, kept, {
     key: to, salt, effort,
     mode: mode ?? marker.params.mode,
-    block: block ?? (marker.params.block || undefined),
+    block: block ?? (marker.params.mode === 'block' ? tileSize(marker.params) : undefined),
+    transforms: transforms ?? (marker.params.mode === 'block' ? tileTransforms(marker.params) : undefined),
     watermark: watermark === undefined ? carried(jxlWatermark(boxes, limits)) : watermark,
     visibleWatermark: visibleWatermark === undefined ? visible : visibleWatermark,
   });
@@ -349,8 +352,8 @@ export function inspectJxl(bytes, limits) {
     srgb: header.srgb,
     scrambled: !!marker,
     mode: marker?.params.mode ?? null,
-    block: marker?.params.mode === 'block' ? marker.params.block : null,
-    transforms: marker?.params.mode === 'mcu' ? !!(marker.params.block & 1) : null,
+    block: marker?.params.mode === 'block' ? tileSize(marker.params) : null,
+    transforms: marker?.params.mode === 'mcu' ? !!(marker.params.block & 1) : marker?.params.mode === 'block' ? tileTransforms(marker.params) : null,
     ...watermarkInfo(jxlWatermark(boxes, limits), marker),
     boxes: boxes.map((b) => ({ type: b.type.trim(), length: b.data.length })),
     metadata: ['Exif', 'xml ', 'jumb'].filter((t) => boxes.some((b) => b.type === t || (b.type === 'brob' && String.fromCharCode(...b.data.subarray(0, 4)) === t))).map((t) => ({ Exif: 'exif', 'xml ': 'xmp', jumb: 'jumbf' })[t]),

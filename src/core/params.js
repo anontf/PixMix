@@ -4,7 +4,8 @@
 // JPEG: APP15 segment "pixmix\0"):
 //   u8  version        (1)
 //   u8  mode           (0 = pixel, 1 = block, 2 = mcu)
-//   u16 block          (big-endian; block: tile size, pixel: 0, mcu: flags, bit 0 = transforms,
+//   u16 block          (big-endian; block: tile size in bits 0-14 and bit 15 = tile
+//                       transforms (flips/rotations); pixel: 0; mcu: flags, bit 0 = transforms,
 //                       bit 1 = restore as progressive JPEG)
 //   u8  salt length    (0..255)
 //   ..  salt
@@ -20,6 +21,12 @@ import { hkdf } from './sha256.js';
 export const VERSION = 1;
 export const MODES = /** @type {const} */ (['pixel', 'block', 'mcu']);
 export const MCU_TRANSFORMS = 1;
+/** Block mode: tiles are also flipped/rotated (a bit above any valid tile size). */
+export const BLOCK_TRANSFORMS = 0x8000;
+/** Tile edge of block-mode params. */
+export const tileSize = (params) => params.block & 0x7fff;
+/** Whether block-mode tiles are flipped/rotated too. */
+export const tileTransforms = (params) => params.mode === 'block' && !!(params.block & BLOCK_TRANSFORMS);
 export const MCU_PROGRESSIVE = 2;
 export const FLAG_STASH = 1;
 const SALT_BYTES = 16;
@@ -37,7 +44,10 @@ const utf8 = new TextEncoder();
  */
 
 /** @returns {ScrambleParams} */
-export function makeParams({ mode = 'pixel', block = 8, transforms = true, progressive = false, salt } = {}) {
+// Default: 16 px tiles, flipped/rotated. Tiles keep neighbouring pixels together, so lossless
+// output compresses almost like the unscrambled image; pixel mode turns it into incompressible
+// noise (about twice the size of a lossless original).
+export function makeParams({ mode = 'block', block = 16, transforms = true, progressive = false, salt } = {}) {
   if (!MODES.includes(mode)) throw new PixmixError(`Unknown mode "${mode}" (expected pixel, block or mcu)`);
   if (mode === 'block' && !(Number.isInteger(block) && block >= 2 && block <= 4096)) {
     throw new PixmixError('Block size must be an integer between 2 and 4096');
@@ -46,7 +56,8 @@ export function makeParams({ mode = 'pixel', block = 8, transforms = true, progr
     salt = new Uint8Array(SALT_BYTES);
     globalThis.crypto.getRandomValues(salt);
   }
-  const field = mode === 'block' ? block : mode === 'mcu' ? (transforms ? MCU_TRANSFORMS : 0) | (progressive ? MCU_PROGRESSIVE : 0) : 0;
+  const field = mode === 'block' ? block | (transforms ? BLOCK_TRANSFORMS : 0)
+    : mode === 'mcu' ? (transforms ? MCU_TRANSFORMS : 0) | (progressive ? MCU_PROGRESSIVE : 0) : 0;
   return { version: VERSION, mode, block: field, salt };
 }
 
@@ -109,8 +120,9 @@ export function readMarker(data) {
   const extra = version === 2 ? 1 : 0;
   if (data.length !== 5 + saltLen + CHECK_BYTES + extra) throw new PixmixError('Corrupt pixmix marker (length)');
   const block = dv.getUint16(2);
-  // The same range makeParams allows: a tile size of 0 made the tile grid infinite.
-  if (mode === 'block' && !(block >= 2 && block <= 4096)) throw new PixmixError('Corrupt pixmix marker (block size)');
+  // The same range makeParams allows: a tile size of 0 made the tile grid infinite. (Before
+  // tile transforms existed the flag bit made this check fail, so old readers refuse such files.)
+  if (mode === 'block' && !((block & 0x7fff) >= 2 && (block & 0x7fff) <= 4096)) throw new PixmixError('Corrupt pixmix marker (block size)');
   const flags = extra ? data[data.length - 1] : 0;
   if (flags & ~FLAG_STASH) throw new PixmixError(`Unsupported pixmix marker flags ${flags}`);
   return {

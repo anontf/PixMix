@@ -308,3 +308,28 @@ test('decoding through the worker gives the same result; errors keep their type'
     delete globalThis.Worker;
   }
 });
+
+test('a metadata policy shapes the file the <img> gets; its pixels stay exact', async () => {
+  const { readMetadata, convert, encodeAsync } = await import('../src/index.js');
+  const { restoreForDisplay, decodeAsync: browserDecodeAsync } = await import('../src/browser/index.js');
+  const tiff = new Uint8Array([0x49, 0x49, 0x2a, 0, 8, 0, 0, 0, 2, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0,
+    0x3b, 0x01, 2, 0, 5, 0, 0, 0, 38, 0, 0, 0, 0, 0, 0, 0, 0x4a, 0x61, 0x6e, 0x65, 0]); // Orientation 6, Artist "Jane"
+  const png = (await import('../src/convert/png-build.js')).buildPng({ width: 6, height: 4, data: new Uint8Array(96).map((_, i) => (i % 4 === 3 ? 255 : i * 9)) }, { exif: tiff }).png;
+  const scrambled = encode(png, { key: 'k' });
+  const policy = { preset: 'web', set: { artist: 'Vivi' } };
+  globalThis.fetch = async () => new Response(scrambled);
+  const img = new FakeImg();
+  await reveal(img, { key: 'k', duration: 10, worker: false, orientation: 'apply', metadata: policy });
+  const shown = new Uint8Array(await resolveObjectURL(img.src).arrayBuffer());
+  assert.deepEqual(readMetadata(shown).exif.tags.map((t) => [t.name, t.value]), [['Orientation', 6], ['Artist', 'Vivi']]);
+  assert.deepEqual(readPng(shown).pixels, readPng(png).pixels);
+  assert.deepEqual(await browserDecodeAsync(scrambled, { key: 'k', metadata: policy }), shown);
+  // JPEG, and a JPEG XL on the pixel route (shown as a PNG, which gets only what is set).
+  const jpegIn = convert(png, { format: 'jpeg' }).bytes;
+  const j = await restoreForDisplay(encode(jpegIn, { key: 'k' }), { key: 'k', worker: false, metadata: 'strip-all' });
+  assert.deepEqual(readMetadata(j.bytes).exif.tags.map((t) => t.name), ['Orientation']);
+  const x = await restoreForDisplay(await encodeAsync(png, { key: 'k', format: 'jxl', effort: 1 }), { key: 'k', worker: false, metadata: policy });
+  assert.equal(x.type, 'image/png');
+  assert.deepEqual(readMetadata(x.bytes).exif.tags.map((t) => [t.name, t.value]), [['Artist', 'Vivi']]);
+  await assert.rejects(restoreForDisplay(scrambled, { key: 'k', worker: false, metadata: 'nope' }), { code: 'BAD_METADATA' });
+});

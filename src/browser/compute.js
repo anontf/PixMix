@@ -10,6 +10,7 @@ import { writeChunks } from '../formats/png/chunks.js';
 import { encodeRasterAsync } from '../formats/png/raster.js';
 import { readOrientation } from '../meta/exif.js';
 import { loadPainter } from '../watermark/load.js';
+import { loadMetadataTools } from '../meta/load.js';
 import { checkInputSize } from '../core/limits.js';
 
 /**
@@ -31,14 +32,20 @@ import { checkInputSize } from '../core/limits.js';
  */
 
 /**
- * @param {{animated?: boolean, limits?: object, watermark?: object|'embedded'|null}} [opts]
+ * @param {{animated?: boolean, limits?: object, watermark?: object|'embedded'|null, metadata?: object|string}} [opts]
  *        watermark: a compiled watermark to draw on the restored image, or 'embedded' for the
- *        file's own
+ *        file's own. metadata: a policy for the restored file (the <img>'s); its tools are
+ *        fetched (dist/pixmix-metadata.mjs) only when one is given
  * @returns {Promise<PixelsResult|JpegResult>}
  */
-export async function compute(bytes, key, { animated = true, limits, watermark = null } = {}) {
+export async function compute(bytes, key, { animated = true, limits, watermark = null, metadata } = {}) {
   checkInputSize(bytes, limits);
   const format = detectFormat(bytes);
+  if (metadata && (format === 'png' || format === 'jpeg')) {
+    // Applied to the scrambled file, whose metadata the restored one copies: the orientation
+    // the animation and the watermark use is then the one the <img> ends up with.
+    bytes = (await loadMetadataTools()).applyMetadata(bytes, metadata, { limits }).bytes;
+  }
   if (format === 'png') {
     const d = await unscramblePngDetailedAsync(bytes, { key, limits });
     const exif = d.img.chunks.find((c) => c.type === 'eXIf')?.data.slice() ?? null;
@@ -68,13 +75,16 @@ export async function compute(bytes, key, { animated = true, limits, watermark =
   }
   if (format === 'jxl') {
     // JPEG route: rebuild the scrambled JPEG and reveal that; visitors get the JPEG.
-    if (inspect(bytes, { limits }).mode === 'mcu') return compute(await scrambledJpegOf(bytes, limits), key, { animated, limits, watermark });
+    if (inspect(bytes, { limits }).mode === 'mcu') return compute(await scrambledJpegOf(bytes, limits), key, { animated, limits, watermark, metadata });
     // Pixel route: the <img> gets a PNG (an APNG for an animation), since most browsers
     // cannot display JPEG XL. The reveal animates frame 0.
     const d = await unscrambleJxlDetailed(bytes, { key, display: true, limits });
-    const w = await painting(watermark, d.watermark, d.layout, null, (paint) => {
+    const tools = metadata ? await loadMetadataTools() : null;
+    const w = await painting(watermark, d.watermark, d.layout, null, async (paint) => {
       const image = d.paint(paint);
-      return rgbaPng(d.layout.width, d.layout.height, image.frames ?? [{ data: image.data }], image.plays);
+      const png = await rgbaPng(d.layout.width, d.layout.height, image.frames ?? [{ data: image.data }], image.plays);
+      // The PNG holds display pixels and nothing else: only what the policy sets applies.
+      return tools ? tools.applyMetadata(png, metadata, { limits }).bytes : png;
     }, limits);
     return {
       kind: 'pixels',

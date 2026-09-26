@@ -320,7 +320,10 @@ It needs only the JPEG XL decoder, not the encoder.
     as they go. It works with PNG block mode and all JPEGs up to 12,000 tiles; otherwise
     it falls back to `dissolve`.
   - `none`.
-  - `prefers-reduced-motion` forces `none`.
+  - `prefers-reduced-motion` forces `none`; an unknown effect plays `dissolve`, with a
+    warning.
+  - Big images (over 1 MP) animate at a reduced size, no finer than the screen shows them;
+    the `<img>` then gets the full image (and `final: 'canvas'` a full-size canvas).
 - Per-image overrides: `data-pixmix-key`, `data-pixmix-effect`, `data-pixmix-src` (fetch from
   here instead of `src`, e.g. to show a placeholder first), `data-pixmix-watermark`.
 - Watermarks (see below): `watermark` / `data-watermark` on the script tag.
@@ -328,15 +331,24 @@ It needs only the JPEG XL decoder, not the encoder.
   show the final `<img>`. Browsers differ on EXIF in PNGs, so this is detected once with a
   2×1 test image. Override it with `orientation: 'apply' | 'ignore'`.
 - `revealAll` is lazy by default: each image decodes when it scrolls into view.
+- A reveal of an image already in flight (or waiting to scroll into view for an earlier
+  `revealAll`) joins it; `reveal()` of an image that shows its restored file does nothing.
 - Decoding runs in a Web Worker by default: unscrambling, inflate/deflate, JPEG entropy
   coding and JPEG XL.
-  - The page only draws the animation.
+  - The page only draws the animation: the worker sends its first and last frames.
+  - `configureJxl`, `configureWatermarks` and `configureMetadata` apply to the worker too.
   - `worker: false` (or `data-worker="false"` on the script tag) keeps it on the main
     thread; a string gives the worker's URL.
   - All reveals share one worker.
-- The animation runs on a temporary canvas. Afterwards the `<img>` gets the exact restored
-  file as a `blob:` URL, so ICC/gamma handling, CSS, alt text and "save image" behave
-  normally.
+- The animation runs on a temporary canvas with the `<img>`'s classes, style and rendered
+  box. Afterwards the `<img>` gets the exact restored file as a `blob:` URL, so ICC/gamma
+  handling, CSS, alt text and "save image" behave normally.
+  - It keeps its size: a srcset density or width descriptor carries over to the blob.
+  - In a `<picture>`, the `<source>`s lose their `srcset` (kept in `data-pixmix-srcset`),
+    or they would pick the scrambled file again.
+  - The `blob:` URL is revoked once the `<img>` gets another `src` or is garbage-collected.
+- A watermark on an EXIF-rotated PNG is laid out for the image as the browser shows it
+  (WebKit ignores PNG orientation).
 - State goes in `data-pixmix-state`: `decoding` → `done` | `error`. On error the scrambled
   image stays and a warning is logged.
 - Cross-origin images need CORS, since the decoder `fetch`es the bytes.

@@ -27,8 +27,8 @@ export function browserHonoursPngOrientation() {
   honoured ??= new Promise((resolve) => {
     const img = new Image();
     const url = URL.createObjectURL(new Blob([probePng()], { type: 'image/png' }));
-    img.onload = () => { URL.revokeObjectURL(url); resolve(img.naturalWidth === 1); };
-    img.onerror = () => { URL.revokeObjectURL(url); resolve(false); };
+    img.addEventListener('load', () => { URL.revokeObjectURL(url); resolve(img.naturalWidth === 1); });
+    img.addEventListener('error', () => { URL.revokeObjectURL(url); resolve(false); });
     img.src = url;
   });
   return honoured;

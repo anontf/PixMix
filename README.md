@@ -234,15 +234,23 @@ the limits to every upload, with its 64 MiB body limit as `maxInputBytes`, and a
 
 Several places inside an image file can hold a small copy of the picture, and that copy
 would show the unscrambled image to anyone who looks:
-- EXIF IFD1 thumbnails (JPEG and PNG);
+- EXIF IFD1 thumbnails (JPEG or uncompressed strips), in JPEG, PNG and JPEG XL;
+- JPEG previews inside the EXIF MakerNote (Olympus, Pentax, older Nikon and others);
+- XMP thumbnails (`xmp:Thumbnails`) and Google's original and depth images (`GImage:Data`,
+  `GDepth:Data`), in the XMP packet or in JPEG extended XMP;
 - JFIF and JFXX thumbnails;
-- Photoshop thumbnail resources;
+- Photoshop thumbnail resources, also when the resources continue over several APP13
+  segments;
 - MPF secondary images, motion-photo video and anything else after the JPEG's end marker.
 
-The encoder removes all of these by default and lists them under `dropped`. EXIF
-thumbnails are zeroed in place so every other EXIF offset stays valid. Pass
-`keepThumbnails: true` to keep them (trailing data after the end marker can't be kept
-either way).
+The encoder removes all of these by default, on every route (same format, converted, JPEG
+XL boxes including Brotli-compressed ones), and lists them under `dropped`. EXIF
+thumbnails and MakerNote previews are zeroed in place so every other offset stays valid;
+only complete, well-formed JPEG streams inside a MakerNote are touched. XMP previews are
+removed from the packet and the rest is written back as it was; extended XMP holding one
+goes entirely. Pass `keepThumbnails: true` to keep them. Data after the end marker can't be
+kept either way, so it is still dropped (and reported), and so is the MPF index pointing
+to it.
 
 ### Input formats and metadata
 
@@ -272,8 +280,8 @@ Where each kind of metadata ends up:
 | EXIF | `eXIf` | APP1 `Exif` | `Exif` box |
 | ICC profile | `iCCP` | APP2 `ICC_PROFILE`, split across segments | in the codestream |
 | XMP | `iTXt XML:com.adobe.xmp` | APP1 XMP | `xml ` box |
-| Density | `pHYs` | JFIF APP0 | dropped (no field) |
-| Comments | `tEXt Comment` | COM | dropped (no field) |
+| Density | `pHYs` | JFIF APP0 (dots per inch when whole, else per cm) | dropped (no field) |
+| Comments | `tEXt Comment` (`iTXt` beyond Latin-1) | COM (UTF-8) | dropped (no field) |
 
 The pixels stay exactly as stored. They aren't rotated (the EXIF orientation travels with
 the EXIF) and aren't converted to sRGB (the ICC profile travels with the image).
@@ -285,7 +293,13 @@ Some things are dropped, and the report says so:
 - precision above 8 bits when writing JPEG (PNG and JPEG XL keep 16 bits), and in
   animations;
 - PNG text chunks other than comments, and gamma without an ICC profile, when writing JPEG;
-- transparency when writing JPEG (flattened onto `background`).
+- transparency when writing JPEG (flattened onto `background`);
+- JPEG XL extra channels other than alpha (spot colours, depth, …), and the animation of a
+  one-frame animated JPEG XL (it becomes a still).
+
+Every report has `notes` (a list, often empty): a lossless output of a lossy source (JPEG,
+lossy WebP, AVIF unless coded as RGB, HEIC, lossy or recompressed-JPEG JPEG XL) gets a note
+that it will be several times larger, and what stays small.
 
 A PNG gets the smallest colour type that loses nothing: grey, palette (1–8 bit), RGB or
 RGBA. Palette output also compresses far better once the pixels are scrambled. A JPEG is

@@ -17,13 +17,13 @@
 // image, a `pmWs` box holds the pixels under a watermark drawn on the scrambled image (pixel
 // route; the JPEG route keeps both in the JPEG's APP15 segments, and mirrors pmWm in a box).
 
-import { readJxl, writeJxl, wrapCodestream, readJxlHeader, isJxl } from './container.js';
+import { readJxl, writeJxl, wrapCodestream, readJxlHeader, isJxl, extraChannelsNote } from './container.js';
 import { loadJxlCodec } from './load.js';
 import { computeLayout, applyMap } from '../../core/layout.js';
 import {
   makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError, FLAG_STASH, tileSize, tileTransforms,
 } from '../../core/params.js';
-import { stripExifThumbnail } from '../../meta/thumbnails.js';
+import { stripExifPreviews, stripXmpPreviews } from '../../meta/thumbnails.js';
 import { exifTiff, unwrapBrob } from '../../meta/jxl.js';
 import { scrambleJpeg, unscrambleJpegDetailed, rekeyJpeg, jpegMarkerBytes, jpegWatermark } from '../jpeg/index.js';
 import { readSegments } from '../jpeg/markers.js';
@@ -44,31 +44,34 @@ const STALE = {
 };
 
 /**
- * Metadata boxes to carry over, with EXIF thumbnails removed unless kept.
+ * Metadata boxes to carry over, with EXIF and XMP previews removed unless kept.
  * @returns {{boxes: import('./container.js').Box[], dropped: string[]}}
  */
 export function sanitizeBoxes(boxes, { keepThumbnails = false, limits } = {}) {
   const out = [], dropped = [];
+  const note = (s) => { if (!dropped.includes(s)) dropped.push(s); };
   for (const box of boxes) {
     if (STRUCTURE.has(box.type)) continue;
     if (STALE[box.type]) { dropped.push(STALE[box.type]); continue; }
     if (keepThumbnails) { out.push(box); continue; }
-    if (box.type === 'Exif' && box.data.length > 4) {
-      const stripped = stripExifThumbnail(exifTiff(box.data));
-      if (stripped) {
-        out.push({ type: 'Exif', data: withOffset(stripped) });
-        dropped.push('EXIF thumbnail');
-        continue;
-      }
-    } else if (box.type === 'brob' && String.fromCharCode(...box.data.subarray(0, 4)) === 'Exif') {
-      const inner = unwrapBrob(box.data, limits);
-      if (!inner.data) { dropped.push('compressed EXIF (cannot be checked for a thumbnail here)'); continue; }
-      const stripped = stripExifThumbnail(exifTiff(inner.data));
-      out.push(stripped ? { type: 'Exif', data: withOffset(stripped) } : box);
-      if (stripped) dropped.push('EXIF thumbnail');
-      continue;
+    const inner = box.type === 'brob' ? String.fromCharCode(...box.data.subarray(0, 4)) : box.type;
+    if (inner !== 'Exif' && inner !== 'xml ') { out.push(box); continue; }
+    let data = box.data;
+    if (box.type === 'brob') {
+      const u = unwrapBrob(box.data, limits);
+      if (!u.data) { dropped.push(`compressed ${inner === 'Exif' ? 'EXIF' : 'XMP'} (cannot be checked for a ${inner === 'Exif' ? 'thumbnail' : 'preview'} here)`); continue; }
+      data = u.data;
     }
-    out.push(box);
+    if (inner === 'Exif') {
+      const stripped = data.length > 4 ? stripExifPreviews(exifTiff(data)) : null;
+      out.push(stripped ? { type: 'Exif', data: withOffset(stripped.tiff) } : box);
+      if (stripped) stripped.dropped.forEach(note);
+    } else {
+      const stripped = stripXmpPreviews(new TextDecoder().decode(data));
+      if (stripped) stripped.dropped.forEach(note);
+      if (!stripped) out.push(box);
+      else if (stripped.text !== null) out.push({ type: 'xml ', data: new TextEncoder().encode(stripped.text) });
+    }
   }
   return { boxes: out, dropped };
 }
@@ -87,6 +90,8 @@ export function reencodeNotes(header) {
   if (header.lossy) notes.push('lossy compression (re-encoded losslessly from the decoded pixels; the file grows)');
   if (highPrecision(header) && header.animated) notes.push(`${header.float ? 'floating-point' : `${header.bits}-bit`} precision (reduced to 8-bit; animations are 8-bit)`);
   else if (header.float || header.bits > 16) notes.push(`${header.float ? 'floating-point' : `${header.bits}-bit`} precision (reduced to 16-bit)`);
+  const extra = extraChannelsNote(header);
+  if (extra) notes.push(extra);
   return notes;
 }
 

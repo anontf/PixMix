@@ -1,7 +1,7 @@
 // Metadata boxes of a JPEG XL container. The colour encoding lives in the codestream
 // header (see formats/jxl/container.js), not in a box.
 
-import { readJxl } from '../formats/jxl/container.js';
+import { readJxl, readJxlHeader, extraChannelsNote } from '../formats/jxl/container.js';
 import { resolveLimits, decompressedLimitError } from '../core/limits.js';
 
 const utf8 = new TextDecoder();
@@ -31,7 +31,14 @@ export function unwrapBrob(data, limits) {
 /** @returns {import('./jpeg.js').Metadata} */
 export function readJxlMetadata(bytes, limits) {
   const meta = { dropped: [] };
-  for (let { type, data } of readJxl(bytes, limits).boxes) {
+  const { boxes, codestream } = readJxl(bytes, limits);
+  try {
+    const extra = extraChannelsNote(readJxlHeader(codestream, limits));
+    if (extra) meta.dropped.push(extra);
+  } catch (err) {
+    if (err?.code === 'LIMIT') throw err;
+  }
+  for (let { type, data } of boxes) {
     if (type === 'brob') {
       const inner = unwrapBrob(data, limits);
       if (!inner.data) { meta.dropped.push(`compressed ${inner.type.trim()} box (${inner.corrupt ? 'corrupt' : 'no Brotli here'})`); continue; }

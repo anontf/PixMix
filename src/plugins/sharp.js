@@ -62,7 +62,8 @@ async function decodeWith(sharp, bytes, limits) {
     metadata.exif = e[0] === 0x45 && e[1] === 0x78 && e[4] === 0 ? e.subarray(6) : e;
   }
   if (meta.xmp) metadata.xmp = new TextDecoder().decode(meta.xmp);
-  if (meta.density) {
+  // libvips reports 72 dpi for files without any; a resolution unit means the file had one.
+  if (meta.density && meta.resolutionUnit) {
     const ppm = Math.round(meta.density / 0.0254);
     metadata.density = { x: ppm, y: ppm, unit: 'meter' };
   }

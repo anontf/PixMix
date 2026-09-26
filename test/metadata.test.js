@@ -446,3 +446,122 @@ test('decode and rekey take a policy too; sync decode needs the tools loaded (th
   const kept = rekey(scrambled, { from: KEY, to: 'k2' });
   assert.deepEqual(readMetadata(kept).exif.tags, readMetadata(scrambled).exif.tags, 'rekey keeps metadata by default');
 });
+
+// --- previews hidden in metadata -------------------------------------------------------
+
+const xmpWithThumbnail = (b64) => '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+  + '<rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:xmpGImg="http://ns.adobe.com/xap/1.0/g/img/" xmlns:dc="http://purl.org/dc/elements/1.1/" dc:format="image/jpeg">'
+  + `<xmp:Thumbnails><rdf:Alt><rdf:li rdf:parseType="Resource"><xmpGImg:format>JPEG</xmpGImg:format><xmpGImg:image>${b64}</xmpGImg:image></rdf:li></rdf:Alt></xmp:Thumbnails>`
+  + '</rdf:Description></rdf:RDF></x:xmpmeta>';
+const has = (hay, needle) => Buffer.from(hay).indexOf(Buffer.from(needle)) >= 0;
+const smallJpeg = async (colour) => new Uint8Array(await sharp({ create: { width: 24, height: 16, channels: 3, background: colour } }).jpeg().toBuffer());
+
+/** Little-endian TIFF: IFD0 -> Exif IFD -> a MakerNote with a vendor header and a JPEG preview inside. */
+function exifWithMakerNotePreview(preview) {
+  const note = Buffer.concat([ascii('VENDOR\0II'), Buffer.alloc(7, 1), preview, Buffer.alloc(5, 2)]);
+  const exifIfd = 8 + 2 + 12 + 4, noteAt = exifIfd + 2 + 12 + 4;
+  const t = Buffer.alloc(noteAt + note.length);
+  t.write('II', 0, 'latin1'); t.writeUInt16LE(42, 2); t.writeUInt32LE(8, 4);
+  t.writeUInt16LE(1, 8); t.writeUInt16LE(0x8769, 10); t.writeUInt16LE(4, 12); t.writeUInt32LE(1, 14); t.writeUInt32LE(exifIfd, 18);
+  t.writeUInt16LE(1, exifIfd); t.writeUInt16LE(0x927c, exifIfd + 2); t.writeUInt16LE(7, exifIfd + 4);
+  t.writeUInt32LE(note.length, exifIfd + 6); t.writeUInt32LE(noteAt, exifIfd + 10);
+  note.copy(t, noteAt);
+  return new Uint8Array(t);
+}
+
+/** Photoshop resources (two big ones, then a thumbnail) split over APP13 segments at arbitrary bytes. */
+function splitIrb(thumb) {
+  const res = (id, data) => Buffer.concat([ascii('8BIM'), Buffer.from([id >> 8, id & 255, 0, 0]), Buffer.from([0, 0, data.length >> 8, data.length & 255]), data, Buffer.alloc(data.length & 1)]);
+  const stream = Buffer.concat([res(0x0404, Buffer.alloc(40000, 0x20)), res(0x0428, Buffer.alloc(40001, 0x21)), res(0x040c, Buffer.concat([Buffer.alloc(28), thumb]))]);
+  const segs = [];
+  for (let o = 0; o < stream.length; o += 65519) segs.push(segment(0xed, Buffer.concat([ascii('Photoshop 3.0\0'), stream.subarray(o, o + 65519)])));
+  return segs;
+}
+
+test('previews in XMP, the MakerNote and continued Photoshop resources are removed and reported on every route; keepThumbnails keeps them', async () => {
+  const { jpeg } = await build();
+  const preview = await smallJpeg('#a03050');
+  const b64 = Buffer.from(preview).toString('base64');
+  const { segments } = readSegments(jpeg);
+  const src = writeSegments([
+    segment(0xe1, Buffer.concat([ascii('Exif\0\0'), exifWithMakerNotePreview(preview)])),
+    segment(0xe1, Buffer.concat([ascii('http://ns.adobe.com/xap/1.0/\0'), Buffer.from(xmpWithThumbnail(b64))])),
+    ...splitIrb(Buffer.from(preview)),
+    ...segments.filter((s) => ![0xe1, 0xed].includes(s.marker)),
+  ]);
+  const gone = (bytes) => !has(bytes, preview.subarray(0, 200)) && !has(bytes, preview.subarray(-200)) && !has(bytes, b64.slice(20, 80));
+  let report;
+  const scrambled = encode(src, { key: KEY, onConvert: (r) => { report = r; } });
+  for (const d of ['MakerNote preview (zeroed)', 'XMP preview (xmp:Thumbnails)', 'Photoshop thumbnail']) assert.ok(report.dropped.includes(d), d);
+  assert.ok(gone(scrambled), 'no preview bytes left');
+  const restored = decode(scrambled, { key: KEY });
+  const meta = readMetadata(restored);
+  assert.ok(!meta.xmp.properties.some((p) => p.name === 'xmp:Thumbnails'));
+  assert.equal(meta.xmp.properties.find((p) => p.name === 'dc:format')?.value, 'image/jpeg', 'the rest of the XMP stays');
+  const exif = readSegments(restored).segments.find((s) => s.marker === 0xe1).data.subarray(6);
+  assert.equal(exif.length, exifWithMakerNotePreview(preview).length, 'the MakerNote is zeroed in place, nothing moves');
+  // The Photoshop resources were joined, the thumbnail removed, the rest kept (80 KB, two segments).
+  const irbs = readSegments(restored).segments.filter((s) => s.marker === 0xed);
+  assert.equal(irbs.length, 2);
+  assert.equal(irbs.reduce((n, s) => n + s.data.length - 14, 0), 12 + 40000 + 12 + 40002);
+
+  const kept = encode(src, { key: KEY, keepThumbnails: true });
+  assert.ok(has(kept, preview.subarray(0, 200)) && has(kept, b64.slice(20, 80)));
+
+  // Converting: PNG output.
+  const png = await encodeAsync(src, { key: KEY, format: 'png', onConvert: (r) => { report = r; } });
+  assert.ok(report.dropped.includes('MakerNote preview (zeroed)') && report.dropped.includes('XMP preview (xmp:Thumbnails)'));
+  assert.ok(gone(png));
+  // PNG and JPEG XL inputs, scrambled as they are.
+  const pngIn = convert(src, { format: 'png', keepThumbnails: true }).bytes;
+  assert.ok(has(pngIn, b64.slice(20, 80)));
+  encode(pngIn, { key: KEY, onConvert: (r) => { report = r; } });
+  assert.ok(report.dropped.includes('XMP preview (xmp:Thumbnails)') && report.dropped.includes('MakerNote preview (zeroed)'));
+  assert.ok(gone(encode(pngIn, { key: KEY })));
+  const jxl = readJxl((await convertAsync(src, { format: 'jxl', keepThumbnails: true })).bytes);
+  const jxlIn = writeJxl([...jxl.boxes.filter((b) => b.type !== 'ftyp' && b.type !== 'jxlc' && b.type !== 'xml '), { type: 'xml ', data: Buffer.from(xmpWithThumbnail(b64)) }], jxl.codestream);
+  const jxlOut = await encodeAsync(jxlIn, { key: KEY, mode: 'block', onConvert: (r) => { report = r; } });
+  assert.ok(report.dropped.includes('XMP preview (xmp:Thumbnails)') && report.dropped.includes('MakerNote preview (zeroed)'));
+  assert.ok(gone(jxlOut));
+});
+
+test('extended XMP holding an image (GImage:Data) goes with the previews', async () => {
+  const { jpeg } = await build();
+  const image = Buffer.alloc(3000, 0x41).toString('base64');
+  const ext = '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+    + `<rdf:Description rdf:about="" xmlns:G="http://ns.google.com/photos/1.0/image/" G:Data="${image}"/></rdf:RDF></x:xmpmeta>`;
+  const extSeg = (at, part) => segment(0xe1, Buffer.concat([
+    ascii('http://ns.adobe.com/xmp/extension/\0'), ascii('A'.repeat(32)),
+    Buffer.from([0, 0, ext.length >> 8, ext.length & 255]), Buffer.from([0, 0, at >> 8, at & 255]), ascii(part),
+  ]));
+  const { segments } = readSegments(jpeg);
+  const src = writeSegments([extSeg(2000, ext.slice(2000)), extSeg(0, ext.slice(0, 2000)), ...segments]);
+  let report;
+  const scrambled = encode(src, { key: KEY, onConvert: (r) => { report = r; } });
+  assert.ok(report.dropped.includes('extended XMP (2 segments: it holds a preview image)'));
+  assert.ok(!has(scrambled, image.slice(0, 100)));
+  // Extended XMP without an image stays.
+  const other = ext.replace(`G:Data="${image}"`, 'G:Mime="image/jpeg"');
+  const plain = writeSegments([segment(0xe1, Buffer.concat([ascii('http://ns.adobe.com/xmp/extension/\0'), ascii('B'.repeat(32)), Buffer.from([0, 0, 0, other.length, 0, 0, 0, 0]), ascii(other)])), ...segments]);
+  encode(plain, { key: KEY, onConvert: (r) => { report = r; } });
+  assert.ok(!report.dropped.some((d) => d.startsWith('extended XMP')));
+});
+
+test('the thumbnail group strips continued Photoshop thumbnails and MakerNote previews; other policies leave them', async () => {
+  const { jpeg } = await build();
+  const { segments } = readSegments(jpeg);
+  const thumb = Buffer.alloc(500, 0x5a);
+  const withIrb = writeSegments([...splitIrb(thumb), ...segments.filter((s) => s.marker !== 0xed)]);
+  const out = applyMetadata(withIrb, 'privacy');
+  assert.ok(out.report.removed.includes('Photoshop thumbnail (thumbnail)'));
+  assert.ok(!has(out.bytes, thumb));
+  assert.ok(has(applyMetadata(withIrb, { remove: ['c2pa'] }).bytes, thumb), 'only the thumbnail group removes it');
+
+  const preview = await smallJpeg('#30a050');
+  const tiff = exifWithMakerNotePreview(preview);
+  const src = writeSegments([segment(0xe1, Buffer.concat([ascii('Exif\0\0'), tiff])), ...segments.filter((s) => s.marker !== 0xe1)]);
+  const res = applyMetadata(src, { remove: ['thumbnail'] });
+  assert.ok(res.report.removed.includes('MakerNote preview (thumbnail)'));
+  assert.ok(!has(res.bytes, preview.subarray(0, 100)));
+  assert.ok(has(applyMetadata(src, { remove: ['c2pa'] }).bytes, preview.subarray(0, 100)));
+});

@@ -229,9 +229,11 @@ async function prepare(bytes, key, orientation, animated, worker = true, limits,
   // Browsers decode JPEGs already oriented; undo that to get the stored pixel grid.
   const [orig, scr] = await Promise.all([loadImage(r.restored, r.type), loadImage(r.scrambled, r.type)]);
   if (swapsAxes(o) && orig.naturalWidth === width) o = 1; // this browser did not apply it
+  // A scrambled file enlarged to whole MCUs is stored larger; the image is its top left.
+  const { storedWidth = width, storedHeight = height } = r.layout;
   return {
     width, height, o, type: r.type, restored, ...wm,
-    animate: (work, opts) => animateJpeg(work, r.layout, toRaw(scr, width, height, o), toRaw(orig, width, height, o), opts),
+    animate: (work, opts) => animateJpeg(work, r.layout, toRaw(scr, storedWidth, storedHeight, o), toRaw(orig, width, height, o), opts),
   };
 }
 

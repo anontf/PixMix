@@ -26,6 +26,7 @@ import { checkInputSize } from '../core/limits.js';
  * @property {Uint8Array} scrambled  the scrambled JPEG (the browser decodes both for frames)
  * @property {Uint8Array|null} exif  APP1 TIFF payload
  * @property {object} layout         perm, transforms, cols, rows, tileW, tileH, width, height
+ *           (and storedWidth, storedHeight when the scrambled file is stored larger)
  *
  * Both may also have `overlay` ({x, y, width, height, rgba}: the watermark drawn into
  * `restored`, for fading it in on the canvas) or `watermarkError` (it could not be drawn).
@@ -63,14 +64,15 @@ export async function compute(bytes, key, { animated = true, limits, watermark =
     const d = unscrambleJpegDetailed(bytes, { key, limits });
     const app1 = d.segments.find((s) => s.marker === 0xe1 && s.data[0] === 0x45 && s.data[4] === 0 && s.data[5] === 0);
     const exif = app1 ? app1.data.slice(6) : null;
-    const { perm, transforms, cols, rows, tileW, tileH, width, height } = d.layout;
+    const { perm, transforms, cols, rows, tileW, tileH, width, height, storedWidth, storedHeight } = d.layout;
     return {
       kind: 'jpeg',
       type: 'image/jpeg',
       ...(await painting(watermark, d.watermark, d.layout, exif, (paint) => d.toJpeg(paint), limits)),
       scrambled: bytes,
       exif,
-      layout: { perm, transforms, cols, rows, tileW, tileH, width, height },
+      // storedWidth/storedHeight: only for a scrambled file enlarged to whole MCUs.
+      layout: { perm, transforms, cols, rows, tileW, tileH, width, height, ...(storedWidth ? { storedWidth, storedHeight } : {}) },
     };
   }
   if (format === 'jxl') {

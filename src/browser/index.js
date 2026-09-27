@@ -406,7 +406,7 @@ function setImageSource(img, bytes, type, candidate) {
     img.addEventListener('error', () => {
       for (const s of sources) s.setAttribute('srcset', s.dataset.pixmixSrcset);
       forget(img);
-      reject(new PixmixError('Browser failed to display restored image'));
+      reject(new PixmixError('Browser failed to display restored image', 'DISPLAY'));
     }, { once: true });
     const d = candidate?.descriptor ?? '';
     const density = /^[\d.]+x$/i.test(d) ? parseFloat(d) : 1;

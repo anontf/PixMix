@@ -88,6 +88,17 @@ async function storedWatermarkId(id) {
  * as a number, which answers 400 (BAD_OPTION) for one that is not valid (NaN included).
  */
 const num = (q, k) => (q.get(k) ? Number(q.get(k)) : undefined);
+/**
+ * A yes/no query parameter: 1/true, 0/false; absent or empty is the default. Anything else
+ * ('auto' for progressive, say) goes to pixmix as it is, which answers 400 when it's invalid.
+ */
+const flag = (q, k) => {
+  const v = q.get(k);
+  if (!v) return undefined;
+  if (v === '1' || v === 'true') return true;
+  if (v === '0' || v === 'false') return false;
+  return v;
+};
 
 const routes = {
   // Any supported input; the X-Pixmix-Convert header reports what happened to it.
@@ -102,6 +113,12 @@ const routes = {
       format: q.get('format') || undefined,
       quality: num(q, 'quality'),
       transforms: q.get('transforms') !== '0',
+      // JPEG output: chroma subsampling and scan structure; background for flattening alpha
+      // (#rrggbb, URL-encoded, or without the #); keepThumbnails keeps the source's previews.
+      subsampling: q.get('subsampling') || undefined,
+      progressive: flag(q, 'progressive'),
+      background: q.get('background') || undefined,
+      keepThumbnails: flag(q, 'keepThumbnails'),
       decoders,
       limits: LIMITS,
       onConvert: (r) => { report = r; },
@@ -122,6 +139,7 @@ const routes = {
     let meta = null;
     const out = await decodeAsync(await body(req), {
       key: q.get('key'),
+      progressive: flag(q, 'progressive'),
       limits: LIMITS,
       watermark: wm === 'embedded' ? 'embedded' : await storedWatermark(wm),
       resolveWatermark: (id) => storedWatermark(id),
@@ -138,6 +156,7 @@ const routes = {
       mode: q.get('mode') || undefined,
       block: num(q, 'block'),
       transforms: q.has('transforms') ? q.get('transforms') !== '0' : undefined,
+      progressive: flag(q, 'progressive'),
       limits: LIMITS,
       metadata: await storedPolicy(q.get('metadata')),
       onMetadata: (r) => { meta = r; },

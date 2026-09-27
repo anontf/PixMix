@@ -257,12 +257,12 @@ Everything pixmix throws on purpose is a `PixmixError` (exported), with a `code`
 
 | Code | When |
 | --- | --- |
-| `BAD_OPTION` | An option is invalid or does not fit the call (see "Options"): values out of range, a mode the output format doesn't have, `mode: 'mcu'` without a JPEG source, an empty key or one with a lone surrogate, an unknown limit, `rekey` to another format. |
+| `BAD_OPTION` | An option is invalid or does not fit the call (see "Options"): values out of range, a mode the output format doesn't have, `mode: 'mcu'` without a JPEG source, an empty key or one with a lone surrogate, an unknown limit, `rekey` to another format; input that is not bytes. |
 | `ALREADY_SCRAMBLED` | `encode` of a file that carries a pixmix marker; `convert` of one to another format. |
 | `NOT_SCRAMBLED` | `decode` or `rekey` of a file without a marker. |
 | `WRONG_KEY` | The key does not match the file's key check. Thrown as `WrongKeyError`, a subclass. |
 | `LIMIT` | A resource limit was exceeded (see "Untrusted input"). |
-| `UNSUPPORTED` | The format is unknown, or needs a decoder plugin that wasn't given; a JPEG pixmix does not handle (12-bit, lossless, arithmetic-coded, hierarchical, several frames, DNL, 2 components); `mode: 'mcu'` for a JPEG the JPEG route can't carry; a visible watermark on a JPEG XL that isn't 8-bit sRGB; a watermark on a CMYK JPEG; a metadata policy on a format other than PNG, JPEG or JPEG XL. |
+| `UNSUPPORTED` | The format is unknown, or needs a decoder plugin that wasn't given; a JPEG pixmix does not handle (12-bit, lossless, arithmetic-coded, hierarchical, several frames, DNL, 2 components); `mode: 'mcu'` for a JPEG the JPEG route can't carry; a visible watermark on a JPEG XL that isn't 8-bit sRGB; a watermark on a CMYK JPEG; a metadata policy on a format other than PNG, JPEG or JPEG XL; a pixmix marker from a newer version (an unknown version or flag). |
 | `BAD_PNG`, `BAD_JPEG`, `BAD_GIF`, `BAD_JXL`, `BAD_<FORMAT>` | The file is damaged. A decoder's own error (jpeg-js, omggif, libvips, the JPEG XL codecs, the browser) is wrapped as `BAD_` plus the input format, e.g. `BAD_WEBP`, with the original as `cause`. |
 | `BAD_METADATA` | An invalid metadata policy or profile; the message names the problem. |
 | `BAD_WATERMARK` | An invalid watermark definition, compiled watermark or id; a carried watermark that is damaged when it is asked for (`watermark: 'embedded'`); an id to look up without `resolveWatermark`. |
@@ -270,8 +270,9 @@ Everything pixmix throws on purpose is a `PixmixError` (exported), with a `code`
 | `DECODER` | A decoder plugin returned the wrong amount of pixel data. |
 | `JXL_ENCODE` | libjxl failed to encode. |
 | `FETCH` | Browser decoder: the image or watermark request answered with an HTTP error. |
+| `DISPLAY` | Browser decoder: the browser could not display the restored image. |
 | `NOT_FOUND`, `EXISTS` | The watermark and metadata profile stores (and the CLI, for an output that exists without `-f`). |
-| `PIXMIX` | A damaged pixmix marker, or one from a newer version (unknown version or flags); input that is not bytes. |
+| `BAD_MARKER` | The pixmix marker is damaged, or its parameters don't fit the image. |
 
 The dev server answers errors as JSON `{ error, code }`, see "Dev server".
 
@@ -975,9 +976,9 @@ options in the query string:
 
 | Route | Query | Answer |
 | --- | --- | --- |
-| `POST /api/encode` | `key`, `format`, `mode`, `block`, `level`, `effort`, `quality`, `transforms=0`, `watermark=<id>` (with `watermarkEmbed=id` only its id is carried), `visibleWatermark=<id>`, `metadata=<preset or profile id>` | the scrambled image; the conversion report in `X-Pixmix-Convert` |
-| `POST /api/decode` | `key`, `watermark=<id>` or `watermark=embedded`, `metadata` | the restored image; the policy's report in `X-Pixmix-Metadata` |
-| `POST /api/rekey` | `from`, `to`, `mode`, `block`, `transforms`, `metadata` | the rekeyed image; `X-Pixmix-Metadata` |
+| `POST /api/encode` | `key`, `format`, `mode`, `block`, `level`, `effort`, `quality`, `transforms=0`, `subsampling`, `progressive=1\|0\|auto`, `background=%23rrggbb` (or without the `#`), `keepThumbnails=1`, `watermark=<id>` (with `watermarkEmbed=id` only its id is carried), `visibleWatermark=<id>`, `metadata=<preset or profile id>` | the scrambled image; the conversion report in `X-Pixmix-Convert` |
+| `POST /api/decode` | `key`, `watermark=<id>` or `watermark=embedded`, `progressive`, `metadata` | the restored image; the policy's report in `X-Pixmix-Metadata` |
+| `POST /api/rekey` | `from`, `to`, `mode`, `block`, `transforms`, `progressive`, `metadata` | the rekeyed image; `X-Pixmix-Metadata` |
 | `POST /api/inspect` | `metadata=1` adds the parsed metadata | `inspect()`'s JSON |
 | `POST /api/gallery` | `key`, `name`, `effect`, `watermark` | publishes a scrambled image to the demo site: `{ id, url }` (201) |
 | `GET /api/gallery` | | `[{ id, url, key, name, effect, watermark, format, width, height, orientation, mode, block, carries, visibleWatermark }]` |
@@ -991,9 +992,9 @@ options in the query string:
 | `POST /api/metadata-profiles`, `GET/PUT/DELETE /api/metadata-profiles/<id>` | | like the watermark routes |
 
 - The gallery lives in memory, so it is empty after a restart. `orientation` is the
-  orientation `inspect` reports for a JPEG or JPEG XL (1 when there is none, and always 1
-  for PNG, for which `inspect` reports none), so the demo site can lay the image out as it
-  will be shown before it loads; `carries` is the id of the watermark the file carries, if
+  orientation `inspect` reports (from the EXIF of a PNG or JPEG, the header of a JPEG XL;
+  1 when there is none), so the demo site can lay the image out as it will be shown before
+  it loads; `carries` is the id of the watermark the file carries, if
   any.
 - Watermark and profile ids must match `[a-z0-9-]` (`preview` is reserved), and bodies are
   validated strictly; a PUT's body must have the id of its URL.

@@ -133,21 +133,21 @@ export function writeMarker(params, check) {
 
 /** @param {Uint8Array} data @returns {{params: ScrambleParams, check: Uint8Array}} */
 export function readMarker(data) {
-  if (data.length < 5) throw new PixmixError('Corrupt pixmix marker');
+  if (data.length < 5) throw new PixmixError('Corrupt pixmix marker', 'BAD_MARKER');
   const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const version = dv.getUint8(0);
-  if (version !== VERSION && version !== 2) throw new PixmixError(`Unsupported pixmix marker version ${version}`);
+  if (version !== VERSION && version !== 2) throw new PixmixError(`Unsupported pixmix marker version ${version}`, 'UNSUPPORTED');
   const mode = MODES[dv.getUint8(1)];
-  if (!mode) throw new PixmixError('Corrupt pixmix marker (mode)');
+  if (!mode) throw new PixmixError('Corrupt pixmix marker (mode)', 'BAD_MARKER');
   const saltLen = dv.getUint8(4);
   const extra = version === 2 ? 1 : 0;
-  if (data.length !== 5 + saltLen + CHECK_BYTES + extra) throw new PixmixError('Corrupt pixmix marker (length)');
+  if (data.length !== 5 + saltLen + CHECK_BYTES + extra) throw new PixmixError('Corrupt pixmix marker (length)', 'BAD_MARKER');
   const block = dv.getUint16(2);
   // The same range makeParams allows: a tile size of 0 made the tile grid infinite. (Before
   // tile transforms existed the flag bit made this check fail, so old readers refuse such files.)
-  if (mode === 'block' && !((block & 0x7fff) >= 2 && (block & 0x7fff) <= 4096)) throw new PixmixError('Corrupt pixmix marker (block size)');
+  if (mode === 'block' && !((block & 0x7fff) >= 2 && (block & 0x7fff) <= 4096)) throw new PixmixError('Corrupt pixmix marker (block size)', 'BAD_MARKER');
   const flags = extra ? data[data.length - 1] : 0;
-  if (flags & ~(FLAG_STASH | FLAG_ENLARGED)) throw new PixmixError(`Unsupported pixmix marker flags ${flags}`);
+  if (flags & ~(FLAG_STASH | FLAG_ENLARGED)) throw new PixmixError(`Unsupported pixmix marker flags ${flags}`, 'UNSUPPORTED');
   return {
     params: { version: VERSION, mode, block, salt: data.slice(5, 5 + saltLen), flags },
     check: data.slice(5 + saltLen, 5 + saltLen + CHECK_BYTES),

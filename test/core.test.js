@@ -63,3 +63,18 @@ test('package.json engines: the Node versions that have what pixmix needs', asyn
   assert.equal(typeof process.getBuiltinModule, 'function');
   assert.equal(typeof globalThis.crypto?.getRandomValues, 'function');
 });
+
+test('error codes: damaged markers, markers from newer versions, input that is not bytes', async () => {
+  const { encode, decode, inspect, detectFormat } = await import('../src/index.js');
+  const { readChunks, writeChunks } = await import('../src/formats/png/chunks.js');
+  const sharp = (await import('sharp')).default;
+  const png = new Uint8Array(await sharp({ create: { width: 40, height: 20, channels: 3, background: '#468' } }).withMetadata({ orientation: 6 }).png().toBuffer());
+  const s = encode(png, { key: 'k' });
+  assert.equal(inspect(png).orientation, 6, 'a PNG reports its eXIf orientation');
+  assert.equal(inspect(s).orientation, 6);
+  const withMarker = (edit) => writeChunks(readChunks(s).map((c) => (c.type === 'pmIx' ? { type: 'pmIx', data: edit(c.data.slice()) } : c)));
+  assert.throws(() => decode(withMarker((d) => d.subarray(0, 3)), { key: 'k' }), { code: 'BAD_MARKER' });
+  assert.throws(() => decode(withMarker((d) => { d[0] = 9; return d; }), { key: 'k' }), { code: 'UNSUPPORTED' });
+  assert.throws(() => decode('not bytes', { key: 'k' }), { code: 'BAD_OPTION' });
+  assert.equal(detectFormat(s), 'png');
+});

@@ -65,7 +65,7 @@ export function computeLayout(key, params, width, height, index = 0) {
   // Pixel grids only know pixel and block mode: an mcu marker here (a JPEG's) is corrupt.
   const size = params.block & 0x7fff;
   if (params.mode !== 'block' || !(size >= 2 && size <= 4096)) {
-    throw new PixmixError(`Corrupt pixmix marker (mode ${params.mode}, block ${size}) for this image`);
+    throw new PixmixError(`Corrupt pixmix marker (mode ${params.mode}, block ${size}) for this image`, 'BAD_MARKER');
   }
   const cols = Math.floor(width / size);
   const rows = Math.floor(height / size);

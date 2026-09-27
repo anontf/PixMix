@@ -163,6 +163,24 @@ test('encode, decode, rekey and inspect endpoints take ?metadata=', { skip }, as
   assert.equal((await call('/api/encode?key=k&metadata=..%2Fx', { method: 'POST', body: jpeg })).status, 400);
 });
 
+test('encode takes the JPEG and conversion options: subsampling, progressive, background, keepThumbnails', { skip }, async () => {
+  const png = new Uint8Array(await sharp({ create: { width: 64, height: 48, channels: 4, background: { r: 40, g: 80, b: 120, alpha: 0.5 } } }).png().toBuffer());
+  const jpeg = async (query) => (await call(`/api/encode?key=k&format=jpeg&${query}`, { method: 'POST', body: png, json: false })).body;
+  const sof = (b) => { const i = Buffer.from(b).findIndex((v, k) => v === 0xff && [0xc0, 0xc1, 0xc2].includes(b[k + 1])); return b.subarray(i, i + 19); };
+  const lumaFactors = (b) => sof(b)[11];
+  assert.equal(lumaFactors(await jpeg('subsampling=4:4:4')), 0x11);
+  assert.equal(lumaFactors(await jpeg('subsampling=4:2:0')), 0x22);
+  assert.equal(inspect(await jpeg('progressive=1')).progressive, true);
+  assert.equal(inspect(await jpeg('progressive=0')).progressive, false);
+  // The alpha is flattened onto the background: a white one is lighter than a black one.
+  const mean = async (b) => (await sharp(Buffer.from(await decodeAsync(b, { key: 'k' }))).stats()).channels[0].mean;
+  assert.ok((await mean(await jpeg('background=%23ffffff'))) > (await mean(await jpeg('background=000000'))) + 50);
+  for (const bad of ['subsampling=4:1:1', 'progressive=maybe', 'background=red', 'keepThumbnails=yes']) {
+    const r = await call(`/api/encode?key=k&format=jpeg&${bad}`, { method: 'POST', body: png });
+    assert.deepEqual([r.status, r.body.code], [400, 'BAD_OPTION'], bad);
+  }
+});
+
 test('bad requests: numeric parameters, JSON bodies, reserved and unknown ids, oversized bodies', { skip }, async () => {
   const png = new Uint8Array(await sharp({ create: { width: 40, height: 30, channels: 3, background: '#406080' } }).png().toBuffer());
   let r = await call('/api/encode?key=k&format=jpeg&quality=abc', { method: 'POST', body: png });
@@ -213,10 +231,12 @@ test('static files: HEAD, content types; gallery images only under their own ext
 });
 
 test('the demo site gallery lists each image with its EXIF orientation', { skip }, async () => {
-  const jpeg = new Uint8Array(await sharp({ create: { width: 64, height: 32, channels: 3, background: '#406080' } }).withMetadata({ orientation: 6 }).jpeg().toBuffer());
-  const scrambled = (await call('/api/encode?key=k', { method: 'POST', body: jpeg, json: false })).body;
-  assert.equal((await call('/api/gallery?key=k&name=rot', { method: 'POST', body: scrambled })).status, 201);
-  const item = (await call('/api/gallery')).body.find((g) => g.name === 'rot');
-  assert.deepEqual([item.width, item.height, item.orientation], [64, 32, 6], 'stored size; the page shows it 32×64');
+  const img = sharp({ create: { width: 64, height: 32, channels: 3, background: '#406080' } }).withMetadata({ orientation: 6 });
+  for (const [name, bytes] of [['rot', await img.jpeg().toBuffer()], ['rot-png', await img.png().toBuffer()]]) {
+    const scrambled = (await call('/api/encode?key=k', { method: 'POST', body: new Uint8Array(bytes), json: false })).body;
+    assert.equal((await call(`/api/gallery?key=k&name=${name}`, { method: 'POST', body: scrambled })).status, 201);
+    const item = (await call('/api/gallery')).body.find((g) => g.name === name);
+    assert.deepEqual([item.width, item.height, item.orientation], [64, 32, 6], `${name}: stored size; the page shows it 32×64`);
+  }
   await call('/api/gallery', { method: 'DELETE' });
 });

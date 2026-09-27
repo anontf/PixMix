@@ -150,6 +150,7 @@ async function main(argv) {
   if (!files.length) throw new UsageError('No input files');
   if (files.filter((f) => f === '-').length > 1) throw new UsageError('stdin ("-") can only be used once');
   if (o.out === '-' && files.length > 1) throw new UsageError('-o - (stdout) needs exactly one input');
+  if (o['in-place'] && files.includes('-')) throw new UsageError('--in-place cannot be used with stdin');
 
   const log = o.quiet ? () => {} : (msg) => process.stderr.write(`${msg}\n`);
   if (command === 'inspect') return runInspect(files, o, limitsFrom(o));
@@ -340,10 +341,7 @@ function outputFormat(command, input, opts) {
 
 function outputPath(command, file, o, outDir, format) {
   if (o.out === '-') return '-';
-  if (command === 'rekey' && o['in-place']) {
-    if (file === '-') throw new PixmixError('--in-place cannot be used with stdin');
-    return file;
-  }
+  if (command === 'rekey' && o['in-place']) return file;
   if (o.out && !outDir) return o.out;
   const name = file === '-' ? 'stdin' : basename(file);
   const stem = name.slice(0, name.length - extname(name).length);

@@ -79,7 +79,7 @@ export function writeSegments(segments, trailing) {
   out[0] = 0xff; out[1] = M.SOI;
   let pos = 2;
   for (const s of segments) {
-    if (s.data.length + 2 > 0xffff) throw new PixmixError(`JPEG segment 0x${s.marker.toString(16)} too large`);
+    if (s.data.length + 2 > 0xffff) throw new PixmixError(`JPEG segment 0x${s.marker.toString(16)} too large`, 'BAD_JPEG');
     out[pos] = 0xff; out[pos + 1] = s.marker;
     out[pos + 2] = (s.data.length + 2) >> 8; out[pos + 3] = (s.data.length + 2) & 255;
     out.set(s.data, pos + 4);

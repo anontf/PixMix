@@ -386,6 +386,7 @@ export function inspectPng(bytes, limits) {
     block: marker?.params.mode === 'block' ? tileSize(marker.params) : null,
     transforms: marker?.params.mode === 'block' ? tileTransforms(marker.params) : null,
     ...watermarkInfo(pngWatermark(chunks, limits), marker),
+    ...(chunks.some((c) => c.type === 'eXIf') ? { orientation: pngOrientation(chunks) } : {}),
     chunks: chunks.map((c) => ({ type: c.type, length: c.data.length })),
   };
 }

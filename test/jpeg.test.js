@@ -364,13 +364,21 @@ test('enlarged scrambled JPEGs: visible watermarks within the original area; JPE
   for (let y = 0; y < 128; y++) for (let x = 200; x < 208; x++) assert.equal(a[(y * 208 + x) * 3], b[(y * 208 + x) * 3], 'right edge untouched');
   assert.ok(ref.equals(await pixels(decode(s, { key: 'k' }))));
   assert.ok(ref.equals(await pixels(decode(rekey(s, { from: 'k', to: 'j' }), { key: 'j' }))));
-  // JPEG XL: libjxl/jxl-oxide cannot carry such a JPEG on the JPEG route; the pixel route takes over.
+  // JPEG XL: the JPEG route carries the enlarged scrambled JPEG (its non-interleaved scans
+  // rebuild exactly with the patched jxl-oxide), and restoring gives the original size back.
   let report;
   const jxl = await encodeAsync(src, { key: 'k', format: 'jxl', onConvert: (r) => { report = r; } });
-  assert.match(report.notes[0], /JPEG route not possible/);
-  assert.equal(inspect(jxl).width, 200);
-  const back = await sharp(Buffer.from(await convertAsync(await decodeAsync(jxl, { key: 'k' }), { format: 'png' }).then((r) => r.bytes))).raw().toBuffer();
-  assert.equal(back.length, 200 * 120 * 3);
+  assert.ok(!report.notes.some((n) => /JPEG route not possible/.test(n)), report.notes.join());
+  assert.equal(inspect(jxl).mode, 'mcu');
+  const ji = inspect(jxl);
+  assert.deepEqual([ji.width, ji.height, ji.storedWidth, ji.storedHeight], [200, 120, 208, 128], 'original size, from the pmSz box; the codestream holds the enlarged JPEG');
+  assert.equal(inspect(await decodeAsync(jxl, { key: 'k' })).storedWidth, undefined, 'restored: no pmSz box');
+  const restored = await decodeAsync(jxl, { key: 'k' });
+  assert.deepEqual([inspect(restored).width, inspect(restored).height], [200, 120]);
+  const { reconstructJpeg } = await (await import('../src/formats/jxl/load.js')).loadJxlCodec();
+  const rebuilt = await reconstructJpeg(restored);
+  assert.ok(sameCoefs(rebuilt, src));
+  assert.ok(ref.equals(await pixels(rebuilt)));
 });
 
 test('enlarged scrambled JPEGs: an unknown flag or a lost size is refused, not misrestored', async () => {

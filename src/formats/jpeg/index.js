@@ -165,6 +165,12 @@ function finishScramble(segments, frame, params, check, { key, watermark, visibl
   });
 }
 
+/** The APP15 pixmix-sz payload (u16 height, u16 width) of an enlarged scrambled JPEG, or null. */
+export function jpegOriginalSize(segments) {
+  const d = segments.find((s) => s.marker === M.APP15 && startsWith(s.data, SZ_SIG))?.data.subarray(SZ_SIG.length);
+  return d?.length === 4 ? d.slice() : null;
+}
+
 /** An enlarged scrambled frame (FLAG_ENLARGED) at its original size; other frames as they are. */
 function originalSize(segments, frame, marker) {
   if (!(marker.params.flags & FLAG_ENLARGED)) return frame;

@@ -95,6 +95,10 @@ impl<'jbrd, 'frame, 'meta> JpegBitstreamReconstructor<'jbrd, 'frame, 'meta> {
         if frame.image_header().metadata.xyb_encoded {
             return Err(Error::IncompatibleFrame);
         }
+        // pixmix patch: as libjxl (FrameDecoder::InitFrameOutput), only 1 or 3 components.
+        if header.components.len() != 1 && header.components.len() != 3 {
+            return Err(Error::IncompatibleFrame);
+        }
 
         let frame_header = frame.header();
         if frame_header.encoding != Encoding::VarDct {
@@ -115,10 +119,17 @@ impl<'jbrd, 'frame, 'meta> JpegBitstreamReconstructor<'jbrd, 'frame, 'meta> {
 
         let mut jpeg_upsampling_ycbcr = frame_header.jpeg_upsampling;
         jpeg_upsampling_ycbcr.swap(0, 1);
-        let is_subsampled = jpeg_upsampling_ycbcr.iter().any(|&x| x != 0);
         let upsampling_shifts_ycbcr: [_; 3] = std::array::from_fn(|idx| {
             ChannelShift::from_jpeg_upsampling(jpeg_upsampling_ycbcr, idx)
         });
+        // pixmix patch: "subsampled" means some channel is actually shifted, as libjxl's
+        // YCbCrChromaSubsampling::Is444 decides (and libjxl applies chroma-from-luma to every
+        // 4:4:4 frame). Upstream looked at the raw modes, so a 4:4:4 JPEG stored with equal
+        // sampling factors other than 1x1 (all 1x2, 2x1 or 2x2) lost its chroma-from-luma
+        // and rebuilt with wrong chroma coefficients.
+        let is_subsampled = upsampling_shifts_ycbcr
+            .iter()
+            .any(|shift| shift.hshift() != 0 || shift.vshift() != 0);
 
         if !is_subsampled {
             let lf_chan_corr = &lf_global_vardct.lf_chan_corr;
@@ -394,6 +405,48 @@ impl<'jbrd, 'frame, 'meta> JpegBitstreamReconstructor<'jbrd, 'frame, 'meta> {
 }
 
 impl JpegBitstreamReconstructor<'_, '_, '_> {
+    /// pixmix patch: where each JPEG component lives in the frame, and its JPEG sampling
+    /// factors and size in blocks, as libjxl's decoder sets up JPEGData
+    /// (FrameDecoder::InitFrameOutput and FrameDimensions): a component's sampling factor is
+    /// 1 << its raw shift, and the frame is padded to whole MCUs of the raw maximum shifts.
+    fn component_geometry(&self) -> Vec<CompGeometry> {
+        let frame_header = self.frame.header();
+        let mut jpeg_upsampling_ycbcr = frame_header.jpeg_upsampling;
+        jpeg_upsampling_ycbcr.swap(0, 1);
+        let max_hs = jpeg_upsampling_ycbcr.iter().any(|&m| m == 1 || m == 2) as u32;
+        let max_vs = jpeg_upsampling_ycbcr.iter().any(|&m| m == 1 || m == 3) as u32;
+        let xsize_blocks = frame_header.width.div_ceil(8 << max_hs) << max_hs;
+        let ysize_blocks = frame_header.height.div_ceil(8 << max_vs) << max_vs;
+        (0..self.header.components.len())
+            .map(|jpeg_idx| {
+                let idx = self.channel_of(jpeg_idx);
+                let mode = jpeg_upsampling_ycbcr[idx] as usize & 3;
+                let shift = ChannelShift::from_jpeg_upsampling(jpeg_upsampling_ycbcr, idx);
+                let hshift = shift.hshift() as u32;
+                let vshift = shift.vshift() as u32;
+                CompGeometry {
+                    idx,
+                    h_samp: [1, 2, 2, 1][mode],
+                    v_samp: [1, 2, 1, 2][mode],
+                    hshift,
+                    vshift,
+                    width_in_blocks: xsize_blocks >> hshift,
+                    height_in_blocks: ysize_blocks >> vshift,
+                }
+            })
+            .collect()
+    }
+
+    /// pixmix patch: the index into the [Y, Cb, Cr]-ordered per-channel data (pass groups,
+    /// LF quant, DC offsets, upsampling) of a JPEG component (libjxl's JpegOrder).
+    fn channel_of(&self, jpeg_idx: usize) -> usize {
+        if self.frame.header().do_ycbcr {
+            jpeg_idx.min(2)
+        } else {
+            [1, 0, 2][jpeg_idx.min(2)]
+        }
+    }
+
     /// Writes reconstructed JPEG bitstream to the writer.
     pub fn write(mut self, mut writer: impl Write) -> Result<()> {
         writer
@@ -432,19 +485,19 @@ impl JpegBitstreamReconstructor<'_, '_, '_> {
                     .write_all(&header)
                     .map_err(Error::ReconstructionWrite)?;
 
-                let mut jpeg_upsampling_ycbcr = self.frame.header().jpeg_upsampling;
-                jpeg_upsampling_ycbcr.swap(0, 1);
-
-                for (idx, comp) in self.header.components.iter().enumerate() {
-                    let sampling_factor = jpeg_upsampling_ycbcr.get(idx).copied().unwrap_or(0);
-                    let sampling_val = match sampling_factor {
-                        0 => 0b01_0001,
-                        1 => 0b10_0010,
-                        2 => 0b10_0001,
-                        3 => 0b01_0010,
-                        _ => 0b01_0001,
-                    };
-                    let component_bytes = [comp.id, sampling_val, comp.q_idx];
+                // pixmix patch: as libjxl's EncodeSOF, a component's sampling factors come
+                // from its own channel (through JpegOrder, which matters for RGB JPEGs), and
+                // its table is the DQT index of the quant table it refers to by position.
+                let geometry = self.component_geometry();
+                for (comp, g) in self.header.components.iter().zip(&geometry) {
+                    let sampling_val = ((g.h_samp << 4) | g.v_samp) as u8;
+                    let table_index = self
+                        .header
+                        .quant_tables
+                        .get(comp.q_idx as usize)
+                        .ok_or(Error::InvalidData)?
+                        .index;
+                    let component_bytes = [comp.id, sampling_val, table_index];
                     writer
                         .write_all(&component_bytes)
                         .map_err(Error::ReconstructionWrite)?;
@@ -545,71 +598,33 @@ impl JpegBitstreamReconstructor<'_, '_, '_> {
                     .write_all(&[si.ss, si.se, (si.ah << 4) | si.al])
                     .map_err(Error::ReconstructionWrite)?;
 
-                let mut jpeg_upsampling_ycbcr = self.frame.header().jpeg_upsampling;
-                jpeg_upsampling_ycbcr.swap(0, 1);
-                let upsampling_shifts_ycbcr: [_; 3] = std::array::from_fn(|idx| {
-                    jxl_modular::ChannelShift::from_jpeg_upsampling(jpeg_upsampling_ycbcr, idx)
-                });
-
-                let mut hsamples = comps
-                    .iter()
-                    .map(|c| [1u32, 2, 2, 1][jpeg_upsampling_ycbcr[c.comp_idx as usize] as usize])
-                    .collect::<Vec<_>>();
-                let mut vsamples = comps
-                    .iter()
-                    .map(|c| [1u32, 2, 1, 2][jpeg_upsampling_ycbcr[c.comp_idx as usize] as usize])
-                    .collect::<Vec<_>>();
-
-                let mut max_hsample = hsamples.iter().copied().max().unwrap().trailing_zeros();
-                let mut max_vsample = vsamples.iter().copied().max().unwrap().trailing_zeros();
-                let mut w8 = (frame_header.width.div_ceil(8) + max_hsample) >> max_hsample;
-                let mut h8 = (frame_header.height.div_ceil(8) + max_vsample) >> max_vsample;
-
-                if num_comps == 1 {
-                    let full_w8 = frame_header.width.div_ceil(8);
-                    let full_h8 = frame_header.height.div_ceil(8);
-                    if (1 << max_hsample) == hsamples[0] {
-                        w8 = full_w8;
-                        max_hsample = 0;
-                    }
-                    if (1 << max_vsample) == vsamples[0] {
-                        h8 = full_h8;
-                        max_vsample = 0;
-                    }
-
-                    hsamples = vec![1];
-                    vsamples = vec![1];
-                }
+                // pixmix patch: the scan covers the MCU grid libjxl's CalculateMcuSize gives:
+                // the sampling factors of all the JPEG's components, and a non-interleaved
+                // scan covers its component's own blocks (ceil(width * h / (8 * hmax))
+                // across). Upstream used the scan's components only, which made every
+                // non-interleaved scan of a subsampled component too large.
+                let geometry = self.component_geometry();
+                let max_h = geometry.iter().map(|g| g.h_samp).max().unwrap_or(1);
+                let max_v = geometry.iter().map(|g| g.v_samp).max().unwrap_or(1);
+                let base = geometry
+                    .get(comps[0].comp_idx as usize)
+                    .ok_or(Error::InvalidData)?;
+                let (h_group, v_group) = if comps.len() > 1 {
+                    (1, 1)
+                } else {
+                    (base.h_samp, base.v_samp)
+                };
+                let mcus_per_row = (frame_header.width * h_group).div_ceil(8 * max_h);
+                let mcu_rows = (frame_header.height * v_group).div_ceil(8 * max_v);
 
                 let params = ScanParams {
                     si,
                     smi,
-                    upsampling_shifts_ycbcr,
-                    hsamples,
-                    vsamples,
-                    max_hsample,
-                    max_vsample,
-                    w8,
-                    h8,
+                    comps: geometry,
+                    mcus_per_row,
+                    mcu_rows,
                 };
-
-                if !self.is_progressive {
-                    if si.ss != 0 || si.se != 0x3f || si.al != 0 || si.ah != 0 {
-                        tracing::error!(
-                            si.ss,
-                            si.se,
-                            si.al,
-                            si.ah,
-                            "Progressive parameter set for sequential JPEG"
-                        );
-                        return Err(Error::InvalidData);
-                    }
-                    self.process_scan::<0>(params, writer)?;
-                } else if si.ah == 0 {
-                    self.process_scan::<1>(params, writer)?;
-                } else {
-                    self.process_scan::<2>(params, writer)?;
-                }
+                self.process_scan(params, writer)?;
             }
 
             // DQT
@@ -630,12 +645,16 @@ impl JpegBitstreamReconstructor<'_, '_, '_> {
                     .write_all(&header)
                     .map_err(Error::ReconstructionWrite)?;
 
-                for qt in qts {
+                // pixmix patch: a component's q_idx is the position of its table in the list
+                // of all quant tables (as libjxl stores it), not the table's DQT index, which
+                // upstream compared it with.
+                let first_table_pos = self.header.quant_tables.len() - remainder.len() - num_tables;
+                for (table_pos, qt) in (first_table_pos..).zip(qts) {
                     let channel = self
                         .header
                         .components
                         .iter()
-                        .position(|c| c.q_idx == qt.index);
+                        .position(|c| c.q_idx as usize == table_pos);
                     let q = channel.and_then(|mut channel| {
                         if do_ycbcr && channel <= 1 {
                             channel ^= 1;

@@ -21,12 +21,12 @@ import { readJxl, writeJxl, wrapCodestream, readJxlHeader, isJxl, extraChannelsN
 import { loadJxlCodec } from './load.js';
 import { computeLayout, applyMap, fitParams } from '../../core/layout.js';
 import {
-  makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError, FLAG_STASH, tileSize, tileTransforms,
+  makeParams, writeMarker, readMarker, checksEqual, PixmixError, WrongKeyError, FLAG_STASH, FLAG_ENLARGED, tileSize, tileTransforms,
 } from '../../core/params.js';
 import { stripExifPreviews, stripXmpPreviews } from '../../meta/thumbnails.js';
 import { isSrgbIcc } from '../../meta/icc.js';
 import { exifTiff, unwrapBrob } from '../../meta/jxl.js';
-import { scrambleJpeg, unscrambleJpegDetailed, rekeyJpeg, jpegMarkerBytes, jpegWatermark } from '../jpeg/index.js';
+import { scrambleJpeg, unscrambleJpegDetailed, rekeyJpeg, jpegMarkerBytes, jpegWatermark, jpegOriginalSize } from '../jpeg/index.js';
 import { readSegments } from '../jpeg/markers.js';
 import { watermarkInfo, carriedFields } from '../png/index.js';
 import {
@@ -38,12 +38,15 @@ export { isJxl };
 export const MARKER_BOX = 'pmIx';
 
 // Container structure (rewritten), or data tied to the old codestream / showing the image.
-const STRUCTURE = new Set(['JXL ', 'ftyp', 'jxlc', 'jxlp', 'jxli', 'jxll', MARKER_BOX, WATERMARK_TAG, STASH_TAG]);
+// JPEG route, enlarged scrambled JPEG (FLAG_ENLARGED): a copy of its original size, which
+// is inside the JPEG, so inspect() can report it without rebuilding the JPEG.
+const SIZE_BOX = 'pmSz';
+const STRUCTURE = new Set(['JXL ', 'ftyp', 'jxlc', 'jxlp', 'jxli', 'jxll', MARKER_BOX, WATERMARK_TAG, STASH_TAG, SIZE_BOX]);
 const STALE = {
   jbrd: 'JPEG reconstruction data (no longer matches the image)',
   jhgm: 'HDR gain map (a second image)',
 };
-const KEPT_WITH_CODESTREAM = new Set(['jxll', MARKER_BOX, WATERMARK_TAG, STASH_TAG]);
+const KEPT_WITH_CODESTREAM = new Set(['jxll', MARKER_BOX, WATERMARK_TAG, STASH_TAG, SIZE_BOX]);
 
 /**
  * Metadata boxes to carry over, with EXIF and XMP previews removed unless kept.
@@ -307,8 +310,10 @@ function routeError(why) {
 
 async function toJxlWithMarker(scrambledJpeg, limits) {
   // The JPEG inside holds the watermark segments; a copy in a box lets inspect() see it.
-  const wm = jpegWatermark(readSegments(scrambledJpeg).segments, limits).data;
-  const mirror = wm ? [{ type: WATERMARK_TAG, data: wm }] : [];
+  const { segments } = readSegments(scrambledJpeg);
+  const wm = jpegWatermark(segments, limits).data;
+  const size = jpegOriginalSize(segments);
+  const mirror = [...(wm ? [{ type: WATERMARK_TAG, data: wm }] : []), ...(size ? [{ type: SIZE_BOX, data: size }] : [])];
   return recompressChecked(scrambledJpeg, [{ type: MARKER_BOX, data: jpegMarkerBytes(scrambledJpeg) }, ...mirror], limits);
 }
 
@@ -336,8 +341,8 @@ async function recompressChecked(jpeg, extra, limits) {
   const { boxes, codestream } = readJxl(transcoded);
   const kept = boxes.filter((b) => !STRUCTURE.has(b.type)); // jbrd, Exif, xml from libjxl
   const out = writeJxl([...kept, ...extra], codestream);
-  // libjxl writes the file and jxl-oxide rebuilds the JPEG from it, and jxl-oxide 0.12 gets
-  // some JPEGs wrong (e.g. 4:4:4 stored with 1x2 sampling factors). A file that cannot be
+  // libjxl writes the file and jxl-oxide rebuilds the JPEG from it (upstream jxl-oxide 0.12
+  // got many JPEGs wrong; native/jxl/patches fixes the known cases). A file that cannot be
   // rebuilt bit for bit could never be restored, so never write one.
   let rebuilt;
   try {
@@ -354,8 +359,8 @@ const sameBytes = (a, b) => a.length === b.length && a.every((v, i) => v === b[i
 
 /**
  * Whether `jpeg` (rebuilt by jxl-oxide from a third-party recompressed JPEG XL) holds the
- * same image as the JPEG XL itself. jxl-oxide 0.12 rebuilds some progressive JPEGs wrongly
- * without an error. Recompressing the rebuilt JPEG and decoding both with the same decoder
+ * same image as the JPEG XL itself (upstream jxl-oxide 0.12 rebuilt some progressive JPEGs
+ * wrongly without an error; this still guards against any such case). Recompressing the rebuilt JPEG and decoding both with the same decoder
  * gives identical pixels exactly when the DCT coefficients match; a false alarm only costs
  * the pixel route.
  */
@@ -375,7 +380,8 @@ export async function rebuiltJpegMatches(jxl, jpeg, limits) {
 
 /**
  * JPEG (already sanitised) -> DCT-domain scramble -> recompressed JPEG XL. The JPEG inside
- * is always baseline: jxl-oxide 0.12 cannot reconstruct some progressive JPEGs.
+ * is always baseline (upstream jxl-oxide 0.12 could not reconstruct most progressive
+ * JPEGs; the patched one can, but the format stays as it was).
  */
 export async function scrambleJpegToJxl(jpeg, { key, transforms, salt, limits, watermark, visibleWatermark } = {}) {
   return toJxlWithMarker(scrambleJpeg(jpeg, { key, transforms, salt, progressive: false, limits, watermark, visibleWatermark }), limits);
@@ -463,10 +469,14 @@ export function inspectJxl(bytes, limits) {
   const { container, boxes, codestream } = readJxl(bytes, limits);
   const header = readJxlHeader(codestream, limits);
   const marker = readMarkerBox(boxes);
+  // An enlarged scrambled JPEG inside: the size it restores to, and the size it is stored at.
+  const sz = marker && marker.params.flags & FLAG_ENLARGED ? boxes.find((b) => b.type === SIZE_BOX)?.data : null;
+  const size = sz?.length === 4
+    ? { width: (sz[2] << 8) | sz[3], height: (sz[0] << 8) | sz[1], storedWidth: header.width, storedHeight: header.height }
+    : { width: header.width, height: header.height };
   return {
     format: 'jxl',
-    width: header.width,
-    height: header.height,
+    ...size,
     container,
     lossy: header.lossy,
     bitDepth: header.bits,

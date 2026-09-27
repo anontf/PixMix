@@ -27,7 +27,14 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
-# jxl-jbr 0.2.1 with one fix: COM segments were rebuilt with their marker byte written twice
-# (see the "pixmix patch" comment in patches/jxl-jbr/src/reconstruct.rs).
+# jxl-jbr 0.2.1 with its JPEG writer fixed to match libjxl's reference one
+# (lib/jxl/jpeg/dec_jpeg_data_writer.cc); every change is marked "pixmix patch":
+# - COM segments were rebuilt with their marker byte written twice;
+# - 4:4:4 JPEGs stored with sampling factors other than 1x1 lost chroma-from-luma;
+# - scans were written on the wrong MCU/block grid (non-interleaved scans of subsampled
+#   components: progressive 4:2:0, one scan per component, >10 blocks per MCU), and
+#   progressive EOB runs, refinement zero runs and padding bits differed from libjxl
+#   (patches/jxl-jbr/src/reconstruct/scan.rs is a port of libjxl's scan writer);
+# - quant tables were matched to components by DQT index instead of by position.
 [patch.crates-io]
 jxl-jbr = { path = "patches/jxl-jbr" }

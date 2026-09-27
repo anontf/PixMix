@@ -26,8 +26,8 @@ export async function jpegForJxl(bytes, from, { mode, limits }) {
     if (mode === 'mcu' || err?.code === 'LIMIT') throw err;
     return { fallback: `jxl-oxide cannot rebuild its JPEG: ${err?.message ?? err}` };
   }
-  // jxl-oxide 0.12 rebuilds some progressive JPEGs wrongly without an error; scrambling that
-  // JPEG would "restore" a different image.
+  // Upstream jxl-oxide 0.12 rebuilt some progressive JPEGs wrongly without an error (the
+  // patched one should not); scrambling such a JPEG would "restore" a different image.
   if (!(await rebuiltJpegMatches(bytes, jpeg, limits))) {
     const why = 'jxl-oxide does not rebuild its JPEG exactly';
     if (mode === 'mcu') throw new PixmixError(`This JPEG XL cannot take the JPEG route (${why}); use mode "block" or "pixel"`, 'UNSUPPORTED');

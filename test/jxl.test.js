@@ -135,8 +135,10 @@ test('JXL decoding is bit-exact (a colour conversion in the decode path would br
 
 // --- JPEG route: JPEG scrambled in the DCT domain, recompressed into JPEG XL ------------
 
-import { readSegments } from '../src/formats/jpeg/markers.js';
+import { readSegments, writeSegments, M } from '../src/formats/jpeg/markers.js';
 import { decodeFrame } from '../src/formats/jpeg/decode.js';
+import { assembleJpeg, encodeScan } from '../src/formats/jpeg/encode.js';
+import { encodePixels } from '../src/formats/jpeg/fdct.js';
 import { convert } from '../src/index.js';
 import { unscrambleJxlDetailed } from '../src/formats/jxl/index.js';
 
@@ -208,14 +210,109 @@ test('JPEG route: JPEGs it cannot carry fall back to the pixel route, and the re
   await assert.rejects(encodeAsync(cmyk, { key: 'k', format: 'jxl', mode: 'mcu' }), { code: 'UNSUPPORTED' });
 });
 
-test('a recompressed-JPEG JXL that jxl-oxide rebuilds wrongly takes the pixel route', async () => {
-  // jxl-oxide 0.12 silently rebuilds this progressive JPEG with different coefficients.
-  const w = 768, h = 512, d = Buffer.alloc(w * h * 3);
+// --- JPEG layouts jxl-oxide 0.12 could not rebuild (fixed in native/jxl/patches/jxl-jbr) --
+
+/** Chroma that follows luma, so libjxl's chroma-from-luma is not zero on 4:4:4. */
+function correlated(w, h) {
+  const d = new Uint8Array(w * h * 4);
+  for (let p = 0; p < w * h; p++) {
+    const x = p % w, y = (p / w) | 0;
+    const v = (Math.sin(x / 3) * Math.cos(y / 4) * 100 + 128 + ((p * 2654435761) >>> 28)) | 0;
+    d.set([v, v >> 1, 255 - v, 255], p * 4);
+  }
+  return d;
+}
+
+/** A 4:4:4 frame relabelled with every component sampled h x v (as libjxl's testdata *_444_1x2.jpg). */
+function sampledAll(w, h, hs, vs) {
+  const { frame, dqt } = encodePixels({ width: w, height: h, data: correlated(w, h) }, { subsampling: '4:4:4' });
+  const mcusX = Math.ceil(w / (8 * hs)), mcusY = Math.ceil(h / (8 * vs));
+  const sof = frame.sof.slice();
+  for (let i = 0; i < 3; i++) sof[7 + i * 3] = (hs << 4) | vs;
+  const components = frame.components.map((c) => {
+    const blocksW = mcusX * hs, blocksH = mcusY * vs;
+    const coefs = new Int16Array(blocksW * blocksH * 64);
+    for (let by = 0; by < c.realH; by++) coefs.set(c.coefs.subarray(by * c.blocksW * 64, (by * c.blocksW + c.realW) * 64), by * blocksW * 64);
+    return { ...c, h: hs, v: vs, blocksW, blocksH, coefs };
+  });
+  return assembleJpeg([dqt], { ...frame, sof, hmax: hs, vmax: vs, mcusX, mcusY, components });
+}
+
+/** Baseline 4:2:0 with one scan per component (non-interleaved). */
+function nonInterleaved(w, h) {
+  const { frame, dqt } = encodePixels({ width: w, height: h, data: rgba(w, h) }, { subsampling: '4:2:0' });
+  const segs = [dqt, { marker: M.SOF0, data: frame.sof }];
+  frame.components.forEach((_, only) => {
+    const { dht, sos, ecs } = encodeScan(frame, { only });
+    segs.push({ marker: M.DHT, data: dht }, { marker: M.SOS, data: sos, ecs });
+  });
+  return writeSegments(segs);
+}
+
+const noisyRamp = (w, h) => {
+  const d = Buffer.alloc(w * h * 3);
   let seed = 1;
   for (let i = 0; i < d.length; i++) { seed = (seed * 1103515245 + 12345) >>> 0; d[i] = ((((i / 3) | 0) % w) * 2 + (seed >>> 24) / 4) & 255; }
-  const jpg = new Uint8Array(await sharp(d, { raw: { width: w, height: h, channels: 3 } }).jpeg({ quality: 85, progressive: true }).toBuffer());
-  const jxl = await codec.transcodeJpeg(jpg);
-  assert.ok(!Buffer.from(await codec.reconstructJpeg(jxl)).equals(Buffer.from(jpg)), 'still a case jxl-oxide gets wrong');
+  return d;
+};
+const sharpJpeg = async (raw, w, h, opts) => new Uint8Array(await sharp(raw, { raw: { width: w, height: h, channels: raw.length / (w * h) } }).jpeg(opts).toBuffer());
+
+const FIXED_LAYOUTS = [
+  // jxl-oxide skipped chroma-from-luma here ("Huffman code lookup failed", or wrong chroma).
+  ['4:4:4 stored with 1x2 sampling factors', async () => sampledAll(61, 45, 1, 2)],
+  ['4:4:4 stored with 2x1 sampling factors', async () => sampledAll(45, 61, 2, 1)],
+  // Non-interleaved scans of subsampled components: panics or wrong coefficients.
+  ['progressive 4:2:0 (libjpeg-turbo), 96x64', async () => sharpJpeg(Buffer.from(rgba(96, 64)).filter((_, i) => i % 4 !== 3), 96, 64, { quality: 85, progressive: true })],
+  ['progressive 4:2:0 (libjpeg-turbo), 768x512 noisy', async () => sharpJpeg(noisyRamp(768, 512), 768, 512, { quality: 85, progressive: true })],
+  ['progressive 4:2:0 (mozjpeg scans), odd size', async () => sharpJpeg(noisyRamp(101, 67), 101, 67, { quality: 80, mozjpeg: true })],
+  ['baseline 4:2:0, one scan per component', async () => nonInterleaved(75, 41)],
+  // Every component 2x2: 12 blocks per MCU, so one scan per component by necessity.
+  ['more than 10 blocks per MCU', async () => sampledAll(64, 48, 2, 2)],
+  ['more than 10 blocks per MCU, partial edge MCUs', async () => sampledAll(37, 21, 2, 2)],
+];
+
+for (const [name, make] of FIXED_LAYOUTS) {
+  test(`JPEG route: ${name} is rebuilt bit for bit and restores exactly`, async () => {
+    const jpg = await make();
+    // libjxl + jxl-oxide alone: the JPEG comes back byte for byte.
+    const jxl = await codec.transcodeJpeg(jpg);
+    assert.ok(Buffer.from(await codec.reconstructJpeg(jxl)).equals(Buffer.from(jpg)), 'rebuilt byte-identical');
+
+    // JPEG -> JPEG XL takes the JPEG route and restores the same coefficients.
+    let report;
+    const s = await encodeAsync(jpg, { key: 'k', format: 'jxl', onConvert: (r) => { report = r; } });
+    assert.equal(inspect(s).mode, 'mcu');
+    assert.ok(!report.notes.some((n) => /JPEG route not possible/.test(n)), report.notes.join());
+    const d = await unscrambleJxlDetailed(s, { key: 'k' });
+    assert.ok(sameCoefs(d.jpeg.toJpeg(), jpg), 'identical DCT coefficients');
+    const restored = await codec.reconstructJpeg(await decodeAsync(s, { key: 'k' }));
+    assert.ok(sameCoefs(restored, jpg));
+    const plain = await codec.reconstructJpeg((await convertAsync(jpg, { format: 'jxl' })).bytes);
+    assert.ok(Buffer.from(restored).equals(Buffer.from(plain)), 'restored byte-identical to the unscrambled file');
+
+    // A third-party recompressed JPEG XL of it stays on the JPEG route too.
+    const t = await encodeAsync(jxl, { key: 'k', onConvert: (r) => { report = r; } });
+    assert.equal(inspect(t).mode, 'mcu');
+    assert.equal(report.decoder, 'jpeg reconstruction');
+    assert.ok(sameCoefs((await unscrambleJxlDetailed(t, { key: 'k' })).jpeg.toJpeg(), jpg));
+  });
+}
+
+test('a recompressed-JPEG JXL that jxl-oxide rebuilds wrongly takes the pixel route', async () => {
+  // No real JPEG is known to rebuild wrongly any more, so break one: the reconstruction
+  // data says "grey", which leaves out chroma-from-luma, and the standard (not optimised)
+  // Huffman tables can code the wrong chroma coefficients that gives, without an error.
+  const w = 96, h = 64;
+  const raw = Buffer.from(correlated(w, h)).filter((_, i) => i % 4 !== 3);
+  const jpg = await sharpJpeg(raw, w, h, { quality: 90, chromaSubsampling: '4:4:4', optimiseCoding: false });
+  const good = await codec.transcodeJpeg(jpg);
+  const { boxes, codestream } = readJxl(good);
+  const jbrd = boxes.find((b) => b.type === 'jbrd');
+  const flipped = jbrd.data.slice();
+  flipped[0] ^= 1; // is_gray
+  const jxl = writeJxl(boxes.filter((b) => b.type !== 'ftyp' && b.type !== 'jxlp').map((b) => (b === jbrd ? { ...b, data: flipped } : b)), codestream);
+  const rebuilt = await codec.reconstructJpeg(jxl);
+  assert.ok(!Buffer.from(rebuilt).equals(Buffer.from(jpg)), 'rebuilds a different JPEG, without an error');
   let report;
   const s = await encodeAsync(jxl, { key: 'k', onConvert: (r) => { report = r; } });
   assert.equal(inspect(s).mode, 'block');

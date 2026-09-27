@@ -168,7 +168,8 @@ export async function reconstructJpeg(bytes, { limits } = {}) {
  * are strings ("LIMIT: …" for a limit), and a Rust panic or running out of WASM memory
  * aborts the call as a bare RuntimeError, whose message the panic hook kept.
  * After a trap the instance is dropped, and the next call starts a fresh one.
- * (jxl-oxide 0.12 panics reconstructing some progressive JPEGs; pixmix's own are baseline.)
+ * (Upstream jxl-oxide 0.12 panicked reconstructing some JPEGs; the patched one should not,
+ * but a panic stays contained.)
  */
 function guard(fn) {
   try {

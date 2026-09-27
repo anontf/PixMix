@@ -336,8 +336,8 @@ async function recompressChecked(jpeg, extra, limits) {
   const { boxes, codestream } = readJxl(transcoded);
   const kept = boxes.filter((b) => !STRUCTURE.has(b.type)); // jbrd, Exif, xml from libjxl
   const out = writeJxl([...kept, ...extra], codestream);
-  // libjxl writes the file and jxl-oxide rebuilds the JPEG from it, and jxl-oxide 0.12 gets
-  // some JPEGs wrong (e.g. 4:4:4 stored with 1x2 sampling factors). A file that cannot be
+  // libjxl writes the file and jxl-oxide rebuilds the JPEG from it (upstream jxl-oxide 0.12
+  // got many JPEGs wrong; native/jxl/patches fixes the known cases). A file that cannot be
   // rebuilt bit for bit could never be restored, so never write one.
   let rebuilt;
   try {
@@ -354,8 +354,8 @@ const sameBytes = (a, b) => a.length === b.length && a.every((v, i) => v === b[i
 
 /**
  * Whether `jpeg` (rebuilt by jxl-oxide from a third-party recompressed JPEG XL) holds the
- * same image as the JPEG XL itself. jxl-oxide 0.12 rebuilds some progressive JPEGs wrongly
- * without an error. Recompressing the rebuilt JPEG and decoding both with the same decoder
+ * same image as the JPEG XL itself (upstream jxl-oxide 0.12 rebuilt some progressive JPEGs
+ * wrongly without an error; this still guards against any such case). Recompressing the rebuilt JPEG and decoding both with the same decoder
  * gives identical pixels exactly when the DCT coefficients match; a false alarm only costs
  * the pixel route.
  */
@@ -375,7 +375,8 @@ export async function rebuiltJpegMatches(jxl, jpeg, limits) {
 
 /**
  * JPEG (already sanitised) -> DCT-domain scramble -> recompressed JPEG XL. The JPEG inside
- * is always baseline: jxl-oxide 0.12 cannot reconstruct some progressive JPEGs.
+ * is always baseline (upstream jxl-oxide 0.12 could not reconstruct most progressive
+ * JPEGs; the patched one can, but the format stays as it was).
  */
 export async function scrambleJpegToJxl(jpeg, { key, transforms, salt, limits, watermark, visibleWatermark } = {}) {
   return toJxlWithMarker(scrambleJpeg(jpeg, { key, transforms, salt, progressive: false, limits, watermark, visibleWatermark }), limits);

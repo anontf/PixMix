@@ -532,18 +532,25 @@ a JPEG XL made by recompressing one (it has a `jbrd` box):
   recompresses it (`decodeAsync`) or shows it (the reveal gives the `<img>` the original
   JPEG).
 - It works everywhere, browsers included, since the encoder is plain WASM.
-- Reconstruction uses jxl-oxide 0.12, with a patch so JPEGs with comments (COM segments)
-  rebuild exactly (`native/jxl/patches`). jxl-oxide gets some JPEGs wrong, so both ends
-  are checked, and a JPEG that fails falls back to the pixel route: the report's `notes`
-  then say why, and the file is several times larger. Asking for `mode: 'mcu'` gives an
-  `UNSUPPORTED` error instead.
+- Reconstruction uses jxl-oxide 0.12 with its JPEG writer patched (`native/jxl/patches`)
+  to match libjxl's reference one: upstream 0.12 broke JPEGs with comments (COM segments),
+  4:4:4 stored with sampling factors other than 1×1 (e.g. all 1×2), and every
+  non-interleaved scan of a subsampled component, so most progressive 4:2:0 JPEGs,
+  baseline ones with one scan per component, and those with more than 10 blocks per MCU.
+  With the patch, every JPEG libjxl recompresses rebuilds bit for bit in pixmix's tests
+  (sharp/libjpeg-turbo and mozjpeg, baseline and progressive, 4:2:0/4:4:4/grey, odd sizes,
+  restart intervals, non-interleaved and >10-blocks-per-MCU layouts, libjxl's testdata).
+  Both ends are still checked, and a JPEG that fails falls back to the pixel route: the
+  report's `notes` then say why, and the file is several times larger. Asking for
+  `mode: 'mcu'` gives an `UNSUPPORTED` error instead.
   - For a JPEG XL made from a JPEG by another tool, the rebuilt JPEG is recompressed and
-    must decode to exactly the same pixels. Some progressive JPEGs fail this: jxl-oxide
-    either stops with an error or silently rebuilds different coefficients.
-  - Every file pixmix writes must rebuild bit for bit before it is returned. This catches
-    JPEGs jxl-oxide can't rebuild, such as 4:4:4 stored with 1×2 sampling factors and any
-    JPEG with more than 10 blocks per MCU (its non-interleaved scans), and ones libjxl can't
-    recompress, such as CMYK and 4:1:1.
+    must decode to exactly the same pixels (a rebuild that stops with an error, or silently
+    gives different coefficients, falls back).
+  - Every file pixmix writes must rebuild bit for bit before it is returned. What falls
+    back today is what libjxl can't recompress, such as CMYK and 4:1:1.
+  - A JPEG with more than 10 blocks per MCU and partial edge MCUs is scrambled enlarged
+    (see "JPEG"); on the JPEG route the codestream holds that enlarged JPEG, so `inspect`
+    reports the stored (enlarged) size, and restoring gives the original size back.
 
 **Pixel route** (`mode: 'pixel' | 'block'`), for everything else:
 - Decode JPEG XL with pixmix → the exact samples the input decodes to: 8- or 16-bit, in
@@ -631,7 +638,7 @@ WASM 3% larger (2.44 MB instead of 2.38 MB) and was no faster in the original be
 #### Rebuilding the decoder WASM
 
 `native/jxl/pkg` is committed, so this is only needed after changing `native/jxl` (its
-`patches/` hold the jxl-oxide patch):
+`patches/` hold the patched jxl-oxide crate, see "JPEG XL"):
 
 ```sh
 rustup target add wasm32-unknown-unknown
@@ -1065,7 +1072,8 @@ options in the query string:
        exactly. Rekeying keeps the enlarged form; a visible watermark is placed on the
        original area. `inspect` reports the original `width`/`height` and the stored
        `storedWidth`/`storedHeight`; the browser reveal shows the original size
-       throughout. (Such a JPEG can't take the JPEG XL JPEG route, see "JPEG XL".)
+       throughout. (On the JPEG XL JPEG route, `inspect` gives the stored size, see
+       "JPEG XL".)
 5. **Marker.** v1 is `u8 version | u8 mode | u16 block | u8 saltLen | salt | u8[4] check`.
    - In `block` mode, `block` is the tile size, with the top bit set when tiles are
      flipped/rotated. In `mcu` mode it holds flags: bit 0 = transforms, bit 1 = restore as
